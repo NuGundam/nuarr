@@ -153,13 +153,42 @@ def _measure(path: str, tracks: str = "", check_only: bool = False) -> dict:
         cmd += ["--tracks", tracks]
     if check_only:
         cmd += ["--check-only"]
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=root,
-                       timeout=WORKER_TIMEOUT, creationflags=NO_WINDOW, startupinfo=hidden_si(),
-                       stdin=subprocess.DEVNULL)
+    from . import outside as _out
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                         errors="replace", cwd=root, creationflags=NO_WINDOW, startupinfo=hidden_si(),
+                         stdin=subprocess.DEVNULL)
+    _out.set_pid("subtiming", p.pid)
+    # PROGRESS AS IT GOES: the worker says "PROG i/n what" on stderr per piece
+    base, span = (82.0, 8.0) if check_only else (5.0, 30.0)
+    errs = []
+
+    def _err():
+        for ln in p.stderr:
+            if ln.startswith("PROG "):
+                try:
+                    i, n = ln.split()[1].split("/")
+                    STATE["pct"] = base + span * int(i) / max(1, int(n))
+                    if ln.count(" ") >= 2:
+                        STATE["stage"] = ln.split(" ", 2)[2].strip()
+                except Exception:                                # noqa: BLE001
+                    pass
+            else:
+                errs.append(ln)
+                del errs[:-20]
+    th = threading.Thread(target=_err, daemon=True)
+    th.start()
+    out = ""
     try:
-        return json.loads((r.stdout or "").strip().splitlines()[-1])
+        for ln in p.stdout:
+            out += ln
+        p.wait(timeout=WORKER_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        p.kill()
+    th.join(5)
+    try:
+        return json.loads((out or "").strip().splitlines()[-1])
     except Exception:                                            # noqa: BLE001
-        return {"ok": False, "why": ((r.stderr or "").strip().splitlines() or ["the measurement said nothing"])[-1][:300]}
+        return {"ok": False, "why": ([e.strip() for e in errs if e.strip()] or ["the measurement said nothing"])[-1][:300]}
 
 
 def _ratio(k: float) -> str:
@@ -198,7 +227,9 @@ def fix(file_id: int, path: str, tracks: list) -> dict:
         def _rep(p):
             STATE["pct"] = 40 + 0.4 * float(p or 0)
         STATE["stage"] = "rewriting the timing"
-        r = _run_reporting([_mkvmerge(), "-o", tmp] + cmd_sync + [path], _rep)
+        from . import outside as _out
+        r = _run_reporting([_mkvmerge(), "-o", tmp] + cmd_sync + [path], _rep,
+                           on_pid=lambda pid: _out.set_pid("subtiming", pid))
         if r.returncode >= 2 or not os.path.exists(tmp):
             fileops._quiet_remove(tmp)
             return {"ok": False, "why": (r.stderr or r.stdout or "mkvmerge failed").strip()[:300]}
@@ -239,7 +270,9 @@ def check_one(row: dict, act: bool | None = None) -> dict:
     fid, path = int(row["id"]), row["path"]
     act = (mode() == "auto") if act is None else act
     t0 = time.time()
-    STATE.update(running=True, file_id=fid, label=_label(path), stage="listening for speech", pct=5.0, started=t0)
+    from . import outside as _out
+    _out.start("subtiming")
+    STATE.update(running=True, file_id=fid, label=_label(path), stage="listening for speech", pct=2.0, started=t0)
     try:
         if not os.path.exists(path):
             res = {"ok": False, "why": "the file is not on disk"}
@@ -286,6 +319,7 @@ def check_one(row: dict, act: bool | None = None) -> dict:
         return {"file_id": fid, "verdict": verdict, "action": action, "note": note, "secs": secs}
     finally:
         STATE.update(running=False, stage="", pct=0.0)
+        _out.stop("subtiming")
 
 
 def busy_disks() -> set:
@@ -363,11 +397,18 @@ def as_running() -> list:
     if not STATE.get("running"):
         return []
     el = time.time() - float(STATE.get("started") or time.time())
+    from . import outside as _out
+    pct = max(0.0, min(1.0, float(STATE["pct"] or 0) / 100.0))
     return [{"job_id": f"subtiming-{STATE['file_id']}", "pool": "subtiming", "kind": "subtiming",
-             "title": STATE["label"], "file": STATE["label"], "stage": STATE["stage"], "progress": STATE["pct"],
+             "title": STATE["label"], "file": STATE["label"], "stage": STATE["stage"], "progress": pct,
              "elapsed_s": round(el), "eta_s": None, "eta_est": True,
              "plan": "subtitle timing: the speech in the audio against each text track's lines",
-             "why_pool": "CPU - the voice detector"}]
+             "why_pool": "CPU - the voice detector, then mkvmerge if a track needs moving",
+             "doing": {"tool": "Silero VAD + ffmpeg" if pct < 0.4 else "mkvmerge --sync", "hw": "CPU",
+                       "why": STATE["stage"]},
+             "disk": _out.disk_of(STATE["file_id"]), "dest_disk": "", "fps": 0.0, "speed": 0.0,
+             "paused_for_viewer": False, "paused_for_load": False, "cancelled": False, "by_bytes": False,
+             **_out.fields("subtiming", pct)}]
 
 
 def snapshot() -> dict:

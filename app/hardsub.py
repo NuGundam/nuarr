@@ -644,6 +644,7 @@ def _ocr_proc(engine: str):
     try:
         from . import qwenvl
         env["NUARR_QWENVL"] = qwenvl.env_model()
+        env["NUARR_QWENVL_LIVE"] = qwenvl.live_path()
     except Exception:                                            # noqa: BLE001
         env["NUARR_QWENVL"] = ""
     try:

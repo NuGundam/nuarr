@@ -193,7 +193,9 @@ def read_all(src: str, dur: float, pieces: list, a_list: list, tracks: list) -> 
     sps = {i: np.zeros(n, np.float32) for i, _ in a_list}
     got = {t["ord"]: set() for t in tracks}
     with tempfile.TemporaryDirectory(prefix="nuarr_stm_") as d:
-        for t0, t1 in pieces:
+        for pi, (t0, t1) in enumerate(pieces):
+            print(f"PROG {pi}/{len(pieces)} reading - piece {pi + 1} of {len(pieces)}",
+                  file=sys.stderr, flush=True)
             # -copyts: a seek lands on the keyframe before t0, and without it a
             # subtitle's clock starts at its first packet after that keyframe -
             # 1.3 s wrong on Blue Skies. With it every time is the file's own;
@@ -238,7 +240,9 @@ def cues_all(src: str, tracks: list, pieces: list) -> dict:
     ff, _ = _ff()
     got = {t["ord"]: set() for t in tracks}
     with tempfile.TemporaryDirectory(prefix="nuarr_stm_") as d:
-        for t0, t1 in pieces:
+        for pi, (t0, t1) in enumerate(pieces):
+            print(f"PROG {pi}/{len(pieces)} reading - piece {pi + 1} of {len(pieces)}",
+                  file=sys.stderr, flush=True)
             # -copyts: a seek lands on the keyframe before t0, and without it a
             # subtitle's clock starts at its first packet after that keyframe -
             # 1.3 s wrong on Blue Skies. With it every time is the file's own;

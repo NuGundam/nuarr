@@ -169,7 +169,25 @@ class Helper:
         self.secs += time.time() - t0
         if txt:
             self.got += 1
+        self._live(time.time() - t0)
         return txt.splitlines() if txt else []
+
+    def _live(self, last: float) -> None:
+        """WHAT IT IS DOING NOW, for nuarr's Processing panel - written to the
+        file nuarr named, replaced whole so a reader never sees half of it."""
+        p = os.environ.get("NUARR_QWENVL_LIVE", "")
+        if not p:
+            return
+        if not getattr(self, "_t0", 0):
+            self._t0 = time.time() - last
+        try:
+            with open(p + ".tmp", "w", encoding="utf-8") as f:
+                json.dump({"pid": os.getpid(), "asked": self.asked, "got": self.got, "failed": self.failed,
+                           "secs": round(self.secs, 2), "last": round(last, 2), "max": self.max,
+                           "at": time.time(), "started": self._t0, "model": self.model}, f)
+            os.replace(p + ".tmp", p)
+        except Exception:                                # noqa: BLE001
+            pass
 
     def stat_line(self) -> str:
         return (f"VLSTAT asked={self.asked} got={self.got} failed={self.failed} "
@@ -299,6 +317,96 @@ def pull(name: str = "") -> dict:
             _tags(force=True)
     threading.Thread(target=_go, daemon=True, name="qwenvl-pull").start()
     return {"started": True}
+
+
+def live_path() -> str:
+    from .config import DATA_DIR
+    return os.path.join(str(DATA_DIR), "qwenvl.live.json")
+
+
+_PS: dict = {"at": 0.0, "m": None}
+
+
+def _loaded() -> dict | None:
+    """Ollama's own word on whether the model is in memory - asked at most
+    every five seconds, because the panel polls several times a second."""
+    now = time.time()
+    if now - _PS["at"] > 5:
+        _PS["at"] = now
+        _PS["m"] = None
+        try:
+            for m in _get("/api/ps", timeout=1.5).get("models") or []:
+                if (m.get("name") or "").startswith("qwen3-vl") or (m.get("model") or "").startswith("qwen3-vl"):
+                    _PS["m"] = m
+        except Exception:                                # noqa: BLE001
+            pass
+    return _PS["m"]
+
+
+def as_running() -> list:
+    """A card while the vision model is reading, or loaded and waiting to
+    unload. Reading: the cues it has been asked about, its pace and the job it
+    is reading for. Loaded and idle: a bar that drains to the moment Ollama
+    lets it go."""
+    try:
+        live = json.load(open(live_path(), encoding="utf-8"))
+    except Exception:                                    # noqa: BLE001
+        live = {}
+    m = _loaded()
+    now = time.time()
+    reading = bool(live) and now - float(live.get("at") or 0) < 30
+    if not reading and not m:
+        return []
+    for_what = ""
+    try:
+        from . import jobs as _j
+        for w in list(_j.RUNNING.values()):
+            if getattr(w, "sub_ocr_active", False) or getattr(w, "pool", "") in ("subocr", "subread"):
+                for_what = w.job.title
+                break
+    except Exception:                                    # noqa: BLE001
+        pass
+    from . import outside as _out
+    vram = int((m or {}).get("size_vram") or 0)
+    if reading:
+        asked, got = int(live.get("asked") or 0), int(live.get("got") or 0)
+        mx = max(1, int(live.get("max") or VL_MAX_DEFAULT))
+        avg = float(live.get("secs") or 0) / max(1, asked)
+        stage = (f"reading doubted cues - {asked} asked, {got} read, {avg:.1f}s each"
+                 + (f" · {vram / 1e9:.1f} GB on the card" if vram else ""))
+        pct = min(1.0, asked / mx)
+        if not _out._M.get("qwenvl") or _out._M["qwenvl"].get("pid") != int(live.get("pid") or 0):
+            _out.start("qwenvl")
+            _out.set_pid("qwenvl", int(live.get("pid") or 0))
+        extra = _out.fields("qwenvl", pct)
+        extra.pop("eta_s", None)
+        el = round(now - float(live.get("started") or now))
+        # the pace over the worker's own run, not since this card was first drawn
+        extra.update(rate=round(asked / max(1.0, el) * 60, 1), rate_unit="cues/min")
+    else:
+        left = 0.0
+        try:
+            import datetime as _dt
+            exp = (m or {}).get("expires_at") or ""
+            left = (_dt.datetime.fromisoformat(exp.replace("Z", "+00:00"))
+                    - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
+        except Exception:                                # noqa: BLE001
+            pass
+        stage = (f"loaded, idle - unloads in {int(max(0, left))}s"
+                 + (f" · {vram / 1e9:.1f} GB on the card" if vram else ""))
+        pct = max(0.0, min(1.0, left / 180.0))
+        extra = {"eta_s": round(max(0, left)), "eta_est": False}
+        el = 0
+    return [{"job_id": "qwenvl", "pool": "qwenvl", "kind": "qwenvl",
+             "title": ("Qwen-VL - " + for_what) if (reading and for_what) else "Qwen-VL reader",
+             "file": "", "stage": stage, "progress": pct, "elapsed_s": el, "eta_est": True,
+             "plan": "the reader of last resort: a subtitle picture OCR doubted, read by a vision model",
+             "why_pool": "GPU through Ollama - loaded on demand, let go after three idle minutes",
+             "doing": {"tool": (live.get("model") or model()) if reading else model(), "hw": "GPU",
+                       "why": "reading" if reading else "waiting to unload"},
+             "disk": "", "dest_disk": "", "fps": 0.0, "speed": 0.0,
+             "paused_for_viewer": False, "paused_for_load": False, "cancelled": False, "by_bytes": False,
+             **extra}]
 
 
 def info() -> dict:

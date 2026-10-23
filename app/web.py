@@ -25214,6 +25214,7 @@ function poolColor(pool){
        : pool==='verify'      ? '#ff7b72'         // coral - the second opinion
        : pool==='qwenvl'      ? '#ff9e64'         // orange - the Qwen-VL reader
        : pool==='subtiming'   ? '#6ee7f7'         // cyan - subtitle timing
+       : pool==='groups'      ? '#d4b8ff'         // soft violet - the group measurer
        : 'var(--ok)';
 }
 function diskColor(name){
@@ -27195,6 +27196,11 @@ function wkStatsHtml(w, pct, indet){
       // as "something is missing", and nothing is. The bytes moved are on
       // the row below.
       ? ''
+      : w.rate_unit
+      // A RATE IN ITS OWN UNIT for the work outside the queue - pictures a
+      // minute, cues a minute - where a queue card shows frames a second.
+      ? `<span><span class="m-fps">${w.rate||0}</span> <span class="m-lbl">${esc(w.rate_unit)}</span></span>
+    <span>${w.speed?`<span class="m-fps">${w.speed}×</span> <span class="m-lbl">realtime</span>`:''}</span>`
       : `<span>${w.fps?`<span class="m-fps">${w.fps}</span> <span class="m-lbl">fps</span>`:'—'}</span>
     <span>${w.speed?`<span class="m-fps">${w.speed}×</span>`
             : (w.by_bytes?'<span class="dim" title="the ×-multiplier comes from ffmpeg\'s output timeline, which is not usable on this file">n/a</span>':'—')}</span>`}

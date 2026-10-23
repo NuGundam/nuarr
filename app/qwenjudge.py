@@ -249,6 +249,8 @@ async def run() -> str:
     if not got:
         return f"waiting - {holder} has the GPU lane"
     global _PROC
+    from . import outside as _out
+    _out.start("qwen")
     STATE.update(running=True, error="", done=0, total=min(len(todo), BATCH), file="",
                  started=time.time(), stage="checking GPU memory")
     try:
@@ -275,6 +277,7 @@ async def run() -> str:
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             creationflags=NO_WINDOW)
         _PROC = p
+        _out.set_pid("qwen", p.pid)
         n, err = 0, ""
         # AS IT GOES, so the Processing System card and the reader row move
         # while it works instead of jumping when the batch ends.
@@ -459,7 +462,16 @@ def as_running() -> list:
         "venc": None, "fps": 0.0, "speed": 0.0, "paused_for_viewer": False,
         "paused_for_load": False, "pace_factor": 0.0, "pace_why": "", "cancelled": False,
         "by_bytes": False, "disk": "", "dest_disk": "",
+        **_live(pct, done),
     }]
+
+
+def _live(pct: float, done: int) -> dict:
+    from . import outside as _out
+    d = _out.fields("qwen", pct, done=done, unit="pictures/min", per=60)
+    if d.get("eta_s") is None:
+        d.pop("eta_s", None)
+    return d
 
 
 _WAITING: dict = {"at": 0.0, "n": 0}

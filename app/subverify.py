@@ -234,6 +234,8 @@ def _whisper(path: str, windows: list, lang3: str, tick=None) -> list:
            "--data", str(DATA_DIR), "--ffmpeg", _ffmpeg_exe(), "--verify", spec]
     p = subprocess.Popen(cmd, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                          text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+    from . import outside as _out
+    _out.set_pid("verify", p.pid)
     heard, err = [], ""
     for ln in p.stdout:
         try:
@@ -321,6 +323,8 @@ def verify_one(row: dict, act: bool | None = None, dry: bool = False) -> dict:
     label = _label(fid, row.get("label") or "", path)
     t0 = time.time()
     act = mode() == "auto" if act is None else act
+    from . import outside as _out
+    _out.start("verify")
     STATE.update(running=True, file_id=fid, label=label, stage="starting", pct=0.0, started=t0)
 
     def tick(stage, pct=0.0):
@@ -602,10 +606,16 @@ def as_running() -> list:
     if not STATE.get("running"):
         return []
     el = time.time() - float(STATE.get("started") or time.time())
+    from . import outside as _out
+    pct = max(0.0, min(1.0, float(STATE["pct"] or 0) / 100.0))
     return [{"job_id": f"verify-{STATE['file_id']}", "pool": "verify", "kind": "verify", "title": STATE["label"],
-             "file": STATE["label"], "stage": STATE["stage"], "progress": STATE["pct"], "elapsed_s": round(el),
+             "file": STATE["label"], "stage": STATE["stage"], "progress": pct, "elapsed_s": round(el),
              "eta_s": None, "eta_est": True, "plan": "the second opinion: Whisper listens where the lines are, "
-             "and the three engines' votes decide", "why_pool": "GPU - the heavy lane"}]
+             "and the three engines' votes decide", "why_pool": "GPU - the heavy lane",
+             "doing": {"tool": "Whisper + Qwen + the readers", "hw": "GPU", "why": STATE["stage"]},
+             "disk": _out.disk_of(STATE["file_id"]), "dest_disk": "", "fps": 0.0, "speed": 0.0,
+             "paused_for_viewer": False, "paused_for_load": False, "cancelled": False, "by_bytes": False,
+             **_out.fields("verify", pct)}]
 
 
 def snapshot() -> dict:

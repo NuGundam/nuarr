@@ -352,7 +352,10 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
                    "why": "an English subtitle is already beside it"})
         return
     lang = _lang_of(r)
+    from . import outside as _out
+    _out.start("submake")
     STATE.update(running=True, file_id=file_id, label=label, stage="starting", pct=0.0,
+                 duration=float(r["duration"] or 0),
                  note="", started=time.time(), library=r["library"] or "",
                  file=os.path.basename(r["path"]), lang=lang)
     joblog.log(f"subtitle maker: {label} ({lang} -> English)", "info")
@@ -396,6 +399,7 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
                                              stderr=asyncio.subprocess.DEVNULL,
                                              creationflags=NO_WINDOW)
     _PROC = p
+    _out.set_pid("submake", p.pid)
     end: dict = {}
     while True:
         ln = await p.stdout.readline()
@@ -723,6 +727,7 @@ def as_running() -> list:
     Empty when nothing is being made."""
     if not STATE.get("running"):
         return []
+    from . import outside as _out
     fid = STATE.get("file_id")
     el = time.time() - float(STATE.get("started") or time.time())
     pct = max(0.0, min(1.0, float(STATE.get("pct") or 0) / 100.0))
@@ -743,8 +748,10 @@ def as_running() -> list:
                      "why": "the file has no subtitles anyone here can read", "detail": ""}],
         "venc": None, "fps": 0.0, "speed": 0.0, "paused_for_viewer": False,
         "paused_for_load": False, "pace_factor": 0.0, "pace_why": "", "cancelled": False,
-        "by_bytes": False, "disk": "", "dest_disk": "", "lang": STATE.get("lang") or "",
+        "by_bytes": False, "disk": _out.disk_of(fid), "dest_disk": "", "lang": STATE.get("lang") or "",
         "library": STATE.get("library") or "", "file_id": fid,
+        **{k: v for k, v in _out.fields("submake", pct, media_s=float(STATE.get("duration") or 0)).items()
+           if v is not None or k != "eta_s"},
     }]
 
 

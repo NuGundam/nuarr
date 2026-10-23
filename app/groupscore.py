@@ -111,11 +111,23 @@ def measure_one(row: dict) -> dict:
             lp = log.replace("\\", "/").replace(":", "\\:")
             lav = (f"[0:v]select='not(mod(n\\,3))',blockdetect,blurdetect,format=yuv420p10le,split[a][b];"
                    f"[a][b]libvmaf=log_fmt=json:log_path='{lp}':n_threads=3:feature=name=cambi")
-            p = subprocess.run([ff, "-hide_banner", "-nostdin", "-nostats", "-v", "info", "-threads", "3",
-                                "-ss", f"{t:.2f}", "-t", f"{SAMPLE_S:.1f}", "-i", row["path"],
-                                "-an", "-sn", "-dn", "-lavfi", lav, "-f", "null", "-"],
-                               capture_output=True, text=True, encoding="utf-8", errors="replace",
-                               timeout=240, creationflags=NO_WINDOW | BELOW_NORMAL, startupinfo=hidden_si())
+            STATE.update(pct=k / len(marks), stage=f"sample {k + 1} of {len(marks)} - banding, blocking, blur")
+            pp = subprocess.Popen([ff, "-hide_banner", "-nostdin", "-nostats", "-v", "info", "-threads", "3",
+                                   "-ss", f"{t:.2f}", "-t", f"{SAMPLE_S:.1f}", "-i", row["path"],
+                                   "-an", "-sn", "-dn", "-lavfi", lav, "-f", "null", "-"],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                                  errors="replace", creationflags=NO_WINDOW | BELOW_NORMAL, startupinfo=hidden_si())
+            from . import outside as _out
+            _out.set_pid("groups", pp.pid)
+            try:
+                _, err_ = pp.communicate(timeout=240)
+            except subprocess.TimeoutExpired:
+                pp.kill()
+                _, err_ = pp.communicate()
+
+            class _P:
+                stderr = err_
+            p = _P()
             m1 = re.search(r"block mean:\s*([\d.]+)", p.stderr or "")
             m2 = re.search(r"blur mean:\s*([\d.]+)", p.stderr or "")
             if m1:
@@ -135,6 +147,28 @@ def measure_one(row: dict) -> dict:
             "banding_max": round(max(bands), 2) if bands else None,
             "block": round(statistics.mean(blocks), 3) if blocks else None,
             "blur": round(statistics.mean(blurs), 3) if blurs else None}
+
+
+def as_running() -> list:
+    """The measurer as a card in the Processing panel while it measures."""
+    if not STATE.get("running"):
+        return []
+    from . import outside as _out
+    el = time.time() - float(STATE.get("at") or time.time())
+    pct = float(STATE.get("pct") or 0)
+    lbl = re.sub(r"\.[A-Za-z0-9]{2,4}$", "", STATE.get("label") or "")
+    return [{"job_id": "groups-measure", "pool": "groups", "kind": "groups",
+             "title": lbl.split(" [")[0][:90], "file": STATE.get("label") or "",
+             "stage": STATE.get("stage") or "measuring", "progress": pct, "elapsed_s": round(el),
+             "eta_s": None, "eta_est": True,
+             "plan": f"release group scorecard: how {STATE.get('grp') or 'this group'} encodes - "
+                     "banding (CAMBI), blocking and blur on three samples",
+             "why_pool": "CPU at low priority - one file at a time, only when the disk is free",
+             "doing": {"tool": "ffmpeg libvmaf CAMBI + blockdetect + blurdetect", "hw": "CPU",
+                       "why": STATE.get("stage") or ""},
+             "disk": _out.disk_of(STATE.get("file_id")), "dest_disk": "", "fps": 0.0, "speed": 0.0,
+             "paused_for_viewer": False, "paused_for_load": False, "cancelled": False, "by_bytes": False,
+             **_out.fields("groups", pct)}]
 
 
 def plan(limit: int = 50) -> list:
@@ -210,7 +244,10 @@ async def step() -> bool:
     if not cand:
         return False
     r = cand[0]
-    STATE.update(running=True, label=os.path.basename(r["path"]), at=time.time())
+    from . import outside as _out
+    _out.start("groups")
+    STATE.update(running=True, label=os.path.basename(r["path"]), at=time.time(), pct=0.0, stage="starting",
+                 file_id=r["id"], grp=r["grp"])
     try:
         res = await asyncio.to_thread(measure_one, r) if os.path.exists(r["path"]) else {"err": "not on disk"}
     except Exception as e:                               # noqa: BLE001
@@ -223,6 +260,7 @@ async def step() -> bool:
                     (r["id"], r["library"], r["grp"], _show(r["path"]), r["path"], r["height"], codec, ten,
                      round(mbps, 2), res.get("banding"), res.get("banding_max"), res.get("block"), res.get("blur"),
                      time.time(), REV, res.get("err")))
+    _out.stop("groups")
     STATE.update(running=False, label="", last=f"{r['grp']}: {os.path.basename(r['path'])[:60]}",
                  done_session=STATE["done_session"] + 1,
                  left=(STATE["left"] - 1) if STATE["left"] else STATE["left"])

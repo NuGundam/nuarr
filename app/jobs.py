@@ -7816,6 +7816,36 @@ def _submake_running() -> list:
         out += subtiming.as_running()
     except Exception:                                            # noqa: BLE001
         pass
+    try:
+        from . import groupscore
+        out += groupscore.as_running()
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        from . import qwenvl
+        out += qwenvl.as_running()
+    except Exception:                                            # noqa: BLE001
+        pass
+    # THE QUIET FIXERS, AS CARDS. Sidecar embeds, settling rewrites and the
+    # rest were drawn only in the disk pop-ups; they move real bytes and
+    # belong beside everything else that does.
+    try:
+        from . import idle as _idle
+        for t in _idle.tasks():
+            t = dict(t)
+            t.setdefault("kind", "background")
+            t.setdefault("fps", 0.0)
+            t.setdefault("speed", 0.0)
+            t.setdefault("io_bps", (t.get("read_bps") or 0) + (t.get("write_bps") or 0))
+            t.setdefault("why_pool", f"{t.get('system') or 'background'} - a quiet fixer outside the queue")
+            t.setdefault("doing", {"tool": t.get("system") or "", "hw": "disk", "why": t.get("stage") or ""})
+            el = float(t.get("elapsed_s") or 0)
+            pr = float(t.get("progress") or 0)
+            t.setdefault("eta_s", round(el / pr - el) if 0.03 < pr < 1 else None)
+            t.setdefault("eta_est", True)
+            out.append(t)
+    except Exception:                                            # noqa: BLE001
+        pass
     return out
 
 
