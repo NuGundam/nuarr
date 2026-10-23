@@ -949,6 +949,8 @@ async def _startup() -> None:
     asyncio.create_task(arrhealth.watch())
     from . import svcnurse
     asyncio.create_task(svcnurse.watch())
+    from . import hevcconvert
+    asyncio.create_task(hevcconvert.watch())
     asyncio.create_task(subneed.watch())
     # Twice a day: do nuarr and the arrs still describe the same files? The
     # check existed before this line did, which meant it only ever ran when
@@ -11486,6 +11488,25 @@ async def api_shrink_trial(ids: str = ""):
 def api_gpu_budget():
     from . import gpubudget
     return gpubudget.snapshot()
+
+
+@app.get("/api/convert")
+def api_convert():
+    from . import hevcconvert
+    if not hevcconvert.STATE["cands"]:
+        hevcconvert.candidates()
+    return hevcconvert.progress()
+
+
+@app.post("/api/convert/cfg")
+def api_convert_cfg(on: int = -1, keep: int = 0, m1080: float = 0, m720: float = 0, msd: float = 0):
+    from . import hevcconvert
+    mm = {k: v for k, v in (("1080", m1080), ("720", m720), ("sd", msd)) if v}
+    c = hevcconvert.set_cfg(on=None if on < 0 else bool(on), keep=keep or None, min_mbps=mm or None)
+    hevcconvert.candidates(force=True)
+    joblog.log(f"HEVC conversion: {'on' if c['on'] else 'off'} for {', '.join(c['libraries'])}, "
+               f"floors {c['min_mbps']}, keep {c['keep']} queued", "info")
+    return hevcconvert.progress()
 
 
 @app.get("/api/vmaf")
@@ -30216,7 +30237,7 @@ function wtab(which){
     const side = which==='vcodec' ? 'video' : 'audio';
     if(hint) hint.textContent = '· '+(side==='video'?'video':'audio')+' codec';
     paneLoad(which, loadCodecTab, side);
-    if(side==='video') loadVmaf();
+    if(side==='video'){ loadVmaf(); loadConvert(); }
     // The title check belongs beside the settings that caused the mismatch:
     // this page decides what tracks are converted TO, and the title is what
     // the picker will then claim they are.
@@ -35057,6 +35078,42 @@ async function loadVmaf(){
   </div>`;
   clearTimeout(_vmafT);
   if((d.running||[]).length) _vmafT=setTimeout(()=>shownPoll('vmafBox', loadVmaf), 3000);
+}
+// ---- library conversion to 10-bit HEVC (hevcconvert.py) ----
+async function loadConvert(){
+  const el=document.getElementById('convBox'); if(!el) return;
+  let d; try{ d=await (await fetch('/api/convert')).json(); }catch(e){ return; }
+  const c=d.cfg, mm=c.min_mbps, saved=d.before_gb-d.after_gb;
+  const eta = d.eta_h==null ? 'pace measured after the first few' : (d.eta_h<48 ? `~${d.eta_h} h left` : `~${(d.eta_h/24).toFixed(1)} days left`);
+  el.innerHTML=`<div class="lkind" style="padding:10px 12px">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <b style="color:#6fb0ff">Convert to 10-bit HEVC</b>
+      <span class="pill ${c.on?'p-ok':'p-dim'}" style="cursor:pointer" onclick="convSet({on:${c.on?0:1}})">${c.on?'ON':'off'}</span>
+      <span class="dim" style="font-size:11.5px">${esc((c.libraries||[]).join(', '))}</span>
+      <span style="font-size:11.5px" title="8-bit H.264 below this bitrate is left alone - it has little to give and a generation to lose">from
+        <input type="number" min="0.5" step="0.5" value="${mm['1080']}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="convSet({m1080:this.value})"> Mbps at 1080p,
+        <input type="number" min="0.5" step="0.5" value="${mm['720']}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="convSet({m720:this.value})"> at 720p,
+        <input type="number" min="0.5" step="0.5" value="${mm['sd']}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="convSet({msd:this.value})"> at SD</span>
+      <span style="font-size:11.5px" title="how many conversions are kept in the queue at once - the rest of the queue is never starved">keep
+        <input type="number" min="1" max="200" value="${c.keep}" style="width:58px;box-sizing:border-box;font-size:11px" onchange="convSet({keep:this.value})"> queued</span>
+    </div>
+    <div class="dim" style="font-size:11px;margin-top:6px">8-bit H.264 bands in flat colour and dark gradients at any setting that saves much; 10-bit HEVC
+      held VMAF 95 with banding around 2.5 on the anime trial and came out 85-90% smaller. Every conversion goes through the quality
+      search above, keeps signs burned and subtitles as they were, and is thrown away unless it saves at least ${Math.round(d.min_saving*100)}% -
+      the original stays. New arrivals in the library are converted on their first pass too.</div>
+    <div style="display:flex;gap:18px;flex-wrap:wrap;font-size:11.5px;margin-top:8px">
+      <span><b>${fmt(d.done)}</b> <span class="dim">converted</span></span>
+      <span><b style="color:#7fd4a3">${saved.toFixed(0)} GB</b> <span class="dim">freed (${d.before_gb.toFixed(0)} → ${d.after_gb.toFixed(0)} GB)</span></span>
+      <span><b>${fmt(d.queued)}</b> <span class="dim">in the queue</span></span>
+      <span><b>${fmt(d.left)}</b> <span class="dim">left · ${fmt(d.left_gb)} GB</span></span>
+      <span class="dim">${d.per_hour?d.per_hour+' an hour · ':''}${eta}</span>
+      ${d.kept_original?`<span class="dim">${d.kept_original} kept as they were (would not save ${Math.round(d.min_saving*100)}%)</span>`:''}
+      ${d.failed?`<span style="color:#e2b341">${d.failed} failed</span>`:''}
+    </div></div>`;
+}
+async function convSet(o){
+  const q=Object.entries(o).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');
+  await fetch('/api/convert/cfg?'+q,{method:'POST'}); loadConvert();
 }
 async function vmafSet(o){
   const q=Object.entries(o).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');

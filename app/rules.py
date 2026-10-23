@@ -908,7 +908,30 @@ BURN_NEVER_TITLE_RE = re.compile(
     r"\bsdh\b|closed\s*caption|\bcc\b", re.I)
 
 
-def _burn_looks_dialogue(s: dict, pool: list[dict]) -> str:
+def _burn_cpm(s: dict, minutes: float) -> float | None:
+    """Lines per minute, from the container's count - None when unknown.
+    A picture track counts a display set to show and one to clear."""
+    try:
+        from . import subocr as _so
+        n = _so.cues(s)
+    except Exception:                                    # noqa: BLE001
+        return None
+    if n is None or not minutes or minutes <= 0:
+        return None
+    per = 2.0 if (s.get("codec_name") or "").lower() in IMAGE_SUB_CODECS else 1.0
+    return n / per / minutes
+
+
+# DENSITY, THE SIGNAL THE TITLE CANNOT FAKE. Signs and songs are a few lines a
+# minute; a script is ten to twenty. Measured 2026-10-22 on the conversion
+# candidates: a lone ASS track titled "English", default-flagged, 397 lines over
+# 24 minutes (16.5 a minute) - the whole script - was picked by the "Default
+# flag (non-dialogue)" rule, because the title named no script word, 397 is
+# under the 500-cue ceiling, and there was no second track to compare with.
+DIALOGUE_CPM = 10.0
+
+
+def _burn_looks_dialogue(s: dict, pool: list[dict], minutes: float = 0.0) -> str:
     """Why this track must not be burned, or '' when nothing says so.
 
     THE FLAG WAS BELIEVED OVER THE TITLE, and that burned full dialogue into
@@ -923,10 +946,22 @@ def _burn_looks_dialogue(s: dict, pool: list[dict]) -> str:
     title = _title(s)
     if BURN_NEVER_TITLE_RE.search(title or ""):
         return f"titled {title!r}, which names the full script"
+    # A TITLE THAT SAYS SIGNS OR SONGS IS TAKEN AT ITS WORD - and only that:
+    # its karaoke can run to thousands of events, which every count below
+    # would read as a script. The flag-only and untitled tracks get no pass.
+    if SIGNS_TITLE_RE.search(title or ""):
+        return ""
+    cpm = _burn_cpm(s, minutes)
+    # a title that says signs/songs is allowed its karaoke effects, which can
+    # run to thousands of events; anything else that dense is a script
+    if cpm is not None and cpm >= DIALOGUE_CPM and not SIGNS_TITLE_RE.search(title or ""):
+        return f"{cpm:.1f} lines a minute - a script, not signs"
     try:
         from . import subocr as _so
         n = _so.cues(s)
-        if n is not None and n / _so.FRAMES_PER_CUE >= _so.dialogue_min_cues():
+        # a track TITLED signs/songs may be karaoke - one event per syllable,
+        # thousands of them - so the size ceiling is for everything else
+        if n is not None and n / _so.FRAMES_PER_CUE >= _so.dialogue_min_cues()                 and not SIGNS_TITLE_RE.search(title or ""):
             return f"{int(n / _so.FRAMES_PER_CUE)} cues - a script, not signs"
         if n is not None:
             # ANOTHER TRACK IN THE SAME LANGUAGE WITH FAR FEWER CUES is the
@@ -944,7 +979,8 @@ def _burn_looks_dialogue(s: dict, pool: list[dict]) -> str:
 
 
 def pick_burn_target(subs: list[dict],
-                     lang_guard: bool | None = None) -> tuple[int | None, str]:
+                     lang_guard: bool | None = None,
+                     minutes: float = 0.0) -> tuple[int | None, str]:
     """The subtitle to burn: a signs/forced track, by priority.
 
     TITLE BEFORE FLAG. Each variant is tried twice - first only on what the
@@ -971,8 +1007,15 @@ def pick_burn_target(subs: list[dict],
                           for rx in variant["patterns"])
             if not hit:
                 continue
-            if _burn_looks_dialogue(s, subs):
+            if _burn_looks_dialogue(s, subs, minutes):
                 continue
+            # A FLAG ALONE HAS TO PROVE IT IS SPARSE. Nothing in the title said
+            # signs; the flag is the release's word, and releases set it on
+            # scripts. Unless the density is known and signs-like, leave it.
+            if by_flag:
+                _c = _burn_cpm(s, minutes)
+                if _c is None or _c >= 6.0:
+                    continue
             # An UNTITLED default-flagged track is ambiguous: the exclude list
             # ("full", "dialogue"...) matches on the title, so with no title the
             # guard cannot fire. On this library those are the FULL DIALOGUE
@@ -1778,6 +1821,14 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
             _trial_hevc10 = _trial and str(_kvg("shrink.trial_hevc10") or "0") == "1"
     except Exception:                                    # noqa: BLE001
         _trial = _trial_hevc10 = False
+    # LIBRARY CONVERSION TO 10-BIT HEVC - see hevcconvert.py. Asked of every
+    # plan, so a new arrival in a converted library is converted too.
+    _conv = False
+    try:
+        from . import hevcconvert as _hc
+        _conv = _hc.wants(library, vcodec, bool(ten_bit), bool(hdr), int(height or 0), float(overall_mbps or 0))
+    except Exception:                                    # noqa: BLE001
+        _conv = False
     oversized = ((_v("shrink_enabled", CONFIG["spaceSaver"]["enabled"]) or _trial)
                  and overall_mbps > ceiling * CONFIG["spaceSaver"]["triggerFactor"]
                  and (_v("shrink_include_hdr",
@@ -1806,9 +1857,9 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
                        + (" (10-bit kept)" if p.ten_bit else ""),
               why,
               f"{p.venc['encoder']} cq={p.venc['cq']}")
-    elif oversized:          # only reachable if the shrink is re-enabled
+    elif oversized or _conv:
         p.encode = True
-        if _trial_hevc10:
+        if _trial_hevc10 or _conv:
             # TO 10-BIT HEVC. Safe on the anime profile, which scores x265 +200
             # and 10bit +50; the Nu profiles score sub-2160p x265 -999999,
             # which is why this is a trial switch and not the default.
@@ -1824,6 +1875,10 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
                           cq=int(_v("h265_cq", _tg["cq"])),
                           extra=CONFIG["nvencExtra"].get(target, ""))
             p.ten_bit = True
+            if _conv and not oversized:
+                # A CONVERSION HAS TO EARN ITS GENERATION: at least
+                # hevcconvert.MIN_SAVING smaller, or the original stays.
+                p.venc["min_saving"] = _hc.MIN_SAVING
         # keep SOURCE codec on shrink -> avoids arr h265 re-download loops
         elif not _v("shrink_force_h265", CONFIG["spaceSaver"]["forceH265"]) \
                 and vcodec == "h264":
@@ -1841,11 +1896,13 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
                           preset=str(_v("h264_preset", _tg["preset"])),
                           cq=int(_v("h264_cq", _tg["cq"])),
                           extra=CONFIG["nvencExtra"].get(target, ""))
-        p.add("video", f"shrink the video ({overall_mbps:.1f} Mbps is high for this size)"
-                       + (" to 10-bit HEVC" if _trial_hevc10 else ""),
-              f"above the {ceiling} Mbps ceiling for {_res_tier(height)}p; "
+        p.add("video", (f"shrink the video ({overall_mbps:.1f} Mbps is high for this size)"
+                        if oversized else f"convert the video to 10-bit HEVC ({overall_mbps:.1f} Mbps of 8-bit H.264)")
+                       + (" to 10-bit HEVC" if oversized and (_trial_hevc10 or _conv) else ""),
+              (f"above the {ceiling} Mbps ceiling for {_res_tier(height)}p; " if oversized
+               else "this library is being converted; ")
               + ("10-bit HEVC keeps flat colour and dark gradients from banding"
-                 if _trial_hevc10 else "source codec kept to avoid an arr re-download loop"),
+                 if (_trial_hevc10 or _conv) else "source codec kept to avoid an arr re-download loop"),
               f"maxrate {max(overall_mbps * p.venc['maxrate_factor'], p.venc['maxrate_floor_mbps']):.1f} Mbps")
     elif hdr:
         # NOTE, not an action. "copy video (HDR preserved)" describes what we are
@@ -2323,11 +2380,16 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
         if known:
             for n, i in enumerate(p.keep_subs or range(len(subs))):
                 if i in known and (subs[i].get("codec_name") or "").lower() \
-                        in IMAGE_SUB_CODECS and not _burn_looks_dialogue(subs[i], subs):
+                        in IMAGE_SUB_CODECS and not _burn_looks_dialogue(
+                            subs[i], subs, float((probe.get("format") or {}).get("duration") or 0) / 60.0):
                     bi, variant = n, "typeset pictures"
                     break
         if bi is None:
-            bi, variant = pick_burn_target(pool, _sr("burn_lang_guard"))
+            try:
+                _mins = float((probe.get("format") or {}).get("duration") or 0) / 60.0
+            except (TypeError, ValueError):
+                _mins = 0.0
+            bi, variant = pick_burn_target(pool, _sr("burn_lang_guard"), _mins)
         if bi is not None:
             real = p.keep_subs[bi] if p.keep_subs else bi
             is_image = (subs[real].get("codec_name") or "").lower() in IMAGE_SUB_CODECS

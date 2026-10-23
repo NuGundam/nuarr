@@ -6034,10 +6034,15 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
     # maxrateFactor x source, so a healthy conversion lands near that; anything
     # far beyond it means something went wrong and is still discarded.
     grow_ok = bool(getattr(job.plan, "grow_ok", False))
+    # A LIBRARY CONVERSION (hevcconvert.py) must save its own, larger share -
+    # a burn riding along does not make it a compatibility encode.
+    _conv_min = float(((getattr(job.plan, "venc", None) or {}).get("min_saving")) or 0)
+    if _conv_min:
+        grow_ok = False
     if grow_ok:
         limit, how = growth_allowance(job.plan, size_before)
     else:
-        limit, how = (1.0 - MIN_SAVING), "a shrink has to shrink"
+        limit, how = (1.0 - max(MIN_SAVING, _conv_min)), "a shrink has to shrink"
     if job.plan.encode and ratio > limit:
         await asyncio.to_thread(_rm, out)
         if grow_ok:
@@ -6054,7 +6059,7 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
             msg = (f"discarded: re-encode produced {ratio*100:.0f}% of the "
                    f"original ({size_before/1024**2:.0f} MB -> "
                    f"{size_after/1024**2:.0f} MB); needs to save at least "
-                   f"{MIN_SAVING*100:.0f}% to be worth keeping")
+                   f"{max(MIN_SAVING, _conv_min)*100:.0f}% to be worth keeping")
             reason = "re-encode would not shrink it"
         joblog.log(msg, "warn", job.id)
         with cursor() as cur:
