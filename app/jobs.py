@@ -854,6 +854,9 @@ class Worker:
     vmaf_stage: str = ""
     vmaf_at: float = 0.0
     vmaf_info: dict = field(default_factory=dict)
+    # WHAT THE SEARCH DECIDED, kept for the rest of the job: the card shows it
+    # while the encode runs, and it is written into the plan for Activity.
+    vmaf_result: dict = field(default_factory=dict)
     _cm_bytes: int = 0
     _cm_at: float = 0.0
     # ffmpeg's out_time does not advance on every file - see read_progress().
@@ -1367,6 +1370,7 @@ class Worker:
             "vmaf_stage": self.vmaf_stage,
             "vmaf_at": self.vmaf_at,
             "vmaf_info": self.vmaf_info,
+            "vmaf_result": self.vmaf_result,
             "by_bytes": self.by_bytes,
             # Seconds left on the commit copy, from the smoothed rate. Computed
             # here rather than in the browser so it cannot disagree with the
@@ -5766,16 +5770,46 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
                 if _vr.get("cq") is not None:
                     _fixed = int((job.plan.venc or {}).get("cq") or 0)
                     job.plan.venc = dict(job.plan.venc or {}, cq=int(_vr["cq"]), cq_fixed=_fixed,
-                                         vmaf=_vr.get("vmaf"))
-                    joblog.log(f"VMAF target: CQ {_vr['cq']} instead of {_fixed} - scores {_vr['vmaf']} "
-                               f"(worst sample {_vr['worst']}, banding {_vr.get('cambi')}), samples "
-                               + (f"{_vr['saved']:+.0f}% smaller" if (_vr.get('saved') or 0) >= 0
-                                  else f"{-_vr['saved']:.0f}% larger")
-                               + f"; {_vr['probes']} probes in {_vr['secs']:.0f}s ({_vr['note']})",
+                                         vmaf=_vr.get("vmaf"), vmaf_worst=_vr.get("worst"),
+                                         cambi=_vr.get("cambi"), vmaf_saved=_vr.get("saved"))
+                    _sv = _vr.get("saved")
+                    _svt = ("" if _sv is None else
+                            f"samples {_sv:.0f}% smaller than at CQ {_fixed}" if _sv >= 0
+                            else f"samples {-_sv:.0f}% larger than at CQ {_fixed}")
+                    _tried = " · ".join(f"CQ {t['cq']} {'✓' if t['ok'] else '✗'} {t['vmaf']}"
+                                        for t in (_vr.get("tried") or []))
+                    w.vmaf_result = {"cq": int(_vr["cq"]), "fixed": _fixed, "vmaf": _vr.get("vmaf"),
+                                     "worst": _vr.get("worst"), "cambi": _vr.get("cambi"),
+                                     "saved": _sv, "probes": _vr.get("probes"), "secs": _vr.get("secs"),
+                                     "note": _vr.get("note"), "tried": _vr.get("tried") or []}
+                    joblog.log(f"VMAF target: CQ {_vr['cq']} chosen instead of the library's {_fixed} - "
+                               f"VMAF {_vr['vmaf']} (worst sample {_vr['worst']}), banding {_vr.get('cambi')}, "
+                               + (_svt or "no size comparison")
+                               + f"; {_vr['probes']} probes in {_vr['secs']:.0f}s ({_vr['note']})"
+                               + (f" - tried {_tried}" if _tried else ""),
                                "info", job.id)
+                    # INTO THE PLAN, AND THE PLAN BACK ONTO THE JOB ROW, so the
+                    # Activity panel shows what was chosen after the job ends -
+                    # it reads plan_json, which was otherwise written once at
+                    # enqueue and never again.
+                    try:
+                        job.plan.add("video", f"quality search chose CQ {_vr['cq']} (the library's is {_fixed})",
+                                     f"VMAF {_vr['vmaf']}, worst sample {_vr['worst']}, banding {_vr.get('cambi')}"
+                                     + (f", {_svt}" if _svt else ""),
+                                     _tried)
+                        with cursor() as _cur:
+                            _cur.execute("UPDATE jobs SET plan_json=? WHERE job_id=?",
+                                         (json.dumps(job.plan.to_dict()), job.id))
+                    except Exception:                    # noqa: BLE001
+                        pass
+                else:
+                    w.vmaf_result = {"cq": None, "note": _vr.get("note") or "",
+                                     "fixed": int((job.plan.venc or {}).get("cq") or 0)}
                 w.vmaf_stage, w.vmaf_frac, w.vmaf_info = "", 0.0, {}
             elif _vt.cfg()["on"] and _skip and _skip != "no encode":
                 joblog.log(f"VMAF target skipped: {_skip} - library CQ kept", "info", job.id)
+                w.vmaf_result = {"cq": None, "note": _skip,
+                                 "fixed": int((job.plan.venc or {}).get("cq") or 0)}
         except Exception as _ve:                             # noqa: BLE001
             joblog.log(f"VMAF target unavailable ({type(_ve).__name__}) - library CQ kept", "warn", job.id)
 

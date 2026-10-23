@@ -25270,6 +25270,24 @@ function sizeDelta(w){
 // the search runs), the time left from the pace so far, and each CQ tried
 // with its score - green passed, red did not.
 function vmafCell(w){
+  // AFTER THE SEARCH: what it picked, for the whole of the encode.
+  if(!w.vmaf_stage && w.vmaf_result){
+    const r = w.vmaf_result, col = poolColor('quality');
+    if(r.cq == null)
+      return `<div class="socr vmafrow"><span class="pill" style="color:var(--dim);border-color:var(--line)">quality</span>
+        <span class="dim">library CQ ${r.fixed||''} kept - ${esc(r.note||'')}</span></div>`;
+    const sv = r.saved;
+    const svt = sv==null ? '' : (sv>=0 ? `<span style="color:#7fd4a3">samples ${sv.toFixed(0)}% smaller</span> than at CQ ${r.fixed}`
+                                       : `<span style="color:#ff7b72">samples ${(-sv).toFixed(0)}% larger</span> than at CQ ${r.fixed}`);
+    const chips = (r.tried||[]).map(t => `<span class="vmafcq" title="CQ ${t.cq}: VMAF ${t.vmaf}, banding ${t.cambi}"
+        style="color:${t.ok?'#7fd4a3':'#e0575b'};border-color:${t.ok?'rgba(127,212,163,.45)':'rgba(224,87,91,.45)'};${t.cq===r.cq?'font-weight:700;background:rgba(162,224,94,.12)':''}">CQ ${t.cq} ${t.ok?'✓':'✗'} ${t.vmaf}</span>`).join('');
+    return `<div class="socr vmafrow">
+      <span class="pill" style="color:${col};border-color:${col}">quality ✓</span>
+      <span><b style="color:${col}">CQ ${r.cq}</b> <span class="dim">chosen (library ${r.fixed})</span> · VMAF <b>${r.vmaf}</b>
+        <span class="dim">(worst ${r.worst})</span> · banding <b>${r.cambi}</b>${svt?' · '+svt:''}</span>
+      <span>${chips}</span>
+      <span class="dim">${r.probes||''} probes in ${Math.round(r.secs||0)}s</span></div>`;
+  }
   if(!w.vmaf_stage) return '';
   const f = Math.max(0, Math.min(1, w.vmaf_frac||0)), pct = f*100;
   const el = w.vmaf_at ? Math.max(0, Date.now()/1000 - w.vmaf_at) : 0;
