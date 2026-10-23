@@ -47,7 +47,7 @@ KV = "vmaf.cfg"
 KV_LEARN = "vmaf.learn"
 DEFAULTS = {"on": True, "target": 95.0, "samples": 4, "sample_s": 6.0, "floor": 2.0, "banding": 4.0}
 CQ_DOWN = 4            # at most this many CQ steps BELOW the library's CQ
-CQ_UP = 10             # at most this many above it
+CQ_UP = 14             # at most this many above it (was 10; burn-heavy anime passed VMAF 96-98 at the old cap of +10)
 MIN_MINUTES = 4.0
 MAX_PROBES = 6
 # THE SEARCH IS CPU WORK, THE ENCODE IS GPU WORK. With four encode slots and a
