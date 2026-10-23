@@ -3369,7 +3369,16 @@ def check_drivepool() -> Reason:
 # purpose: a stall that clears in two seconds still buys the viewer a full
 # hold, and a buffer that pops over the line for one poll does not release.
 BUFFER_SETTLE_S = 20.0
-_BUF: dict = {"since": 0.0, "last": 0.0, "ok_since": 0.0, "who": ""}
+# THE WAIT FOR EVERYONE TO CLEAR THEIR FLOOR HAS AN END. 2026-10-22: daphoking
+# stalled for a moment at 18:20, then paused; the hold then waited for EVERY
+# playing viewer to be over their floor, and a remote 4K viewer sat at 56 s
+# against a 77 s floor - so everything stayed frozen for over an hour, still
+# labelled "daphoking is buffering". Once the minimum is served and nobody has
+# stalled again for this long, the hold lifts and the per-disk rules - which
+# already pause work on that viewer's spindle until their buffer is back -
+# carry on protecting them.
+BUFFER_MAX_SETTLE_S = 120.0
+_BUF: dict = {"since": 0.0, "last": 0.0, "ok_since": 0.0, "who": "", "stallers": [], "waiting_on": ""}
 
 
 def _buffer_note(active: list, buffering: list, base: float) -> None:
@@ -3388,7 +3397,8 @@ def _buffer_note(active: list, buffering: list, base: float) -> None:
                        f"running job is frozen until they are in the clear",
                        "warn")
             _BUF["since"] = now
-        _BUF.update(last=now, ok_since=0.0, who=who)
+        _BUF.update(last=now, ok_since=0.0, who=who, waiting_on="",
+                    stallers=sorted({str(s.get("user") or s.get("username") or "") for s in buffering}))
         return
     if not _BUF["since"]:
         return
@@ -3396,6 +3406,7 @@ def _buffer_note(active: list, buffering: list, base: float) -> None:
     # served since the LAST stall and every measured viewer is back over
     # their floor and has stayed there - or when nobody is watching at all.
     clear = True
+    below = []
     for s in active:
         try:
             lead = float(s.get("lead_s"))
@@ -3404,18 +3415,28 @@ def _buffer_note(active: list, buffering: list, base: float) -> None:
         floor = session_floor(s, base)
         if floor > 0 and lead < floor:
             clear = False
-            break
+            below.append(f"{s.get('user') or s.get('username') or 'a viewer'} "
+                         f"({lead:.0f}s of a {floor:.0f}s floor)")
+    # WHO THE HOLD IS ACTUALLY WAITING FOR NOW, which is not always who stalled.
+    _BUF["waiting_on"] = ", ".join(below)
     if not clear:
         _BUF["ok_since"] = 0.0
     elif not _BUF["ok_since"]:
         _BUF["ok_since"] = now
     served = now - _BUF["last"] >= hold_s
     settled = bool(_BUF["ok_since"]) and now - _BUF["ok_since"] >= BUFFER_SETTLE_S
-    if (served and settled) or not active:
-        joblog.log(f"buffering hold released after {now - _BUF['since']:.0f}s - "
-                   + ("nobody is watching" if not active
-                      else f"{_BUF['who']} has buffer again"), "ok")
-        _BUF.update(since=0.0, last=0.0, ok_since=0.0, who="")
+    # The viewer who stalled has paused or stopped: their stall is over.
+    playing_users = {str(s.get("user") or s.get("username") or "") for s in active}
+    staller_gone = bool(_BUF.get("stallers")) and not (set(_BUF["stallers"]) & playing_users)
+    capped = now - _BUF["last"] >= hold_s + BUFFER_MAX_SETTLE_S
+    if (served and (settled or staller_gone or capped)) or not active:
+        why = ("nobody is watching" if not active
+               else f"{_BUF['who']} has buffer again" if settled
+               else f"{_BUF['who']} paused or stopped" if staller_gone
+               else f"no stall for {hold_s + BUFFER_MAX_SETTLE_S:.0f}s - "
+                    f"{_BUF['waiting_on'] or 'everyone'} left to the per-disk rules")
+        joblog.log(f"buffering hold released after {now - _BUF['since']:.0f}s - {why}", "ok")
+        _BUF.update(since=0.0, last=0.0, ok_since=0.0, who="", stallers=[], waiting_on="")
 
 
 def buffer_hold() -> tuple[bool, str, float]:
@@ -3424,6 +3445,11 @@ def buffer_hold() -> tuple[bool, str, float]:
         return False, "", 0.0
     left = max(0.0, _tune("buffer_hold_s") - (time.time() - _BUF["last"]))
     return True, _BUF["who"], left
+
+
+def buffer_waiting_on() -> str:
+    """Once the minimum is served: whose buffer the hold is still waiting for."""
+    return _BUF.get("waiting_on") or ""
 
 
 # ------------------------------------------------------ a viewer landing --
@@ -3521,7 +3547,8 @@ def global_hold() -> tuple[bool, str, float]:
     held right now, and why. A stall outranks a landing."""
     on, who, left = buffer_hold()
     if on:
-        return True, f"{who} is buffering", left
+        w = buffer_waiting_on()
+        return True, (f"{who} stalled - waiting for {w}" if (w and left <= 0) else f"{who} is buffering"), left
     on, who, left = landing_hold()
     if on:
         return True, f"{who} just pressed play", left
@@ -3548,17 +3575,23 @@ def check_buffering() -> Reason:
     if not on:
         return Reason(False, "buffering", "no viewer is stalling")
     settle = int(BUFFER_SETTLE_S)
+    w = buffer_waiting_on()
+    since_last = time.time() - _BUF["last"]
+    cap_left = max(0.0, _tune("buffer_hold_s") + BUFFER_MAX_SETTLE_S - since_last)
     return Reason(
         True, "buffering",
-        f"{who} is buffering - everything is held",
+        (f"{who} is buffering - everything is held" if left > 0 or not w
+         else f"{who} stalled {since_last:.0f}s ago - still waiting for {w}"),
         extra=["Every pool holds and every running job is frozen, on "
                "every disk: a stalling viewer is the one thing nuarr must "
                "never be the cause of",
                (f"at least {left:.0f}s more" if left > 0
-                else "minimum served; waiting for the buffer to settle")],
+                else f"minimum served; waiting for the buffer to settle - at most {cap_left:.0f}s more")],
         clears=(f"{int(_tune('buffer_hold_s'))}s after the last stall, once "
-                f"their buffer is back over its floor for {settle}s - or "
-                "when they stop watching"))
+                f"every viewer is back over their floor for {settle}s, or the one who "
+                f"stalled pauses or stops - and in any case {int(BUFFER_MAX_SETTLE_S)}s "
+                "after that with no new stall; the per-disk rules keep protecting anyone "
+                "still short"))
 
 
 def check_manual() -> Reason:
