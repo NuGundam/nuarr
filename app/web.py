@@ -40291,11 +40291,14 @@ function paintCodecTab(){
           const kids=fields.filter(k=>k.parent===f.key);
           if(!kids.length) return codecField(L.name,side,f);
           const on=!!(((_cod.policy||{})[L.name]||{})[side]||{})[f.key];
+          // OFF IS SHOWN, NOT HIDDEN. Collapsed to "6 more settings", a person
+          // had to switch a destructive rule on just to read what it would
+          // do. The children now render greyed and inert while their parent
+          // is off - visible, and plainly not in force.
           return codecField(L.name,side,f)
-            +`<div class="cfkids${on?' open':''}">`
-            +(on ? kids.map(k=>codecField(L.name,side,k)).join('')
-                 : `<div class="cfkidsoff dim">${kids.length} more setting${
-                      kids.length===1?'':'s'} — shown when this is on</div>`)
+            +`<div class="cfkids${on?' open':' cfkidsdim'}">`
+            +(on ? '' : `<div class="cfkidsoff dim">these apply once ${esc(f.label.toLowerCase())} is switched on</div>`)
+            +kids.map(k=>codecField(L.name,side,k)).join('')
             +`</div>`;
         }).join('')}
         ${side==='video'?`<div class="cftestrow">
@@ -50828,6 +50831,7 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
 .cfkids.open{border-left-color:#2f6f4f}
 .cfkids .cfrow:last-child{border-bottom:none}
 .cfkidsoff{font-size:11.5px;padding:7px 0 9px;font-style:italic}
+.cfkidsdim .cfrow{opacity:.42;pointer-events:none;filter:grayscale(.6)}
 /* the "how auto works" block at the top of the video tab */
 .cfintro{border:1px solid var(--line);border-radius:8px;padding:13px 16px;
   margin-bottom:12px;background:rgba(255,255,255,.02)}

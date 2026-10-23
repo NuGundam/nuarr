@@ -169,11 +169,16 @@ FIELDS: dict[str, list[dict]] = {
         {"key": "shrink_enabled", "label": "Shrink oversized files",
          "type": "bool", "default": False,
          "what": "Re-encodes files whose bitrate is above the ceiling for "
-                 "their resolution. OFF, and deliberately: with animation "
-                 "excluded and the ceiling at a level that does not wreck "
-                 "the picture, only 17 files in the whole library qualify. "
-                 "That is not a library-scale saving and it is a destructive "
-                 "rule to carry for it."},
+                 "their resolution, keeping the source codec unless told "
+                 "otherwise below. Every shrink goes through the quality "
+                 "search (VMAF 95, banding under 4 - see Quality target at "
+                 "the top of this page) and is thrown away unless it saves "
+                 "at least 5%, so it can no longer quietly soften a file. "
+                 "Still off by default: it re-encodes files that play fine, "
+                 "and on 8-bit H.264 animation it bands at any setting that "
+                 "saves much. For a library of 8-bit H.264, the conversion "
+                 "to 10-bit HEVC below does the job better - the 322 "
+                 "oversized anime files went 1.92 TB to 0.24 TB that way."},
         {"parent": "shrink_enabled", "key": "shrink_1080_mbps", "label": "Shrink ceiling — 1080p",
          "type": "int", "min": 0, "max": 200, "step": 1, "default": 22,
          "unit": "Mbps",
