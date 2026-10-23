@@ -38553,7 +38553,7 @@ function vfyBlock(kind){
       For a raw, Whisper's language head settles whether English is in fact spoken. Each ASS track it reads also teaches the show's style below.</div>
     <div style="font-size:11px;margin:6px 0">How often each engine agreed with the final verdict: ${engChip('whisper','Whisper')}${engChip('qwen','Qwen')}${engChip('rules','the readers')}</div>
     ${rows.length?`<div class="rowbox scrollbox" style="max-height:320px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
-      <colgroup><col style="width:52px"><col style="width:auto"><col style="width:44px"><col style="width:78px"><col style="width:86px"><col style="width:82px"><col style="width:84px"><col style="width:150px"></colgroup>
+      <colgroup><col style="width:52px"><col style="width:auto"><col style="width:44px"><col style="width:78px"><col style="width:96px"><col style="width:82px"><col style="width:100px"><col style="width:230px"></colgroup>
       <thead><tr class="dim" style="font-size:10.5px"><th class="l">WHEN</th><th class="l">FILE · QUESTION</th><th class="c">WAS</th><th class="c">READERS</th><th class="c">WHISPER</th><th class="c">QWEN</th><th class="c">VERDICT</th><th class="l">DONE</th></tr></thead><tbody>
       ${rows.map((r,i)=>{ const e=r.evidence||{}, vt=e.votes||{}, w=e.whisper||{}, q=e.qwen; const open=_vfyOpen===r.id;
         const verdictWord=r.kind?r.kind:(r.verdict||'undecided');
@@ -38562,10 +38562,10 @@ function vfyBlock(kind){
           <td class="l" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.path)}"><b>${esc(r.label)}</b><div class="dim" style="font-size:10px">${esc(r.question)}</div></td>
           <td class="c dim" title="how sure the board was before">${r.was_sure}%</td>
           <td class="c" style="font-size:10.5px">${vfyVote(vt.rules)}</td>
-          <td class="c" style="font-size:10.5px">${vt.whisper?vfyVote(vt.whisper):'<span class="dim">-</span>'}${w.compared?`<div class="dim" style="font-size:10px">${w.matched}/${w.compared} lines match</div>`:''}</td>
+          <td class="c" style="font-size:10.5px;white-space:normal">${vt.whisper?vfyVote(vt.whisper):'<span class="dim">-</span>'}${w.compared?`<div class="dim" style="font-size:10px">${w.matched}/${w.compared} lines match</div>`:''}</td>
           <td class="c" style="font-size:10.5px">${vt.qwen?vfyVote(vt.qwen):'<span class="dim">not asked</span>'}${q?`<div class="dim" style="font-size:10px">${q.p}% dialogue</div>`:''}</td>
-          <td class="c"><b style="color:${r.confidence>=v.sure_at?'#3fb950':r.verdict?'#e3b341':'#8b949e'}">${esc(verdictWord)}</b><div class="dim" style="font-size:10px">${r.confidence?r.confidence+'%':''}</div></td>
-          <td class="l" style="font-size:10.5px;color:${r.action.startsWith('answered')?'#3fb950':r.action.startsWith('failed')?'#e0575b':'var(--dim)'}">${esc(r.action)}</td></tr>
+          <td class="c" style="white-space:normal;overflow-wrap:anywhere"><b style="color:${r.confidence>=v.sure_at?'#3fb950':r.verdict?'#e3b341':'#8b949e'}">${esc(verdictWord)}</b><div class="dim" style="font-size:10px">${r.confidence?r.confidence+'%':''}</div></td>
+          <td class="l" style="white-space:normal;overflow-wrap:anywhere;font-size:10.5px;color:${r.action.startsWith('answered')?'#3fb950':r.action.startsWith('failed')?'#e0575b':'var(--dim)'}">${esc(r.action)}</td></tr>
           ${open?`<tr><td colspan="8" style="background:rgba(255,255,255,.025);padding:6px 10px;font-size:11px;white-space:normal">
             ${(w.pairs||[]).length?`<div style="font-weight:600;margin-bottom:3px">On the screen · what Whisper heard there</div>${w.pairs.map(p=>`<div class="mono" style="font-size:10.5px"><span style="color:${p.match>=0.34?'#3fb950':'#e0575b'}">${Math.round(p.match*100)}%</span> &nbsp;${esc(p.screen)} <span class="dim">·</span> <i>${esc(p.heard||'(nothing heard)')}</i></div>`).join('')}`:''}
             ${(w.audio||[]).length?`<div><b>Audio tracks:</b> ${w.audio.map(a=>`track ${a.track+1}: ${esc(a.code||'?')} ${Math.round(a.confidence*100)}%`).join(' · ')}</div>`:''}

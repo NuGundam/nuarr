@@ -267,6 +267,11 @@ def _english_hits(words: str) -> list:
 # until files move, which is the honest state of it - and the 362 sitting on
 # `marks` are queued for a re-read right now, so it will fill.
 RULES: dict = {
+    "answered": {
+        "says": MISSING, "sure": 95, "short": "answered",
+        "line": "somebody answered this file - the second opinion or you",
+        "rests": "an answer about this one file outranks every rung that could "
+                 "not decide; a reading that later finds subtitles still wins."},
     "unread": {
         "says": UNKNOWN, "short": "not looked inside",
         "line": "nobody has opened this file yet",
@@ -453,6 +458,7 @@ RULE_ORDER = (
     "nopic", "show_burned",                    # and the shields
     "marks", "noframes", "stale",
     "signs_only", "missing",                   # the two that accuse
+    "answered",                                # a person or the second opinion said
 )
 assert set(RULE_ORDER) == set(RULES), "a rung is defined but never tried"
 
@@ -1245,17 +1251,35 @@ def check_one(file_id: int, cur=None) -> dict:
         untagged = _keeps_untagged(lib)
         now = time.time()
         out = {}
+        # AN ANSWER SETTLES WHAT THE RUNGS CANNOT. The second opinion answers
+        # "a raw" (or "English is spoken") with Whisper's language head, and
+        # that answer was only ever kept as a learning example - the next pass
+        # judged the file from scratch, landed on `unknown` again, and the
+        # file sat on the board as a question already answered: 21 City Hunter
+        # raws, answered 96-100% sure on 2026-10-21, never handed to the
+        # Subtitle maker, which only takes `missing`. Only an UNDECIDED verdict
+        # gives way to it - a reading that has since found subtitles still wins.
+        ans = cur.execute("SELECT said, by FROM raw_answers WHERE file_id=?",
+                          (int(file_id),)).fetchone() if _has_answers(cur) else None
         for lang in want:
             st, why, rule = verdict(file_id, lang, cur, facts, untagged,
                                     None,
                                     float(row["duration"] or 0) / 60.0,
                                     str(row["path"] or ""))
+            if st == UNKNOWN and ans is not None:
+                if str(ans["said"] or "") == "raw":
+                    st, rule = MISSING, "answered"
+                    why = (f"answered a raw by {ans['by'] or 'you'} - nothing here can be "
+                           f"followed without {lang} subtitles")
+                elif str(ans["said"] or "") == "not_raw":
+                    st, rule = OK, "answered"
+                    why = f"answered by {ans['by'] or 'you'}: not a raw"
             sure = _sure_of(st, rule, file_id, lang, cur, facts, None,
                             str(row["path"] or ""),
                             float(row["duration"] or 0) / 60.0)
             out[lang] = st
             if (was and str(was["state"] or "") in (MISSING, UNKNOWN)
-                    and st == OK and str(was["rule"] or "") != "unread"):
+                    and st == OK and str(was["rule"] or "") != "unread" and rule != "answered"):
                 try:
                     rs = raw_score(file_id, lang, cur, facts, None,
                                    str(row["path"] or ""),
@@ -1679,6 +1703,11 @@ def learn_init() -> None:
                 terms   TEXT,
                 path    TEXT
             )""")
+
+
+def _has_answers(cur) -> bool:
+    return bool(cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                            "AND name='raw_answers'").fetchone())
 
 
 def record_answer(file_id: int, said: str, by: str, rule: str = "",

@@ -144,6 +144,23 @@ def _note_engines(votes: dict, verdict: str) -> None:
 
 
 # ------------------------------------------------------------ picking -----
+def _label(fid: int, label: str, path: str) -> str:
+    """The row's name - never "(untitled)". A file read in its first minutes,
+    before the arr's title reached it, came with that placeholder; by now the
+    title is usually there, and the filename always is."""
+    if label and not label.startswith("(untitled)"):
+        return label
+    try:
+        from .db import display_label
+        with cursor() as cur:
+            r = cur.execute("SELECT title, season, episode, path FROM files WHERE id=?", (int(fid),)).fetchone()
+        if r and (r["title"] or "").strip():
+            return display_label(r["title"], r["season"], r["episode"], r["path"])
+    except Exception:                                            # noqa: BLE001
+        pass
+    return os.path.splitext(os.path.basename(path))[0][:90] or label or "(untitled)"
+
+
 def candidates(limit: int = 50) -> list:
     """The board's unsure rows, least sure first, not yet verified for this reading."""
     from . import subkind
@@ -301,7 +318,7 @@ def verify_one(row: dict, act: bool | None = None, dry: bool = False) -> dict:
     init()
     fid, source = int(row["file_id"]), str(row.get("source") or "")
     path = row.get("path") or ""
-    label = row.get("label") or os.path.basename(path)
+    label = _label(fid, row.get("label") or "", path)
     t0 = time.time()
     act = mode() == "auto" if act is None else act
     STATE.update(running=True, file_id=fid, label=label, stage="starting", pct=0.0, started=t0)
@@ -488,6 +505,12 @@ def verify_one(row: dict, act: bool | None = None, dry: bool = False) -> dict:
                 else:
                     subneed.record_answer(fid, "raw", "second opinion", str(row.get("rule") or ""), path=path)
                     action = "answered: a raw - the Subtitle maker takes it"
+                # the answer settles the raw check's row now (see subneed.check_one),
+                # so the board drops it and a raw goes on to the Subtitle maker
+                try:
+                    subneed.check_one(fid)
+                except Exception:                                # noqa: BLE001
+                    pass
             _note_engines(votes, "english" if verdict == "english" else "raw" if verdict == "raw" else verdict)
         elif verdict:
             action = f"left for you ({conf}% - the line is {sure}%)"
@@ -592,6 +615,8 @@ def snapshot() -> dict:
         tot = cur.execute("SELECT COUNT(*) n, SUM(CASE WHEN action LIKE 'answered%' THEN 1 ELSE 0 END) a, "
                           "SUM(CASE WHEN action LIKE 'left%' THEN 1 ELSE 0 END) l FROM verify_log").fetchone()
     for r in rows:
+        if (r.get("label") or "").startswith("(untitled)") or not r.get("label"):
+            r["label"] = _label(r["file_id"], "", r["path"])
         try:
             r["evidence"] = json.loads(r["evidence"] or "{}")
         except Exception:                                        # noqa: BLE001
