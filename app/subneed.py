@@ -1261,12 +1261,21 @@ def check_one(file_id: int, cur=None) -> dict:
         # gives way to it - a reading that has since found subtitles still wins.
         ans = cur.execute("SELECT said, by FROM raw_answers WHERE file_id=?",
                           (int(file_id),)).fetchone() if _has_answers(cur) else None
+        # ...BUT NOT BEFORE THE FILE HAS BEEN LOOKED AT, AND NEVER OVER AN
+        # ENGLISH TRACK. "Unknown" is also what a file says in its first
+        # minutes, before the subtitle reader has read its tracks - and the
+        # second opinion's "a raw" is about the AUDIO. On 2026-10-23 five FLE
+        # Maoyu remuxes with a default English AnimeNOW track inside were
+        # forced to `missing` that way and the Subtitle maker made Whisper
+        # subtitles nobody needed (recycled again once the track was read).
+        eng_inside = _eng_sub_inside(cur, int(file_id))
         for lang in want:
             st, why, rule = verdict(file_id, lang, cur, facts, untagged,
                                     None,
                                     float(row["duration"] or 0) / 60.0,
                                     str(row["path"] or ""))
-            if st == UNKNOWN and ans is not None:
+            if st == UNKNOWN and ans is not None and not eng_inside \
+                    and rule not in ("unread", "noread"):
                 if str(ans["said"] or "") == "raw":
                     st, rule = MISSING, "answered"
                     why = (f"answered a raw by {ans['by'] or 'you'} - nothing here can be "
@@ -1703,6 +1712,22 @@ def learn_init() -> None:
                 terms   TEXT,
                 path    TEXT
             )""")
+
+
+def _eng_sub_inside(cur, file_id: int) -> bool:
+    """Does the probe show an English subtitle track (not counting the
+    'English (nuarr)' one the Subtitle maker adds)?"""
+    try:
+        r = cur.execute("SELECT json FROM file_probes WHERE file_id=?", (int(file_id),)).fetchone()
+        for s_ in (json.loads((r["json"] if r else "") or "{}").get("streams") or []):
+            if s_.get("codec_type") != "subtitle":
+                continue
+            t = s_.get("tags") or {}
+            if (t.get("language") or "").lower() in ("eng", "en") and "nuarr" not in (t.get("title") or "").lower():
+                return True
+    except Exception:                                            # noqa: BLE001
+        pass
+    return False
 
 
 def _has_answers(cur) -> bool:

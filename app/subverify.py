@@ -459,16 +459,33 @@ def verify_one(row: dict, act: bool | None = None, dry: bool = False) -> dict:
             question = "is English spoken (a mis-tagged dub), or is it a raw?"
             from . import audiolang
             found = []
+            # A FILE WITH ENGLISH SUBTITLES INSIDE IS NOT A RAW, whatever its
+            # audio is. Asked first: the raw check can hold a file at "unknown"
+            # only because its tracks have not been read yet.
+            from . import subneed as _sn
+            with cursor() as cur:
+                _eng = _sn._eng_sub_inside(cur, fid)
+            if _eng:
+                ev["whisper"] = {"note": "not listened to - the file carries an English subtitle track"}
+                verdict, kind, conf = "english", "english subtitles", 100
+                votes["rules"] = "english"
+                n_tracks = 0
+            else:
+                n_tracks = -1
             with cursor() as cur:
                 r = cur.execute("SELECT audio_langs FROM files WHERE id=?", (fid,)).fetchone()
-            n_tracks = max(1, len([x for x in re.split(r"[,\s]+", str((r["audio_langs"] if r else "") or "")) if x]))
+            if n_tracks:
+                n_tracks = max(1, len([x for x in re.split(r"[,\s]+", str((r["audio_langs"] if r else "") or "")) if x]))
             for i in range(min(n_tracks, 4)):
                 tick(f"listening to audio track {i + 1}", 10 + 70 * i / max(1, n_tracks))
                 d = audiolang.detect(path, track=i, file_id=fid)
                 found.append({"track": i, "code": d.get("code") or "", "confidence": round(float(d.get("confidence") or 0), 2)})
-            ev["whisper"] = {"audio": found}
+            if not _eng:
+                ev["whisper"] = {"audio": found}
             eng = [f for f in found if f["code"] == "eng" and f["confidence"] >= 0.75]
-            if eng:
+            if _eng:
+                pass
+            elif eng:
                 verdict, kind, conf = "english", "english audio", int(round(100 * max(f["confidence"] for f in eng)))
                 votes["whisper"] = "english"
             elif found and all(f["code"] and f["code"] != "eng" and f["confidence"] >= 0.75 for f in found):
@@ -496,7 +513,10 @@ def verify_one(row: dict, act: bool | None = None, dry: bool = False) -> dict:
                                " · title already right" if r.get("gone") else f" · retitle failed: {r.get('why', '')[:60]}")
             elif source == subkind.RAW:
                 from . import subneed
-                if verdict == "english":
+                if verdict == "english" and kind == "english subtitles":
+                    subneed.record_answer(fid, "not_raw", "second opinion", str(row.get("rule") or ""), path=path)
+                    action = "answered: it has English subtitles inside - not a raw"
+                elif verdict == "english":
                     subneed.record_answer(fid, "not_raw", "second opinion", str(row.get("rule") or ""), path=path)
                     action = "answered: English is spoken - not a raw"
                     if act:
