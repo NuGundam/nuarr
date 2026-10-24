@@ -28,11 +28,34 @@ def set_pid(key: str, pid) -> None:
         m.update(pid=int(pid or 0), started=m.get("started") or time.time())
 
 
-def start(key: str) -> None:
-    """A new piece of work under this key: totals and rates from zero."""
+def start(key: str, file_id=None) -> None:
+    """A new piece of work under this key: totals and rates from zero.
+    file_id names the file being read, so the reads land on its disk in the
+    ledger (rw_by_label) - the writes go to the cache, which is not a pool
+    disk, and are not credited anywhere."""
+    disk = disk_of(file_id) if file_id else ""
     with _LOCK:
         _M[key] = {"pid": 0, "started": time.time(), "per_pid": {}, "read_total": 0, "write_total": 0,
-                   "read_bps": 0.0, "write_bps": 0.0, "at": 0.0, "prog": []}
+                   "read_bps": 0.0, "write_bps": 0.0, "at": 0.0, "prog": [], "disk": disk}
+
+
+def rw_by_label() -> dict:
+    """{pool disk: (read_bps, write_bps)} for every outside worker that named
+    its file - merged into idle.rw_by_label/bps_by_label, so the gate sees a
+    Whisper or VMAF read on a viewer's spindle as nuarr's own and not as a
+    stranger's load to steer around."""
+    out: dict = {}
+    with _LOCK:
+        for m in _M.values():
+            d = m.get("disk") or ""
+            if not d:
+                continue
+            _sample(m)
+            r = float(m.get("read_bps") or 0.0)
+            if r > 0:
+                a, b = out.get(d, (0.0, 0.0))
+                out[d] = (a + r, b)
+    return out
 
 
 def stop(key: str) -> None:

@@ -1,0 +1,9 @@
+Audit part 6: the open list
+
+- db: reaper thread shrinks idle connections' page cache after 2 min, closes dead threads' connections
+- fileops: the commit pause cap now sticks for the copy (one 5-min wait, then quarter speed) instead of re-waiting per 8 MB chunk
+- jobs.outside_commit: hardsub/subdupe/submake/subtiming commits get the same viewer/load pace and stage callback as queue commits; gate counts their copy rate as ours
+- outside.rw_by_label: outside workers' reads credited to the file's disk in the idle ledger
+- web: the 1.4 MB page script served as /app-<hash>.js, immutable for a year; stale hash answers location.reload()
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

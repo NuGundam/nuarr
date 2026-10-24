@@ -4877,6 +4877,53 @@ def _commit_pace(w: Worker):
     return pace
 
 
+# COMMITS MADE OUTSIDE THE QUEUE, while they copy. The gate reads their copy
+# rate here the way it reads a worker's, so a hardsub mark landing on a
+# viewer's disk is nuarr's own I/O and not "somebody else's".
+OUTSIDE_COMMITS: dict[int, object] = {}
+
+
+def outside_commit(path: str, system: str = "") -> dict:
+    r"""on_stage + pace for a safe_replace that has no Worker behind it.
+
+    hardsub, subdupe, submake and subtiming each committed a full container
+    copy over a library file at full speed, with no viewer check and no load
+    check - the one copy in the system the throttle did not govern. This
+    gives them the identical behaviour the queue's commits have, through the
+    same two callbacks: `fileops.safe_replace(path, tmp, **outside_commit(path))`.
+    """
+    import types
+    ns = types.SimpleNamespace(disk="", dest_disk="", commit_phase="", commit_total=0,
+                               commit_bytes=0, commit_bps=0.0, _cm_at=0.0, _cm_bytes=0,
+                               pace_factor=0.0, pace_why="", paused_for_viewer=False,
+                               paused_for_load=False, system=system, path=path,
+                               at=time.time())
+    try:
+        from . import scanner as _sc
+        ns.disk = _sc.disk_of(path) or ""
+    except Exception:                                        # noqa: BLE001
+        pass
+    key = id(ns)
+    OUTSIDE_COMMITS[key] = ns
+    stage = _commit_stage_cb(ns)
+
+    def _on_stage(phase, staged, copied, total):
+        stage(phase, staged, copied, total)
+        if phase == "verifying":
+            OUTSIDE_COMMITS.pop(key, None)
+
+    def _pace():
+        try:
+            return disk_pace(ns)
+        except Exception:                                    # noqa: BLE001
+            return 0.0
+    # a same-volume commit never calls on_stage: anything two hours old is gone
+    for k, o in list(OUTSIDE_COMMITS.items()):
+        if time.time() - float(getattr(o, "at", 0) or 0) > 7200:
+            OUTSIDE_COMMITS.pop(k, None)
+    return {"on_stage": _on_stage, "pace": _pace}
+
+
 def paced_disks() -> set[str]:
     r"""Spindles that currently have a copy on them the ramp can actually slow.
 

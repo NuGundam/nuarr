@@ -470,6 +470,7 @@ def copy_with_progress(src: str, dst: str, on_progress=None,
     """
     total = os.path.getsize(src)
     copied = 0
+    capped = False           # the full PAUSE_CAP_S has been waited once
     bg = _BackgroundIO()
     try:
         with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
@@ -498,7 +499,16 @@ def copy_with_progress(src: str, dst: str, on_progress=None,
                     # a second of the buffer recovering - the whole point is to
                     # give the disk back promptly, and a long fixed sleep would
                     # keep yielding after the reason had gone.
-                    if factor < 0:
+                    if factor < 0 and capped:
+                        # THE CAP WAS ONLY A CAP FOR ONE CHUNK. After the
+                        # five-minute wait this fell to "heaviest throttle" for
+                        # 8 MB, then the next chunk asked pace() again, got the
+                        # same -1 and waited another five minutes - a 20 GB
+                        # commit under a stuck viewer was 2,500 waits. Once the
+                        # cap has been paid on this copy, a pause request is a
+                        # quarter-speed request for the rest of it.
+                        factor = 3.0
+                    elif factor < 0:
                         waited = 0.0
                         bg.set(True)
                         while waited < PAUSE_CAP_S:
@@ -519,7 +529,9 @@ def copy_with_progress(src: str, dst: str, on_progress=None,
                         # and holding a finished encode in the cache plus a
                         # worker slot indefinitely helps nobody. Past the cap
                         # it falls back to the heaviest throttle instead.
-                        factor = 3.0 if waited >= PAUSE_CAP_S else 0.0
+                        if waited >= PAUSE_CAP_S:
+                            capped = True
+                        factor = 3.0 if capped else 0.0
                     # Ask the OS to yield first. Entered and left on the
                     # TRANSITIONS only - a viewer starting or stopping mid-copy
                     # flips this within one chunk, and nothing is called on the
@@ -666,7 +678,7 @@ LANDING_DIR = ".nuarr-land"
 
 
 def landing_dir(target: str, label: str) -> str:
-    """`<pool drive>\.nuarr-land\<label>`, or '' when it is not there.
+    r"""`<pool drive>\.nuarr-land\<label>`, or '' when it is not there.
 
     An existing folder is the whole test: the rule lives in DrivePool and
     cannot be read from here, but a folder that exists was made for a rule,

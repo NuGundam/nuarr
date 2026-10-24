@@ -503,7 +503,8 @@ def fix_one(file_id: int, report=None) -> dict:
                     "why": (f"the rebuilt file is missing {lost}"
                             if lost else
                             "the rebuilt file still has duplicates")}
-        res = fileops.safe_replace(path, tmp)
+        from .jobs import outside_commit as _oc
+        res = fileops.safe_replace(path, tmp, **_oc(path, "subdupe"))
         fileops._quiet_remove(tmp)      # finished with, succeed or fail
         if not getattr(res, "ok", False):
             return {"ok": False,

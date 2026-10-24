@@ -289,14 +289,62 @@ _CONN_PRAGMAS = (
 # is bounded by that pool, not by request count.
 _local = threading.local()
 
+# EVERY CONNECTION, SO AN IDLE ONE CAN BE ASKED TO LET GO. ~110 threads (the
+# job pool, the loop's executor, uvicorn's) each kept a 2 MB page cache for
+# ever - most of them after one burst of queries at startup - and that was
+# ~220 MB of RSS doing nothing. A reaper thread runs PRAGMA shrink_memory on
+# a connection two minutes after its thread last used it (the cache refills
+# on the next query; hot threads are never touched), and closes the
+# connection of a thread that has ended. check_same_thread=False is what lets
+# the reaper call it; SQLite here is built serialized (threadsafety 3), so a
+# shrink racing the owner's query is serialised by SQLite's own mutex.
+_CONNS: dict = {}            # thread ident -> (conn, Thread)
+_USED: dict = {}             # thread ident -> last cursor() time
+_SHRUNK: dict = {}           # thread ident -> _USED value it was shrunk at
+_CONNS_LOCK = threading.Lock()
+_REAPER = [False]
+IDLE_SHRINK_S = 120.0
+
+
+def _reap() -> None:
+    import time as _t
+    while True:
+        _t.sleep(60)
+        now = _t.time()
+        with _CONNS_LOCK:
+            items = list(_CONNS.items())
+        for ident, (conn, th) in items:
+            try:
+                if not th.is_alive():
+                    with _CONNS_LOCK:
+                        _CONNS.pop(ident, None)
+                    _USED.pop(ident, None)
+                    _SHRUNK.pop(ident, None)
+                    conn.close()
+                    continue
+                used = _USED.get(ident, 0.0)
+                if now - used > IDLE_SHRINK_S and _SHRUNK.get(ident) != used:
+                    conn.execute("PRAGMA shrink_memory")
+                    _SHRUNK[ident] = used
+            except Exception:                                    # noqa: BLE001
+                pass
+
 
 def connect() -> sqlite3.Connection:
     conn = getattr(_local, "conn", None)
     if conn is None:
-        conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
+        conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None,
+                               check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.executescript(_CONN_PRAGMAS)
         _local.conn = conn
+        with _CONNS_LOCK:
+            _CONNS[threading.get_ident()] = (conn, threading.current_thread())
+            if not _REAPER[0] and getattr(sqlite3, "threadsafety", 0) == 3:
+                _REAPER[0] = True
+                threading.Thread(target=_reap, name="db-reaper", daemon=True).start()
+    import time as _t
+    _USED[threading.get_ident()] = _t.time()
     return conn
 
 

@@ -249,7 +249,7 @@ async def step() -> bool:
         return False
     r = cand[0]
     from . import outside as _out
-    _out.start("groups")
+    _out.start("groups", r["id"])
     STATE.update(running=True, label=os.path.basename(r["path"]), at=time.time(), pct=0.0, stage="starting",
                  file_id=r["id"], grp=r["grp"])
     try:

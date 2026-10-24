@@ -331,7 +331,7 @@ def verify_one(row: dict, act: bool | None = None, dry: bool = False) -> dict:
     t0 = time.time()
     act = mode() == "auto" if act is None else act
     from . import outside as _out
-    _out.start("verify")
+    _out.start("verify", fid)
     STATE.update(running=True, file_id=fid, label=label, stage="starting", pct=0.0, started=t0)
 
     def tick(stage, pct=0.0):

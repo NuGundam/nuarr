@@ -2030,7 +2030,8 @@ def mark_one(file_id: int, kind: str = "") -> dict:
         if _lang_key("eng") not in _probe_langs(tmp):
             return {"ok": False, "why": "the rebuilt file does not carry the "
                                         "marker - nothing was changed"}
-        res = fileops.safe_replace(path, tmp)
+        from .jobs import outside_commit as _oc
+        res = fileops.safe_replace(path, tmp, **_oc(path, "hardsub"))
         if not getattr(res, "ok", False):
             return {"ok": False,
                     "why": f"could not put the file in place: "

@@ -248,7 +248,8 @@ def fix(file_id: int, path: str, tracks: list) -> dict:
             why = "; ".join(f"track {t['ord'] + 1}: {t.get('why', '')}" for t in bad) or chk.get("why") or "the check failed"
             return {"ok": False, "why": "the corrected file still is not in step - nothing was changed (" + why + ")"}
         STATE.update(stage="putting it back", pct=90)
-        res = fileops.safe_replace(path, tmp)
+        from .jobs import outside_commit as _oc
+        res = fileops.safe_replace(path, tmp, **_oc(path, "subtiming"))
         fileops._quiet_remove(tmp)
         if not getattr(res, "ok", False):
             return {"ok": False, "why": f"could not put the rebuilt file in place: {getattr(res, 'why', '')}"}
@@ -277,7 +278,7 @@ def check_one(row: dict, act: bool | None = None) -> dict:
     act = (mode() == "auto") if act is None else act
     t0 = time.time()
     from . import outside as _out
-    _out.start("subtiming")
+    _out.start("subtiming", fid)
     STATE.update(running=True, file_id=fid, label=_label(path), stage="listening for speech", pct=2.0, started=t0)
     try:
         if not os.path.exists(path):

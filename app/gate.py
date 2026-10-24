@@ -2771,6 +2771,19 @@ def _our_bps_by_key() -> dict[str, float]:
                     out[keys[dst]] = out.get(keys[dst], 0.0) + cb
     except Exception:
         pass
+    # AND THE COMMITS MADE OUTSIDE THE QUEUE - see jobs.outside_commit.
+    try:
+        from . import jobs as _j
+        keys = _label_keys()
+        for ns in list(_j.OUTSIDE_COMMITS.values()):
+            if getattr(ns, "commit_phase", "") != "copying":
+                continue
+            cb = float(getattr(ns, "commit_bps", 0) or 0)
+            dst = getattr(ns, "dest_disk", "") or getattr(ns, "disk", "")
+            if cb > 0 and keys.get(dst):
+                out[keys[dst]] = out.get(keys[dst], 0.0) + cb
+    except Exception:                                            # noqa: BLE001
+        pass
     # AND THE WORK THAT IS NOT A JOB. A sidecar remux moves as many bytes as
     # an encode and used to be counted as somebody else's - which is the one
     # mistake this function exists to prevent, since "not ours" is what the

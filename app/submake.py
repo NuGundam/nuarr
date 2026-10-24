@@ -378,7 +378,7 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
         return
     lang = _lang_of(r)
     from . import outside as _out
-    _out.start("submake")
+    _out.start("submake", file_id)
     STATE.update(running=True, file_id=file_id, label=label, stage="starting", pct=0.0,
                  duration=float(r["duration"] or 0),
                  note="", started=time.time(), library=r["library"] or "",
@@ -663,7 +663,8 @@ def restyle_one(file_id: int, style: str = "", srt_text: str = "") -> dict:
         d1 = float((k.get("container") or {}).get("properties", {}).get("duration") or 0) / 1e9
         if d0 and abs(d0 - d1) > 2:
             return {"ok": False, "why": f"the rebuilt file runs {d1:.0f}s against {d0:.0f}s - nothing was replaced"}
-        rep = fileops.safe_replace(path, tmp)
+        from .jobs import outside_commit as _oc
+        rep = fileops.safe_replace(path, tmp, **_oc(path, "submake"))
         if not getattr(rep, "ok", False):
             return {"ok": False, "why": f"could not put the rebuilt file in place: {getattr(rep, 'why', '')}"}
     finally:

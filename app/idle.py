@@ -906,6 +906,14 @@ def by_disk() -> dict:
     return out
 
 
+def _outside_rw() -> dict:
+    try:
+        from . import outside as _o
+        return _o.rw_by_label() or {}
+    except Exception:                                            # noqa: BLE001
+        return {}
+
+
 def bps_by_label() -> dict:
     """Total bytes a second this is putting on each pool disk."""
     out: dict = {}
@@ -916,6 +924,8 @@ def bps_by_label() -> dict:
         for lbl in (d["disk"], d["dest_disk"]):
             if lbl:
                 out[lbl] = out.get(lbl, 0.0) + rate
+    for lbl, (r, w) in _outside_rw().items():
+        out[lbl] = out.get(lbl, 0.0) + r + w
     return out
 
 
@@ -931,6 +941,9 @@ def rw_by_label() -> dict:
         if dst and dst != src:
             a, b = out.get(dst, (0.0, 0.0))
             out[dst] = (a, b + w)
+    for lbl, (r, w) in _outside_rw().items():
+        a, b = out.get(lbl, (0.0, 0.0))
+        out[lbl] = (a + r, b + w)
     return out
 
 

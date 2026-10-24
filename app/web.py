@@ -51782,11 +51782,52 @@ def _strip_js_comments(html: str) -> str:
     return "".join(out)
 
 
+_JS_FILES: dict[str, tuple[bytes, bytes]] = {}
+
+
+def _split_js(html: str) -> str:
+    """The page's big script becomes /app-<hash>.js, cached for a year.
+
+    The page is no-cache with an ETag, which is right for its HTML - but
+    the 1.4 MB script inside it rode along on every full load, and every
+    build (restart) made the whole thing new. As a file named by its own
+    hash the browser keeps it until the code changes; the dashboard and the
+    settings page share one copy, since the script is the same bytes."""
+    import re as _re
+    best = None
+    for m in _re.finditer(r"<script>(.*?)</script>", html, _re.S):
+        if best is None or len(m.group(1)) > len(best.group(1)):
+            best = m
+    if best is None or len(best.group(1)) < 100_000:
+        return html
+    body = best.group(1).encode("utf-8")
+    h = hashlib.sha1(body).hexdigest()[:16]
+    if h not in _JS_FILES:
+        _JS_FILES[h] = (body, gzip.compress(body, 6))
+    return html[:best.start()] + f'<script src="/app-{h}.js"></script>' + html[best.end():]
+
+
+@app.get("/app-{h}.js")
+def app_js(h: str, request: Request) -> Response:
+    ent = _JS_FILES.get(h)
+    if ent is None:
+        # a tab from before a restart asking for a build that is gone: tell
+        # it to reload rather than run half the page
+        return Response("location.reload()", media_type="application/javascript",
+                         headers={"Cache-Control": "no-store"})
+    raw, gz = ent
+    head = {"Cache-Control": "public, max-age=31536000, immutable", "Vary": "Accept-Encoding"}
+    if "gzip" in (request.headers.get("accept-encoding") or "").lower():
+        head["Content-Encoding"] = "gzip"
+        return Response(gz, media_type="application/javascript; charset=utf-8", headers=head)
+    return Response(raw, media_type="application/javascript; charset=utf-8", headers=head)
+
+
 def _page(key: str, build, request: Request) -> Response:
     """Serve a built page, gzipped when the caller will take it."""
     ent = _PAGE_CACHE.get(key)
     if ent is None:
-        html = _strip_js_comments(build())
+        html = _split_js(_strip_js_comments(build()))
         ent = _PAGE_CACHE[key] = (html, gzip.compress(html.encode("utf-8"), 6))
     html, gz = ent
     # NO-CACHE WITH A VALIDATOR, WHICH IS WHAT NO-STORE WAS REACHING FOR.
