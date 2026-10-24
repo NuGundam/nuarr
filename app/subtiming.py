@@ -380,7 +380,8 @@ async def watch() -> None:
         pass
     await asyncio.sleep(330)
     while True:
-        STATE["next_run"] = time.time() + TICK_S
+        t_tick = time.time()
+        STATE["next_run"] = t_tick + TICK_S
         try:
             await asyncio.to_thread(waiting)
         except Exception:                                        # noqa: BLE001
@@ -397,7 +398,10 @@ async def watch() -> None:
                     STATE["hour_count"] += int(r.get("done") or 0)
         except Exception as e:                                   # noqa: BLE001
             joblog.log(f"subtitle timing: {type(e).__name__}: {e}", "error")
-        await asyncio.sleep(TICK_S)
+        # THE TICK IS START TO START. Sleeping a full TICK_S after the batch
+        # added the batch's own time to every cycle: at 200/hour, 7 files
+        # (~80 s) + 120 s = 200 s a cycle, which is 126 an hour, not 200.
+        await asyncio.sleep(max(10.0, TICK_S - (time.time() - t_tick)))
 
 
 def as_running() -> list:
