@@ -635,6 +635,17 @@ def snapshot() -> dict:
         waiting = len(candidates(400))
     except Exception:                                            # noqa: BLE001
         waiting = -1
+    # STILL ON THE BOARD? A row "left for you" a day ago may long since have
+    # been answered, replaced or given subtitles - the panel should only say
+    # "waiting for you" about the ones that really still are.
+    try:
+        from . import subkind
+        f = subkind.findings(limit=800, want_done=False, want_unread=False)
+        live = {(int(x["file_id"]), x["source"]) for x in (f.get("rows") or []) if not x.get("done")}
+    except Exception:                                            # noqa: BLE001
+        live = set()
+    for r in rows:
+        r["open"] = (int(r["file_id"]), r["source"]) in live
     # SPEED AND ETA, measured: seconds per file over the last twenty, files
     # in the last hour, and what is left at that pace - but never faster than
     # the hourly budget allows.

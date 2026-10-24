@@ -38517,71 +38517,122 @@ async function vfyLoad(force){
 function vfyVote(v){ const c=VFY_VOTE[v]||['#8b949e','-']; return `<span style="color:${c[0]}">${esc(c[1])}</span>`; }
 let _vfyMsg=null;   /* the last Verify-now reply, shown for 2 minutes */
 function vfyBlock(kind){
+  // THE SECOND OPINION, IN PLAIN WORDS. It used to read like an engine room:
+  // vote columns per engine, "weight 0.98", "left for you (89% - the line is
+  // 90%)". What a person wants from it is four things - what it was asked,
+  // what it decided, what it did about it, and whether anything is still
+  // waiting on them. The engines' votes are one click away on each row.
   const v=_vfy; if(!v) return '<div class="dim" style="font-size:11px">loading the second opinion…</div>';
   const eng=v.engines||{};
-  const engChip=(k,word)=>{ const e=eng[k]||{}; const n=e.total||0; return `<span title="${n} verdict(s) it took part in; its weight in the next vote is ${e.weight}" style="display:inline-block;margin-right:10px">${word}: <b>${n?Math.round(e.rate*100)+'%':'no record yet'}</b><span class="dim"> right${n?' of '+fmt(n):''} · weight ${e.weight}</span></span>`; };
-  const focus={whisper:'Whisper',qwen:'Qwen',ocr:'the readers'}[kind];
   const rows=v.recent||[];
+  const open=rows.filter(r=>r.open&&r.action.startsWith('left')).length;
+  const LANG={eng:'English',jpn:'Japanese',fra:'French',deu:'German',spa:'Spanish',ita:'Italian',kor:'Korean',zho:'Chinese',
+    chi:'Chinese',rus:'Russian',por:'Portuguese',ara:'Arabic',hin:'Hindi',tha:'Thai',pol:'Polish',tur:'Turkish',nld:'Dutch',swe:'Swedish'};
+  const QWORD={picture:'Are subtitles burned into the picture?',raw:'No English at all (a raw), or English audio?'};
+  const qOf=r=>r.source==='raw'?QWORD.raw:r.source==='picture'?QWORD.picture:'Is this subtitle track dialogue, or only signs & songs?';
+  const AWORD={raw:'A raw - no English',english:'English is spoken','english audio':'English is spoken',dialogue:'Yes - dialogue',
+    hybrid:'Yes - dialogue + signs',signs:'No - signs & songs only',none:'No subtitles in the picture',not:'No'};
+  const aOf=r=>AWORD[r.kind]||AWORD[r.verdict]||(r.kind||r.verdict||'Not sure');
+  const pctBar=(p,ok)=>`<span style="display:inline-block;width:46px;height:5px;background:var(--line);border-radius:3px;vertical-align:middle;margin-right:5px;overflow:hidden"><i style="display:block;height:5px;width:${Math.max(0,Math.min(100,p))}%;background:${ok?'#3fb950':'#e3b341'}"></i></span>`;
+  const happened=r=>{
+    const a=r.action||'';
+    if(a.startsWith('answered')){
+      const rest=a.replace(/^answered:\s*/,'');
+      const tail=/Subtitle maker/.test(rest)?'sent to the Subtitle maker for English subtitles'
+        :/not a raw/.test(rest)?'marked as not a raw'+(/retag/.test(rest)?', audio language being fixed':'')
+        :rest;
+      return `<span style="color:#3fb950">Done</span> <span class="dim">- ${esc(tail)}</span>`;
+    }
+    if(a.startsWith('left')){
+      const m=a.match(/\((\d+)%/);
+      const why=m?`it was ${m[1]}% sure; it acts at ${v.sure_at}%`:'the checks disagreed';
+      return r.open
+        ? `<span style="color:#e3b341">Your call</span> <span class="dim">- ${esc(why)}.</span> <a href="/settings#lang@skPanel" onclick="event.stopPropagation()" style="color:#79c0ff">Answer it →</a>`
+        : `<span class="dim">Your call (${esc(why)}) - since settled, nothing to do</span>`;
+    }
+    if(a.startsWith('failed')) return `<span style="color:#e0575b">Failed</span> <span class="dim">- ${esc(a.replace(/^failed:?\s*/,''))}</span>`;
+    return `<span class="dim">${esc(a)}</span>`;
+  };
+  const whoSaid=r=>{
+    const e=r.evidence||{}, vt=e.votes||{}, w=e.whisper||{}, q=e.qwen;
+    const line=(name,txt)=>`<div style="margin:2px 0"><b style="display:inline-block;width:118px">${name}</b>${txt}</div>`;
+    let h='';
+    if(r.source==='raw'){
+      h+=line('Whisper (listens)', (w.audio||[]).length
+        ? w.audio.map(t=>`audio track ${t.track+1}: <b>${esc(LANG[t.code]||t.code||'?')}</b> ${Math.round(t.confidence*100)}%`).join(' · ')
+        : '<span class="dim">heard nothing it could name</span>');
+      h+=line('Qwen (reads)', '<span class="dim">not asked - this question is about the audio, and Qwen only reads written words</span>');
+      h+=line('Screen reader', '<span class="dim">not asked - nothing on screen to read</span>');
+    }else{
+      h+=line('Whisper (listens)', w.compared
+        ? `${w.matched} of ${w.compared} lines on screen match what is said`+(vt.whisper?` - says <b>${esc(VFY_VOTE[vt.whisper]?VFY_VOTE[vt.whisper][1]:vt.whisper)}</b>`:'')
+        : '<span class="dim">'+esc(w.note||'nothing to compare')+'</span>');
+      h+=line('Qwen (reads)', q?`${q.p}% likely dialogue${q.why?' - <span class="dim">'+esc(q.why)+'</span>':''}`:'<span class="dim">no reading for this file yet</span>');
+      h+=line('Screen reader', e.rules?`${e.rules.sure}% sure - <span class="dim">${esc(e.rules.why||'')}</span>`:'<span class="dim">-</span>');
+      if((w.pairs||[]).length) h+=`<div style="margin-top:4px" class="dim">On screen · what was heard there</div>`
+        +w.pairs.map(p=>`<div class="mono" style="font-size:10.5px"><span style="color:${p.match>=0.34?'#3fb950':'#e0575b'}">${Math.round(p.match*100)}%</span> ${esc(p.screen)} <span class="dim">·</span> <i>${esc(p.heard||'(nothing heard)')}</i></div>`).join('');
+    }
+    if(r.note) h+=`<div style="color:#e0575b">${esc(r.note)}</div>`;
+    return h+`<div class="dim" style="margin-top:3px">took ${r.secs}s</div>`;
+  };
+  const rec=(k,word)=>{ const e=eng[k]||{}; const n=e.total||0;
+    return `<span style="margin-right:14px">${word}: <b>${n?Math.round(e.rate*100)+'% right':'no record yet'}</b><span class="dim">${n?' over '+fmt(n)+' decisions':''}</span></span>`; };
+  const idle = v.mode==='off' ? 'Switched off - nothing is checked.'
+    : v.waiting>0 ? `Idle - next check ${v.next_run&&v.next_run>Date.now()/1000?'in '+Math.max(1,Math.round((v.next_run-Date.now()/1000)/60))+' min':'within 5 minutes'}.`
+    : 'Idle - nothing is unsure right now.';
   return `<div class="lkind" style="margin-top:12px;padding:11px 12px">
-    <div class="lkindhead"><b style="color:#79c0ff">The second opinion</b>
-      <span class="dim" style="font-size:11px">${v.running?'at work':v.last_run?'last verdict '+ago(v.last_run):'has not run yet'}</span>
-      <span style="margin-left:auto;display:flex;gap:6px;align-items:center;font-size:11px">
-        <select onchange="vfyMode(this.value)" style="font-size:11px" title="off: never runs. advise: verifies and attaches the evidence to the row, a person still answers. auto: answers at or above the sure line and carries the fix out.">
-          ${[['off','off'],['advise','advise only'],['auto','auto - answer and fix']].map(([k,w])=>`<option value="${k}" ${v.mode===k?'selected':''}>${w}</option>`).join('')}</select>
-        sure at <input type="number" min="50" max="100" value="${v.sure_at}" style="width:64px;box-sizing:border-box;font-size:11px" onchange="vfyBudget(this.value,null)">%
-        · <input type="number" min="1" max="60" value="${v.per_hour}" style="width:58px;box-sizing:border-box;font-size:11px" onchange="vfyBudget(null,this.value)">/hour
-        <button class="rmb" onclick="vfyRun(this)" ${v.running?'disabled':''}>Verify 3 now</button>
+    <div class="lkindhead"><b style="color:#79c0ff">Second opinion</b>
+      <span class="dim" style="font-size:11px">a closer look at the files nuarr isn't sure about</span>
+      <span style="margin-left:auto;display:flex;gap:6px;align-items:center;font-size:11px;flex-wrap:wrap">
+        <select onchange="vfyMode(this.value)" style="font-size:11px" title="Off: never runs. Suggest only: checks and shows its answer, you decide. Decide &amp; fix: acts on its own when sure enough.">
+          ${[['off','Off'],['advise','Suggest only'],['auto','Decide & fix']].map(([k,w])=>`<option value="${k}" ${v.mode===k?'selected':''}>${w}</option>`).join('')}</select>
+        <span title="It only decides on its own at or above this confidence">decide when ≥</span>
+        <input type="number" min="50" max="100" value="${v.sure_at}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="vfyBudget(this.value,null)">% sure
+        · <input type="number" min="1" max="60" value="${v.per_hour}" style="width:52px;box-sizing:border-box;font-size:11px" onchange="vfyBudget(null,this.value)"> files/hour
+        <button class="rmb" onclick="vfyRun(this)" ${v.running?'disabled':''}>Check 3 now</button>
         ${v.running?`<button class="rmb" onclick="fetch('/api/verify/stop',{method:'POST'})">Stop</button>`:''}</span></div>
     ${_vfyMsg&&Date.now()-_vfyMsg.at<120000?`<div style="font-size:11.5px;margin:5px 0 0;color:${_vfyMsg.c}">${esc(_vfyMsg.t)}</div>`:''}
     <style>.vfybar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;position:relative;flex:1;min-width:120px}
       .vfyfill{height:6px;background:#79c0ff;border-radius:3px;transition:width .9s linear}
       .vfyrun{position:absolute;inset:0;background:repeating-linear-gradient(45deg,rgba(121,192,255,.35) 0 8px,transparent 8px 16px);background-size:200% 100%;animation:vfymove 1s linear infinite}
-      @keyframes vfymove{from{background-position:0 0}to{background-position:-22.6px 0}}</style>
-    <div style="display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;font-size:11.5px;margin:6px 0 2px">
-      <span><b>${fmt(v.total)}</b> <span class="dim">processed</span></span>
-      <span><b>${fmt(v.answered)}</b> <span class="dim">answered</span></span>
-      <span><b>${fmt(v.left)}</b> <span class="dim">left for you</span></span>
-      <span><b>${fmt(v.waiting<0?0:v.waiting)}</b> <span class="dim">in the queue</span></span>
-      <span class="dim">${v.avg_secs?`${v.avg_secs}s per file · ${v.hour_n} this hour`:'no pace measured yet'}${v.eta_s?` · queue done in ~${v.eta_s<90?v.eta_s+'s':v.eta_s<5400?Math.round(v.eta_s/60)+' min':Math.round(v.eta_s/3600*10)/10+' h'}`:''}</span>
+      @keyframes vfymove{from{background-position:0 0}to{background-position:-22.6px 0}}
+      .vfychip{display:inline-flex;flex-direction:column;padding:4px 12px;border:1px solid var(--line);border-radius:8px;min-width:78px}
+      .vfychip b{font-size:15px}.vfychip span{font-size:10.5px}</style>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:stretch;margin:8px 0 6px">
+      <div class="vfychip"><b>${fmt(v.total)}</b><span class="dim">checked</span></div>
+      <div class="vfychip"><b style="color:#3fb950">${fmt(v.answered)}</b><span class="dim">decided by itself</span></div>
+      <div class="vfychip"><b style="color:${open?'#e3b341':'inherit'}">${fmt(open)}</b><span class="dim">waiting for you</span></div>
+      <div class="vfychip"><b>${fmt(v.waiting<0?0:v.waiting)}</b><span class="dim">still to check</span></div>
+      <div class="dim" style="font-size:11px;align-self:center;margin-left:4px">${v.avg_secs?`about ${v.avg_secs}s a file · ${v.hour_n} this hour`:''}${v.eta_s?` · queue done in ~${v.eta_s<90?v.eta_s+'s':v.eta_s<5400?Math.round(v.eta_s/60)+' min':Math.round(v.eta_s/3600*10)/10+' h'}`:''}</div>
     </div>
     ${v.running?`<div style="display:flex;gap:10px;align-items:center;font-size:11.5px;margin:2px 0 6px">
-      <span class="dlspin"></span><b style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px">${esc(v.label||'')}</b>
+      <span class="dlspin"></span><span>Checking <b>${esc(v.label||'')}</b></span>
       <div class="vfybar"><div class="vfyfill" style="width:${Math.max(2,Math.min(100,Math.round(v.pct||0)))}%"></div><div class="vfyrun"></div></div>
-      <span class="mono" style="font-variant-numeric:tabular-nums">${Math.round(v.pct||0)}%</span>
-      <span class="dim" style="white-space:nowrap">${esc(v.stage||'')} · ${v.elapsed_s||0}s${v.file_eta_s!=null?` · ~${v.file_eta_s}s left`:''}</span></div>`:
-      `<div class="dim" style="font-size:11px;margin:0 0 4px">${v.waiting>0?(v.mode==='off'?'switched off - nothing runs':`idle - next pass ${v.next_run&&v.next_run>Date.now()/1000?'in '+Math.max(1,Math.round((v.next_run-Date.now()/1000)/60))+' min':'within 5 minutes'}`):'idle - nothing is unsure right now'}</div>`}
-    <div class="dim" style="font-size:11px;margin:4px 0 2px">Every file the subtitle board is unsure about - "72% sure this is burned-in dialogue", "58% sure this track is signs" -
-      gets all three engines instead of a person: <b>Whisper</b> listens at the moments the lines appear and writes what is said there in English;
-      if the screen says what the voices say it is dialogue, if people talk and the screen says something else it is a sign or a title.
-      <b>Qwen</b> gives the judge's reading, taught by every answer on the same show; <b>the readers</b> give what they read.
-      The votes are weighted by how often each engine was right before, and agreement is the confidence. At or above the sure line the file
-      is answered the way you would answer it - so every rule, the Qwen judge and the shape memory learn from it - and in auto the fix is carried out.
-      For a raw, Whisper's language head settles whether English is in fact spoken. Each ASS track it reads also teaches the show's style below.</div>
-    <div style="font-size:11px;margin:6px 0">How often each engine agreed with the final verdict: ${engChip('whisper','Whisper')}${engChip('qwen','Qwen')}${engChip('rules','the readers')}</div>
-    ${rows.length?`<div class="rowbox scrollbox" style="max-height:320px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
-      <colgroup><col style="width:52px"><col style="width:auto"><col style="width:44px"><col style="width:78px"><col style="width:96px"><col style="width:82px"><col style="width:100px"><col style="width:230px"></colgroup>
-      <thead><tr class="dim" style="font-size:10.5px"><th class="l">WHEN</th><th class="l">FILE · QUESTION</th><th class="c">WAS</th><th class="c">READERS</th><th class="c">WHISPER</th><th class="c">QWEN</th><th class="c">VERDICT</th><th class="l">DONE</th></tr></thead><tbody>
-      ${rows.map((r,i)=>{ const e=r.evidence||{}, vt=e.votes||{}, w=e.whisper||{}, q=e.qwen; const open=_vfyOpen===r.id;
-        const verdictWord=r.kind?r.kind:(r.verdict||'undecided');
-        return `<tr style="cursor:pointer" onclick="_vfyOpen=${open?'null':r.id};lrnPaint('${kind}')">
+      <span class="dim" style="white-space:nowrap">${esc(v.stage||'')} · ${v.elapsed_s||0}s${v.file_eta_s!=null?` · ~${v.file_eta_s}s left`:''}</span></div>`
+      :`<div class="dim" style="font-size:11px;margin:0 0 4px">${idle}</div>`}
+    <div style="font-size:11.5px;margin:4px 0">When nuarr's first look at a file can't tell what it is - <i>are these burned-in words dialogue? is this a raw?</i> -
+      the second opinion asks again with better tools, and if they agree strongly enough it decides for you, the same way you would.
+      Anything below the line waits for you on the <a href="/settings#lang@skPanel" style="color:#79c0ff">Subtitle User Input</a> board.</div>
+    <details style="font-size:11px;margin:2px 0 8px"><summary class="dim" style="cursor:pointer">How does it decide?</summary>
+      <div style="margin:5px 0 0 4px;line-height:1.55">
+        <div><b>Whisper</b> listens: which language is spoken, and whether the words on screen are what people are saying.</div>
+        <div><b>Qwen</b> reads the words on screen and judges whether they look like dialogue. It only reads, so it isn't asked about raws - those are about the audio.</div>
+        <div><b>The screen reader</b> is nuarr's own first guess (OCR of the picture, or the shape of a subtitle track).</div>
+        <div style="margin-top:3px">Each one counts for more the more often it has been right before. Track record: ${rec('whisper','Whisper')}${rec('qwen','Qwen')}${rec('rules','Screen reader')}</div>
+      </div></details>
+    ${rows.length?`<div class="rowbox scrollbox" style="max-height:340px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <colgroup><col style="width:56px"><col style="width:24%"><col style="width:auto"><col style="width:170px"><col style="width:300px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px"><th class="l">WHEN</th><th class="l">FILE</th><th class="l">QUESTION</th><th class="l">ITS ANSWER</th><th class="l">WHAT HAPPENED</th></tr></thead><tbody>
+      ${rows.map(r=>{ const op=_vfyOpen===r.id; const ok=r.confidence>=v.sure_at;
+        return `<tr style="cursor:pointer" onclick="_vfyOpen=${op?'null':r.id};lrnPaint('${kind}')" title="click to see what each check said">
           <td class="l dim" style="font-size:10.5px">${ago(r.at)}</td>
-          <td class="l" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.path)}"><b>${esc(r.label)}</b><div class="dim" style="font-size:10px">${esc(r.question)}</div></td>
-          <td class="c dim" title="how sure the board was before">${r.was_sure}%</td>
-          <td class="c" style="font-size:10.5px">${vfyVote(vt.rules)}</td>
-          <td class="c" style="font-size:10.5px;white-space:normal">${vt.whisper?vfyVote(vt.whisper):'<span class="dim">-</span>'}${w.compared?`<div class="dim" style="font-size:10px">${w.matched}/${w.compared} lines match</div>`:''}</td>
-          <td class="c" style="font-size:10.5px">${vt.qwen?vfyVote(vt.qwen):'<span class="dim">not asked</span>'}${q?`<div class="dim" style="font-size:10px">${q.p}% dialogue</div>`:''}</td>
-          <td class="c" style="white-space:normal;overflow-wrap:anywhere"><b style="color:${r.confidence>=v.sure_at?'#3fb950':r.verdict?'#e3b341':'#8b949e'}">${esc(verdictWord)}</b><div class="dim" style="font-size:10px">${r.confidence?r.confidence+'%':''}</div></td>
-          <td class="l" style="white-space:normal;overflow-wrap:anywhere;font-size:10.5px;color:${r.action.startsWith('answered')?'#3fb950':r.action.startsWith('failed')?'#e0575b':'var(--dim)'}">${esc(r.action)}</td></tr>
-          ${open?`<tr><td colspan="8" style="background:rgba(255,255,255,.025);padding:6px 10px;font-size:11px;white-space:normal">
-            ${(w.pairs||[]).length?`<div style="font-weight:600;margin-bottom:3px">On the screen · what Whisper heard there</div>${w.pairs.map(p=>`<div class="mono" style="font-size:10.5px"><span style="color:${p.match>=0.34?'#3fb950':'#e0575b'}">${Math.round(p.match*100)}%</span> &nbsp;${esc(p.screen)} <span class="dim">·</span> <i>${esc(p.heard||'(nothing heard)')}</i></div>`).join('')}`:''}
-            ${(w.audio||[]).length?`<div><b>Audio tracks:</b> ${w.audio.map(a=>`track ${a.track+1}: ${esc(a.code||'?')} ${Math.round(a.confidence*100)}%`).join(' · ')}</div>`:''}
-            ${w.note?`<div class="dim">${esc(w.note)}</div>`:''}
-            ${e.rules?`<div class="dim" style="margin-top:3px">The readers said: ${esc(e.rules.why||'')}</div>`:''}
-            ${q&&q.why?`<div class="dim">Qwen: ${esc(q.why)}</div>`:''}
-            ${e.style&&e.style.font?`<div class="dim">Style learnt: ${esc(e.style.font)} ${e.style.size}px, alignment ${e.style.align}${(e.style.signs||[]).length?', sign styles '+esc(e.style.signs.join(', ')):''}</div>`:''}
-            ${r.note?`<div style="color:#e0575b">${esc(r.note)}</div>`:''}
-            <div class="dim">took ${r.secs}s</div></td></tr>`:''}`; }).join('')}
-      </tbody></table></div>`:`<div class="dim" style="font-size:11px">Nothing verified yet${v.mode==='off'?' - it is switched off':v.waiting?' - the first run is minutes away, or press Verify 3 now':' - nothing is unsure right now'}.</div>`}
+          <td class="l" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.path)}"><b>${esc(r.label)}</b></td>
+          <td class="l" style="white-space:normal">${esc(qOf(r))}</td>
+          <td class="l" style="white-space:normal"><b style="color:${r.verdict?(ok?'#3fb950':'#e3b341'):'#8b949e'}">${esc(r.verdict?aOf(r):'Not sure')}</b>
+            ${r.confidence?`<div style="font-size:10px">${pctBar(r.confidence,ok)}<span class="dim">${r.confidence}% sure</span></div>`:''}</td>
+          <td class="l" style="white-space:normal;font-size:11px">${happened(r)}</td></tr>
+          ${op?`<tr><td colspan="5" style="background:rgba(255,255,255,.025);padding:6px 10px;font-size:11px;white-space:normal">${whoSaid(r)}</td></tr>`:''}`; }).join('')}
+      </tbody></table></div>`:`<div class="dim" style="font-size:11px">Nothing checked yet${v.mode==='off'?' - it is switched off':v.waiting?' - the first check is minutes away, or press Check 3 now':' - nothing is unsure right now'}.</div>`}
   </div>`;
 }
 async function vfyMode(m){ await fetch('/api/verify/mode?mode='+m,{method:'POST'}); await vfyLoad(true); for(const k of ['whisper','qwen','ocr','subai']) lrnPaint(k); }
