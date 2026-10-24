@@ -11118,7 +11118,16 @@ async def api_subtiming_run(n: int = 3, file_id: int = 0, path: str = ""):
         file_id = subtiming.file_by_path(path)
         if not file_id:
             raise HTTPException(404, "that path is not in the library")
-    return await asyncio.to_thread(subtiming.run_batch, max(1, min(20, int(n))), int(file_id))
+    n = max(1, min(600, int(n)))
+    if file_id or n <= 5:
+        return await asyncio.to_thread(subtiming.run_batch, n, int(file_id))
+    # A BIG BATCH RUNS BEHIND THE ANSWER: 200 files is ~40 minutes, far past
+    # what a button's request should hold open. The panel's own poll shows
+    # it going, and Stop ends it between files.
+    if subtiming.STATE.get("running"):
+        return {"busy": True}
+    asyncio.get_running_loop().run_in_executor(None, subtiming.run_batch, n, 0)
+    return {"started": n}
 
 
 @app.post("/api/subtiming/stop")
@@ -38740,8 +38749,8 @@ function stmPaint(){
       <span style="margin-left:auto;display:flex;gap:6px;align-items:center;font-size:11px">
         <select onchange="stmMode(this.value)" style="font-size:11px" title="off: never runs. advise: measures and lists, changes nothing. auto: corrects a fixed offset or a frame-rate drift in place, after proving the result is in step.">
           ${[['off','off'],['advise','advise only'],['auto','auto - fix in place']].map(([k,w])=>`<option value="${k}" ${v.mode===k?'selected':''}>${w}</option>`).join('')}</select>
-        <input type="number" min="1" max="600" value="${v.per_hour}" style="width:62px;box-sizing:border-box;font-size:11px" onchange="stmBudget(this.value)">/hour
-        <button class="rmb" onclick="stmRun(this)" ${v.running?'disabled':''}>Check 3 now</button>
+        <input id="stmN" type="number" min="1" max="600" value="${v.per_hour}" style="width:62px;box-sizing:border-box;font-size:11px" oninput="stmNLabel(this.value)" onchange="stmBudget(this.value)">/hour
+        <button id="stmRunBtn" class="rmb" onclick="stmRun(this)" ${v.running?'disabled':''}>Check ${v.per_hour} now</button>
         ${v.running?`<button class="rmb" onclick="fetch('/api/subtiming/stop',{method:'POST'})">Stop</button>`:''}</span></div>
     ${_stmMsg&&Date.now()-_stmMsg.at<120000?`<div style="font-size:11.5px;margin:5px 0 0;color:${_stmMsg.c}">${esc(_stmMsg.t)}</div>`:''}
     <div style="display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;font-size:11.5px;margin:6px 0 2px">
@@ -38795,12 +38804,15 @@ function stmGo(url,btn){
   if(btn){ btn.disabled=true; btn.innerHTML='<span class="dlspin"></span>checking…'; }
   fetch(url,{method:'POST'}).then(r=>r.ok?r.json():r.json().then(j=>Promise.reject(new Error(j.detail||('HTTP '+r.status))))).then(d=>{
     if(d.busy) stmSay('Already checking - the run in progress has to finish first.','#d29922');
+    else if(d.started) stmSay('Checking the next '+d.started+' files - follow it in the table below; Stop ends it after the current file.','#3fb950');
     else if(!d.done) stmSay('Nothing to check right now.');
     else stmSay('Checked '+d.done+(d.done===1?' file':' files')+(d.fixed?', fixed '+d.fixed:'')+' - '+(d.results||[]).map(x=>x.verdict+(x.action?' ('+x.action+')':'')).join(', ')+'.','#3fb950');
   }).catch(e=>stmSay('The request failed: '+((e&&e.message)||e),'#f85149'));
   setTimeout(stmLoad,1500);
 }
-function stmRun(btn){ stmGo('/api/subtiming/run?n=3',btn); }
+function stmNVal(){ const e=document.getElementById('stmN'); return Math.max(1,Math.min(600,parseInt(e&&e.value,10)||1)); }
+function stmNLabel(){ const b=document.getElementById('stmRunBtn'); if(b&&!b.disabled) b.textContent='Check '+stmNVal()+' now'; }
+function stmRun(btn){ stmGo('/api/subtiming/run?n='+stmNVal(),btn); }
 function stmOne(btn){ const p=(document.getElementById('stmPath').value||'').trim(); if(!p) return; stmGo('/api/subtiming/run?path='+encodeURIComponent(p),btn); }
 // ---- what the subtitle tools learn (sublearn.py) - one panel ----
 let _lrn={}, _lrnAt={}, _lrnOpen={}, _lrnShow={};
