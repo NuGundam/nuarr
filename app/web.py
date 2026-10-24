@@ -3480,6 +3480,34 @@ _AMEMO: dict = {}
 _AMEMO_FIRST: dict = {}          # key -> the one in-flight first computation
 
 
+def _jbytes(d) -> Response:
+    """A JSON answer ENCODED WHERE IT WAS BUILT. FastAPI's own path runs
+    jsonable_encoder + json.dumps + gzip on the event loop for every route,
+    def or async; the diag stall watcher clocked 3.5 s inside
+    jsonable_encoder on a 235 KB answer, during which every other request
+    on the box waited - the 16 s /api/groups was that wait, not its SQL.
+    A Response of ready bytes skips all of it."""
+    return Response(json.dumps(d, default=str, separators=(",", ":")).encode("utf-8"),
+                    media_type="application/json")
+
+
+async def _off_loop_json(fn, *args, **kw) -> Response:
+    """Run fn on a worker thread and encode its answer there."""
+    def _work():
+        return json.dumps(fn(*args, **kw), default=str, separators=(",", ":")).encode("utf-8")
+    return Response(await asyncio.to_thread(_work), media_type="application/json")
+
+
+async def _memo_json(key: str, ttl: float, fn, *args, **kw) -> Response:
+    """_amemo_bg over pre-encoded bytes: served from the last answer, refreshed
+    behind it, never encoded on the loop."""
+    async def _build():
+        def _work():
+            return json.dumps(fn(*args, **kw), default=str, separators=(",", ":")).encode("utf-8")
+        return await asyncio.to_thread(_work)
+    return Response(await _amemo_bg(key, ttl, _build), media_type="application/json")
+
+
 async def _amemo_bg(key: str, ttl: float, fn):
     import asyncio as _a
     v = _AMEMO.get(key)
@@ -8619,7 +8647,7 @@ def api_systems():
 
 
 @app.get("/api/subkind")
-def api_subkind(limit: int = 600, done: int = 0, unread: int = 0):
+async def api_subkind(limit: int = 600, done: int = 0, unread: int = 0):
     r"""What subtitles each file carries - the picture and every text track.
 
     600, because "select all" has to mean all of them.
@@ -8630,7 +8658,10 @@ def api_subkind(limit: int = 600, done: int = 0, unread: int = 0):
     still cover everything, so the footer can still offer what it is hiding.
     """
     from . import subkind
-    return subkind.findings(max(1, min(int(limit), 1000)),
+    # 10 s memo: the panel polls at 2.5 s while reading, and every call was
+    # the same three seconds of per-row Python
+    return await _memo_json(f"subkind:{limit}:{done}:{unread}", 10.0,
+                            subkind.findings, max(1, min(int(limit), 1000)),
                             want_done=bool(done), want_unread=bool(unread))
 
 
@@ -10612,12 +10643,13 @@ async def api_renames_apply(arr: str, parent_id: int, file_id: int,
 
 
 @app.get("/api/jobs")
-def api_jobs(recent: int = Query(60, le=1000)):
+async def api_jobs(recent: int = Query(60, le=1000)):
     # system load rides along with the job poll - one request, always in step
     # with the worker rows it sits above.
     # `recent` defaults low: this is polled every 2 s, and shipping 300 finished
     # rows each time made a 160 KB response out of data that rarely changes.
-    return jobs.snapshot(recent_limit=recent) | {"system": system.snapshot(), "outside": _outside_live()}
+    return await _off_loop_json(
+        lambda: jobs.snapshot(recent_limit=recent) | {"system": system.snapshot(), "outside": _outside_live()})
 
 
 _TAUT_PROBE: dict = {"at": 0.0, "d": None, "busy": False}
@@ -10872,25 +10904,30 @@ async def api_subneed(limit: int = 200, library: str = ""):
     row. It is reported so the number is visible and never offered a button.
     See subneed.py's docstring for the measurement that made this necessary.
     """
-    d = subneed.snapshot()
-    d["missing_list"] = subneed.missing(limit, library)
-    # What the subtitle maker has done with each one - in auto it goes first.
-    try:
-        from . import submake
-        for r in d["missing_list"]:
-            r["maker"] = submake.gate(int(r["file_id"]))
-    except Exception:                                    # noqa: BLE001
-        pass
-    d["unknown_sample"] = subneed.unknown_sample(12)
-    # The rule asks for a subtitle these have not got and the audio is in
-    # the language, so they are listed and nothing offers to delete them.
-    d["want_list"] = subneed.wanting(400, library)
-    try:
-        from . import remedy
-        d["budget"] = remedy.budget()
-    except Exception:                                    # noqa: BLE001
-        d["budget"] = {}
-    return d
+    # ON A THREAD. This ran four table reads and one json.loads per missing
+    # row on the event loop, polled every 1.2 s while the maker works.
+    def _work():
+        d = subneed.snapshot()
+        d["missing_list"] = subneed.missing(limit, library)
+        # What the subtitle maker has done with each one - in auto it goes first.
+        try:
+            from . import submake
+            g = submake.gate_many([r["file_id"] for r in d["missing_list"]])
+            for r in d["missing_list"]:
+                r["maker"] = g.get(int(r["file_id"]), "none")
+        except Exception:                                    # noqa: BLE001
+            pass
+        d["unknown_sample"] = subneed.unknown_sample(12)
+        # The rule asks for a subtitle these have not got and the audio is in
+        # the language, so they are listed and nothing offers to delete them.
+        d["want_list"] = subneed.wanting(400, library)
+        try:
+            from . import remedy
+            d["budget"] = remedy.budget()
+        except Exception:                                    # noqa: BLE001
+            d["budget"] = {}
+        return d
+    return await _off_loop_json(_work)
 
 
 @app.get("/api/submake")
@@ -11019,10 +11056,10 @@ def api_learn_match_style(on: int = 1):
 
 
 @app.get("/api/verify")
-def api_verify():
+async def api_verify():
     """The second opinion: mode, engine reliability, what it verified lately."""
     from . import subverify
-    return subverify.snapshot()
+    return await _memo_json("verify", 5.0, subverify.snapshot)
 
 
 @app.post("/api/verify/mode")
@@ -11053,10 +11090,10 @@ def api_verify_stop():
 
 
 @app.get("/api/subtiming")
-def api_subtiming():
+async def api_subtiming():
     """Subtitle timing: what was checked, what was out of step, what was fixed."""
     from . import subtiming
-    return subtiming.snapshot()
+    return await _memo_json("subtiming", 5.0, subtiming.snapshot)
 
 
 @app.post("/api/subtiming/mode")
@@ -11536,9 +11573,11 @@ def api_gpu_budget():
 
 
 @app.get("/api/groups")
-def api_groups(library: str = ""):
+async def api_groups(library: str = ""):
     from . import groupscore
-    return groupscore.scorecard(library)
+    # changes once per measured file (every few seconds at most) - and the
+    # page asks every minute
+    return await _memo_json("groups:" + library, 30.0, groupscore.scorecard, library)
 
 
 @app.get("/api/groups/detail")
@@ -12234,14 +12273,15 @@ def _label_for(title, season, episode, path) -> str | None:
     file, else read off the name; the film year from the path."""
     import ntpath
     if not title and path:
+        from .db import _DIR_TITLE as _DT
         d = ntpath.dirname(path).rstrip("\\") + "\\"
-        if d not in _DIR_TITLE:
+        if d not in _DT:
             r = _rows("SELECT title FROM files WHERE COALESCE(title,'') <> '' "
                       "AND substr(path, 1, ?) = ? LIMIT 1", (len(d), d))
-            _DIR_TITLE[d] = r[0]["title"] if r else None
-            if len(_DIR_TITLE) > 5000:
-                _DIR_TITLE.clear()
-        title = _DIR_TITLE.get(d)
+            _DT[d] = r[0]["title"] if r else None
+            if len(_DT) > 5000:
+                _DT.clear()
+        title = _DT.get(d)
     if not title:
         return None
     if season is None and path:
@@ -51722,11 +51762,31 @@ if not _SETTINGS_PANES:
 _PAGE_CACHE: dict[str, tuple[str, bytes]] = {}
 
 
+def _strip_js_comments(html: str) -> str:
+    """Whole-line // comments inside <script> blocks dropped at build time:
+    half a megabyte of the 1.9 MB script is commentary the browser only has
+    to download and parse. Only lines that START with // (after whitespace)
+    are removed, so a // inside a string or a URL is never touched, and
+    line numbers inside the block shift - which the diag stack traces, which
+    name functions, do not depend on."""
+    import re as _re
+    out, pos = [], 0
+    for m in _re.finditer(r"<script\b[^>]*>.*?</script>", html, _re.S | _re.I):
+        out.append(html[pos:m.start()])
+        block = m.group(0)
+        lines = block.split("\n")
+        kept = [ln for ln in lines if not ln.lstrip().startswith("//")]
+        out.append("\n".join(kept))
+        pos = m.end()
+    out.append(html[pos:])
+    return "".join(out)
+
+
 def _page(key: str, build, request: Request) -> Response:
     """Serve a built page, gzipped when the caller will take it."""
     ent = _PAGE_CACHE.get(key)
     if ent is None:
-        html = build()
+        html = _strip_js_comments(build())
         ent = _PAGE_CACHE[key] = (html, gzip.compress(html.encode("utf-8"), 6))
     html, gz = ent
     # NO-CACHE WITH A VALIDATOR, WHICH IS WHAT NO-STORE WAS REACHING FOR.

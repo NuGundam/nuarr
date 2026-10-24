@@ -156,9 +156,13 @@ def as_running() -> list:
     from . import outside as _out
     el = time.time() - float(STATE.get("at") or time.time())
     pct = float(STATE.get("pct") or 0)
-    lbl = re.sub(r"\.[A-Za-z0-9]{2,4}$", "", STATE.get("label") or "")
+    try:
+        from .db import label_for
+        lbl = label_for(file_id=STATE.get("file_id"))
+    except Exception:                                    # noqa: BLE001
+        lbl = re.sub(r"\.[A-Za-z0-9]{2,4}$", "", STATE.get("label") or "").split(" [")[0][:90]
     return [{"job_id": "groups-measure", "pool": "groups", "kind": "groups",
-             "title": lbl.split(" [")[0][:90], "file": STATE.get("label") or "",
+             "title": lbl, "file": STATE.get("label") or "",
              "stage": STATE.get("stage") or "measuring", "progress": pct, "elapsed_s": round(el),
              "eta_s": None, "eta_est": True,
              "plan": f"release group scorecard: how {STATE.get('grp') or 'this group'} encodes - "

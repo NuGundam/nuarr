@@ -33,6 +33,7 @@ MARGIN_GB = 1.0          # kept free for encodes starting and drivers
 COST_GB = {              # measured on the A5000, model + working memory
     "qwen": 8.5,         # Qwen2.5-7B int8_float16, CTranslate2
     "whisper": 4.0,      # large-v3 float16
+    "whisper_small": 1.2,  # the language identifier (audiolang)
     "paddle": 1.5,
     "qwenvl": 5.6,       # qwen3-vl:8b at num_ctx 2048
 }

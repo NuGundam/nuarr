@@ -647,6 +647,12 @@ def _ocr_proc(engine: str):
         env["NUARR_QWENVL_LIVE"] = qwenvl.live_path()
     except Exception:                                            # noqa: BLE001
         env["NUARR_QWENVL"] = ""
+    if dev != "cpu":
+        try:
+            from . import gpubudget as _gb
+            _gb.make_room(_gb.COST_GB.get("paddle", 1.5), "paddle", 20)
+        except Exception:                                        # noqa: BLE001
+            pass
     try:
         p = subprocess.Popen(
             [_sys.executable,

@@ -176,9 +176,15 @@ def _tally_text(t: dict) -> str:
             f"this show: " + ", ".join(f"{v} {words.get(k, k)}" for k, v in sorted(t.items())) + ".\n")
 
 
-def track_verdicts() -> dict:
-    """{(file_id, track): {"p", "kind", "why", "size"}}"""
+_TV: dict = {"at": 0.0, "v": None}
+
+
+def track_verdicts(fresh: bool = False) -> dict:
+    """{(file_id, track): {"p", "kind", "why", "size"}} - the whole table,
+    held for a minute: the board asked for it on every 2.5 s poll."""
     from .db import cursor
+    if not fresh and _TV["v"] is not None and time.time() - _TV["at"] < 60 and not STATE.get("running"):
+        return _TV["v"]
     init_tracks()
     out = {}
     with cursor() as cur:
@@ -186,6 +192,7 @@ def track_verdicts() -> dict:
             out[(int(r["file_id"]), int(r["track"]))] = {"p": int(r["dialogue_p"] or 0),
                                                          "kind": r["kind"] or "", "why": r["why"] or "",
                                                          "size": int(r["size"] or 0), "ex": r["ex"] or ""}
+    _TV.update(at=time.time(), v=out)
     return out
 
 
@@ -292,6 +299,11 @@ async def run() -> str:
             if "progress" in d:
                 STATE.update(done=int(d["progress"]), total=int(d.get("total") or STATE["total"]),
                              file=str(d.get("file") or ""), stage="reading the lines")
+                try:
+                    from . import heavy as _hv
+                    _hv.touch(LANE)
+                except Exception:                                # noqa: BLE001
+                    pass
             n = int(d.get("judged", n))
             err = d.get("error", err)
         await p.wait()
@@ -440,10 +452,11 @@ def as_running() -> list:
     # TITLED BY THE FILE, like every other card: "City Hunter - S00E01", with
     # what the judge is doing and how far it is in the stage line.
     f = STATE.get("file") or ""
-    import re as _re
-    stem = _re.sub(r"\.[A-Za-z0-9]{2,4}$", "", f)
-    m = _re.match(r"(.+?)(?: \(\d{4}\))? - (S\d+E\d+)", stem)
-    label = f"{m.group(1)} - {m.group(2)}" if m else (stem.split(" [")[0] or "Qwen judge")
+    try:
+        from .db import pretty_from_filename
+        label = pretty_from_filename(f) or "Qwen judge"
+    except Exception:                                    # noqa: BLE001
+        label = f.split(" [")[0] or "Qwen judge"
     return [{
         "job_id": "qwenjudge", "pool": "qwen", "kind": "qwen",
         "title": label, "file": f,

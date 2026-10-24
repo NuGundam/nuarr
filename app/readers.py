@@ -43,6 +43,8 @@ DEPTH = {"listen": 60, "subread": 120}
 # When the verdict table was last swept, and what went. See watch().
 _PRUNE: dict = {"at": 0.0, "last": {}}
 FEED_S = 60.0
+MODEL_IDLE_S = 120.0
+_IDLE: dict = {"listen": 0.0}
 
 STATE: dict = {"listen": {"fed": 0, "on_queue": 0, "at": 0.0},
                "subread": {"fed": 0, "on_queue": 0, "at": 0.0}}
@@ -814,9 +816,37 @@ async def watch() -> None:
         # encoding the rest of the time.
         try:
             from . import audiolang
-            if not await asyncio.to_thread(_have, "listen") \
-                    and getattr(audiolang, "_MODEL", None) is not None:
-                await asyncio.to_thread(audiolang.unload)
+            if getattr(audiolang, "_MODEL", None) is not None:
+                from . import jobs as _j
+                listening = any(getattr(w, "pool", "") == "listen" for w in list(_j.RUNNING.values()))
+                try:
+                    from . import subverify as _sv
+                    verifying = _sv._LOCK.locked()
+                except Exception:                                # noqa: BLE001
+                    verifying = False
+                if listening or verifying:
+                    _IDLE["listen"] = 0.0
+                elif not _IDLE["listen"]:
+                    _IDLE["listen"] = time.time()
+                # NO LISTENER FOR TWO MINUTES = the model goes, queue or no
+                # queue. It used to wait for the listen queue to be EMPTY,
+                # and a queue that always has a few rows kept 1.2 GB loaded
+                # for days.
+                if not await asyncio.to_thread(_have, "listen") or \
+                        (_IDLE["listen"] and time.time() - _IDLE["listen"] > MODEL_IDLE_S):
+                    await asyncio.to_thread(audiolang.unload)
+                    _IDLE["listen"] = 0.0
+        except Exception:                                        # noqa: BLE001
+            pass
+        # THE SAME FOR THE SERVED OCR READER. Its idle timer only ran on the
+        # next frame read, so between passes it sat on the card for hours.
+        try:
+            from . import hardsub as _hs
+            o = _hs._OCR
+            if o.get("proc") is not None and time.time() - float(o.get("at") or 0) > _hs.OCR_IDLE_S:
+                from . import jobs as _j
+                if not any(getattr(w, "pool", "") == "subread" for w in list(_j.RUNNING.values())):
+                    await asyncio.to_thread(_hs.ocr_close)
         except Exception:                                        # noqa: BLE001
             pass
         await asyncio.sleep(FEED_S)

@@ -151,22 +151,18 @@ def _label(fid: int, label: str, path: str) -> str:
     if label and not label.startswith("(untitled)"):
         return label
     try:
-        from .db import display_label
-        with cursor() as cur:
-            r = cur.execute("SELECT title, season, episode, path FROM files WHERE id=?", (int(fid),)).fetchone()
-        if r and (r["title"] or "").strip():
-            return display_label(r["title"], r["season"], r["episode"], r["path"])
+        from .db import label_for
+        return label_for(path=path, file_id=int(fid))
     except Exception:                                            # noqa: BLE001
-        pass
-    return os.path.splitext(os.path.basename(path))[0][:90] or label or "(untitled)"
+        return os.path.splitext(os.path.basename(path))[0].split(" [")[0][:90] or label or "(untitled)"
 
 
-def candidates(limit: int = 50) -> list:
+def candidates(limit: int = 50, findings: dict | None = None) -> list:
     """The board's unsure rows, least sure first, not yet verified for this reading."""
     from . import subkind
     init()
     try:
-        f = subkind.findings(limit=800, want_done=False, want_unread=False)
+        f = findings if findings is not None else subkind.findings(limit=800, want_done=False, want_unread=False)
     except Exception:                                            # noqa: BLE001
         return []
     rows = [r for r in (f.get("rows") or []) if r.get("action") and not r.get("done")
@@ -237,6 +233,17 @@ def _whisper(path: str, windows: list, lang3: str, tick=None) -> list:
     from . import outside as _out
     _out.set_pid("verify", p.pid)
     heard, err = [], ""
+    try:
+        _drain_whisper(p, heard, tick)
+    finally:
+        if p.poll() is None:
+            p.kill()
+        p.wait(timeout=30)
+    return heard
+
+
+def _drain_whisper(p, heard: list, tick) -> None:
+    err = ""
     for ln in p.stdout:
         try:
             d = json.loads(ln)
@@ -568,7 +575,7 @@ def run_batch(n: int) -> dict:
         if not got:
             return {"skipped": f"{holder} has the GPU lane"}
         from . import gpubudget as _gb
-        _ok, _why = _gb.make_room(_gb.COST_GB["whisper"], "verify", 300)
+        _ok, _why = _gb.make_room(_gb.COST_GB.get("whisper_small", 1.2), "verify", 300)
         if not _ok:
             heavy.release(LANE)
             return {"skipped": f"GPU memory - {_why}"}
@@ -577,6 +584,7 @@ def run_batch(n: int) -> dict:
             for r in candidates(n):
                 if _STOP["flag"]:
                     break
+                heavy.touch(LANE)             # a long batch must not lose the lane
                 done.append(verify_one(r))
             return {"done": len(done), "answered": sum(1 for d in done if d["action"].startswith("answered")),
                     "results": done}
@@ -651,17 +659,22 @@ def snapshot() -> dict:
             r["evidence"] = json.loads(r["evidence"] or "{}")
         except Exception:                                        # noqa: BLE001
             r["evidence"] = {}
+    # THE BOARD, READ ONCE: for what is waiting and for which rows are still
+    # open. It was read twice per snapshot, and it is the dear part.
     try:
-        waiting = len(candidates(400))
+        from . import subkind
+        f = subkind.findings(limit=800, want_done=False, want_unread=False)
+    except Exception:                                            # noqa: BLE001
+        f = None
+    try:
+        waiting = len(candidates(400, f)) if f is not None else -1
     except Exception:                                            # noqa: BLE001
         waiting = -1
     # STILL ON THE BOARD? A row "left for you" a day ago may long since have
     # been answered, replaced or given subtitles - the panel should only say
     # "waiting for you" about the ones that really still are.
     try:
-        from . import subkind
-        f = subkind.findings(limit=800, want_done=False, want_unread=False)
-        live = {(int(x["file_id"]), x["source"]) for x in (f.get("rows") or []) if not x.get("done")}
+        live = {(int(x["file_id"]), x["source"]) for x in ((f or {}).get("rows") or []) if not x.get("done")}
     except Exception:                                            # noqa: BLE001
         live = set()
     for r in rows:

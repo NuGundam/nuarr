@@ -1977,6 +1977,8 @@ def _estimate_client_leads(sessions: list[dict]) -> None:
     for k in list(_SLEADS):
         if k in live_keys and k not in saveable:
             del _SLEADS[k]
+        elif k not in live_keys and now - float((_SLEADS[k] or {}).get("at") or 0) > SLEAD_MAX_AGE_S:
+            del _SLEADS[k]              # an ended session, an hour on
     _SLEADS.update(saveable)
     _sleads_save(_SLEADS)
 
@@ -2508,6 +2510,10 @@ def check_plex() -> Reason:
             # underneath it showed people happily watching.
             why_now = ("after the encoders parked" if active
                        else "after playback stopped")
+            # THE GRACE IS ABOUT THE ENCODERS - it exists so an episode
+            # change does not restart them. It held every pool, so a parked
+            # encoder idled passthrough and disk work everywhere for 2 min.
+            _enc_only = bool(get_toggle("gate.plex_encode_only"))
             return Reason(
                 True, "plex",
                 f"Grace period {why_now} — "
@@ -2516,7 +2522,8 @@ def check_plex() -> Reason:
                                "episodes does not restart the encoders"],
                 clears=(f"Automatically in {left/60:.1f} min, unless "
                         + ("a viewer's buffer runs down again" if active
-                           else "somebody starts watching again")))
+                           else "somebody starts watching again")),
+                **({"pools": ("encode",)} if _enc_only else {}))
             # NOTE: the old message called these "idle sessions" and counted
             # every session including ones that were direct-playing at the
             # time. They were not idle and the number was misleading.
@@ -2743,16 +2750,25 @@ def _our_bps_by_key() -> dict[str, float]:
         from . import jobs
         keys = _label_keys()
         for w in list(jobs.RUNNING.values()):
-            rate = float(getattr(w, "read_bps", 0) or 0) + \
-                float(getattr(w, "write_bps", 0) or 0)
-            if rate <= 0:
-                continue
-            # A job reads its source and writes its output, often on two
-            # different spindles; both are ours.
-            for lbl in (getattr(w, "disk", ""), getattr(w, "dest_disk", "")):
-                k = keys.get(lbl or "")
-                if k:
-                    out[k] = out.get(k, 0.0) + rate
+            rd = float(getattr(w, "read_bps", 0) or 0)
+            wr = float(getattr(w, "write_bps", 0) or 0)
+            src = getattr(w, "disk", "") or ""
+            dst = getattr(w, "dest_disk", "") or src
+            # THE READ IS ON THE SOURCE, THE WRITE ON THE DESTINATION. Both
+            # halves used to be credited to both spindles, which over-counted
+            # nuarr's share and hid real outside load (a viewer, a balance).
+            if rd > 0 and keys.get(src):
+                out[keys[src]] = out.get(keys[src], 0.0) + rd
+            if wr > 0 and keys.get(dst):
+                out[keys[dst]] = out.get(keys[dst], 0.0) + wr
+            # AND THE COMMIT COPY, which has no ffmpeg behind it: with w.proc
+            # gone its rates decayed to zero and its own writes read as
+            # somebody else's - so a commit could pause itself at 97 % busy,
+            # resume under 85 %, and sawtooth.
+            if getattr(w, "commit_phase", "") == "copying":
+                cb = float(getattr(w, "commit_bps", 0) or 0)
+                if cb > 0 and keys.get(dst):
+                    out[keys[dst]] = out.get(keys[dst], 0.0) + cb
     except Exception:
         pass
     # AND THE WORK THAT IS NOT A JOB. A sidecar remux moves as many bytes as
@@ -3378,7 +3394,24 @@ BUFFER_SETTLE_S = 20.0
 # already pause work on that viewer's spindle until their buffer is back -
 # carry on protecting them.
 BUFFER_MAX_SETTLE_S = 120.0
-_BUF: dict = {"since": 0.0, "last": 0.0, "ok_since": 0.0, "who": "", "stallers": [], "waiting_on": ""}
+_BUF: dict = {"since": 0.0, "last": 0.0, "ok_since": 0.0, "who": "", "stallers": [], "waiting_on": "",
+              "disks": set()}
+
+
+def hold_disks() -> set | None:
+    """THE SCOPE OF THE GLOBAL HOLD. A stalling or landing viewer used to
+    freeze every job on every spindle and stop every pool - four NVENC
+    encodes on disks nobody was reading included - for up to three minutes
+    per episode rollover. The viewer is only hurt by work on the disk they
+    read (and the disk a commit is landing on). So: the set of disks the
+    hold protects, or None when it is not yet known which disk that is -
+    and only then is the hold truly global."""
+    if _BUF["since"]:
+        return set(_BUF.get("disks") or ()) or None
+    if _LAND:
+        ds = {v.get("disk") for v in _LAND.values()}
+        return None if (not ds or None in ds or "" in ds) else ds
+    return None
 
 
 def _buffer_note(active: list, buffering: list, base: float) -> None:
@@ -3393,11 +3426,19 @@ def _buffer_note(active: list, buffering: list, base: float) -> None:
         who = ", ".join(sorted({str(s.get("user") or s.get("username")
                                     or "a viewer") for s in buffering}))
         if not _BUF["since"]:
-            joblog.log(f"{who} is buffering - every pool holds and every "
-                       f"running job is frozen until they are in the clear",
-                       "warn")
+            joblog.log(f"{who} is buffering - work on their disk holds and "
+                       f"jobs there are frozen until they are in the clear "
+                       f"(everything, if their disk is not known)", "warn")
             _BUF["since"] = now
-        _BUF.update(last=now, ok_since=0.0, who=who, waiting_on="",
+        disks = set()
+        for s in buffering:
+            try:
+                d = _disk_for(str(s.get("file") or "")) if s.get("file") else None
+            except Exception:                                    # noqa: BLE001
+                d = None
+            if d:
+                disks.add(d)
+        _BUF.update(last=now, ok_since=0.0, who=who, waiting_on="", disks=disks,
                     stallers=sorted({str(s.get("user") or s.get("username") or "") for s in buffering}))
         return
     if not _BUF["since"]:
@@ -3436,7 +3477,7 @@ def _buffer_note(active: list, buffering: list, base: float) -> None:
                else f"no stall for {hold_s + BUFFER_MAX_SETTLE_S:.0f}s - "
                     f"{_BUF['waiting_on'] or 'everyone'} left to the per-disk rules")
         joblog.log(f"buffering hold released after {now - _BUF['since']:.0f}s - {why}", "ok")
-        _BUF.update(since=0.0, last=0.0, ok_since=0.0, who="", stallers=[], waiting_on="")
+        _BUF.update(since=0.0, last=0.0, ok_since=0.0, who="", stallers=[], waiting_on="", disks=set())
 
 
 def buffer_hold() -> tuple[bool, str, float]:
@@ -3501,8 +3542,8 @@ def _landing_note(active: list, everyone: list, base: float) -> None:
             who = str(s.get("user") or s.get("username") or "a viewer")
             _LAND[key] = {"since": now, "who": who, "file": f}
             joblog.log(f"{who} pressed play - everything holds until nuarr "
-                       f"knows which disk they are on and their buffer is "
-                       f"over its floor", "info")
+                       f"knows which disk they are on, then only that disk "
+                       f"until their buffer is over its floor", "info")
         _LAND_SEEN[key] = f or (prev or "")
         e = _LAND.get(key)
         if not e:
@@ -3510,6 +3551,8 @@ def _landing_note(active: list, everyone: list, base: float) -> None:
         # RESOLVED? The disk is known and the buffer is measured and over
         # its floor - or the wait has hit its cap, or they paused.
         d = _disk_for(f) if f else None
+        if d:
+            e["disk"] = d
         try:
             lead = float(s.get("lead_s"))
         except (TypeError, ValueError):
@@ -3559,6 +3602,11 @@ def check_landing() -> Reason:
     on, who, left = landing_hold()
     if not on:
         return Reason(False, "newviewer", "nobody has just started")
+    hd = hold_disks()
+    if hd:
+        return Reason(False, "newviewer",
+                      f"{who} just pressed play - work on {', '.join(sorted(hd))} waits while they settle",
+                      restricts=f"new work avoids {', '.join(sorted(hd))}")
     return Reason(
         True, "newviewer",
         f"{who} just pressed play - everything is held while they settle",
@@ -3578,6 +3626,11 @@ def check_buffering() -> Reason:
     w = buffer_waiting_on()
     since_last = time.time() - _BUF["last"]
     cap_left = max(0.0, _tune("buffer_hold_s") + BUFFER_MAX_SETTLE_S - since_last)
+    hd = hold_disks()
+    if hd:
+        return Reason(False, "buffering",
+                      f"{who} is buffering - work on {', '.join(sorted(hd))} is frozen, the rest carries on",
+                      restricts=f"new work avoids {', '.join(sorted(hd))}")
     return Reason(
         True, "buffering",
         (f"{who} is buffering - everything is held" if left > 0 or not w

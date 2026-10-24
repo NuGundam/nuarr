@@ -265,7 +265,10 @@ async def busy(disk: str = "") -> dict:
     try:
         from . import gate
         st = await asyncio.to_thread(gate.check_plex)
-        if st is not None and getattr(st, "blocked", False):
+        if st is not None and getattr(st, "blocked", False) \
+                and tuple(getattr(st, "pools", ()) or ()) != ("encode",):
+            # a hold that names only the encode pool is about the GPU;
+            # these fixers move bytes on disks, so it is not theirs
             return {"busy": True, "why": "somebody is watching",
                     "detail": getattr(st, "detail", "") or ""}
     except Exception:                                            # noqa: BLE001
@@ -318,18 +321,26 @@ async def busy(disk: str = "") -> dict:
                 "why": f"the CPU is at {m['cpu_all']:.0f}%",
                 "detail": "whoever filled it, there is nothing left to spare"}
     if m.get("gpu", 0) >= GPU_BUSY_PCT:
-        return {"busy": True, "why": f"the GPU is at {m['gpu']:.0f}%",
-                "detail": f"background work waits above {GPU_BUSY_PCT:.0f}%"}
+        try:
+            from . import jobs as _j
+            _ours = any(getattr(w, "pool", "") == "encode" for w in list(_j.RUNNING.values()))
+        except Exception:                                        # noqa: BLE001
+            _ours = False
+        if not _ours:
+            # four of nuarr's own encodes fill the encoder; that is not a
+            # reason to pause work that never touches the card
+            return {"busy": True, "why": f"the GPU is at {m['gpu']:.0f}%",
+                    "detail": f"background work waits above {GPU_BUSY_PCT:.0f}%"}
     # 6. and THIS FILE'S disk, which is the question the queue asks
     if disk:
         try:
             from . import gate
-            if disk in gate.plex_disks():
-                return {"busy": True, "why": f"a viewer is on {disk}",
+            if disk in gate.plex_disks() or disk in (gate.hold_disks() or ()):
+                return {"busy": True, "why": f"a viewer is on {disk}", "disk": disk,
                         "detail": "the transcode queue steers around this "
                                   "spindle for the same reason"}
             if disk in gate.busy_disks():
-                return {"busy": True, "why": f"{disk} is busy",
+                return {"busy": True, "why": f"{disk} is busy", "disk": disk,
                         "detail": "a rebuild, a balance or a copy has that "
                                   "disk - the other eleven are free"}
         except Exception:                                        # noqa: BLE001
@@ -530,8 +541,8 @@ async def run(key: str, title: str, pending, do_one, label=None, *,
                     # the way is this file's own spindle, step over it and
                     # take the next one - the sort above means there usually
                     # is a next one.
-                    if b["busy"] and (b.get("why") or "").endswith(
-                            dk or "\x00"):
+                    if b["busy"] and dk and (b.get("disk") == dk
+                                             or (b.get("why") or "").endswith(dk)):
                         # NAMED, NOT COUNTED. "3 skipped" is a number you can
                         # only shrug at; "stepped over NU-DRIVE-1" is the same
                         # fact and answers the next question with it.
@@ -835,13 +846,25 @@ def _sample_all() -> list:
     return live
 
 
+def _nice(name: str) -> str:
+    """Fixers hand in the raw filename; the card shows what a person would say."""
+    n = str(name or "")
+    if n.lower().endswith((".mkv", ".mp4", ".avi", ".m4v", ".ts", ".ass", ".srt", ".sup")):
+        try:
+            from .db import pretty_from_filename
+            return pretty_from_filename(n) or n
+        except Exception:                                        # noqa: BLE001
+            return n
+    return n
+
+
 def tasks() -> list[dict]:
     """The same shape a worker reports itself in, so one renderer draws both."""
     out = []
     for t in _sample_all():
         out.append({
             "job_id": f"bg{t.id}", "background": True,
-            "system": t.system, "title": t.title or t.now, "file": t.now,
+            "system": t.system, "title": _nice(t.title or t.now), "file": t.now,
             "pool": "background", "stage": t.note or t.system,
             "stage_s": round(time.time() - t.since),
             "elapsed_s": round(time.time() - t.since),

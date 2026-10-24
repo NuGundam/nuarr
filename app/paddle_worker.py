@@ -272,7 +272,20 @@ def serve(engine: str, lang: str, device: str) -> None:
                       "device": getattr(read, "device", device),
                       "vl": vl.model}),
           flush=True)
+    # ITS OWN IDLE TIMER. nuarr closes this reader when it goes quiet, but
+    # if nuarr dies or forgets, nothing else ever would - a worker that
+    # outlives its purpose sits on the card with a model loaded.
+    import threading as _th
+    last = [time.time()]
+
+    def _watch():
+        while True:
+            time.sleep(60)
+            if time.time() - last[0] > 900:
+                os._exit(0)
+    _th.Thread(target=_watch, daemon=True).start()
     for line in sys.stdin:
+        last[0] = time.time()
         p = line.strip()
         if not p or p == "QUIT":
             break

@@ -31,7 +31,7 @@ OLLAMA = os.environ.get("NUARR_OLLAMA", "http://127.0.0.1:11434")
 MODEL_DEFAULT = "qwen3-vl:8b-instruct"
 VL_MAX_DEFAULT = 200           # cues per track it may be asked about
 DOUBT_SCORE = 0.72             # mean Paddle confidence under this is a doubt
-LOAD_GB = 7.0                  # free GPU memory needed to LOAD it (5.5 + room for the rest)
+LOAD_GB = 6.6                  # free GPU memory needed to LOAD it (5.6 + the 1 GB margin gpubudget keeps)
 KEEP_ALIVE = "3m"              # Ollama unloads it after this long idle; loading again costs about a second
 
 PROMPT = ("This image is one subtitle cue cut from a video. Transcribe the text "
@@ -337,9 +337,12 @@ def note_for(path: str) -> None:
 
 def _nice(fname: str) -> str:
     """'City Hunter (1987) - S01E39 - Title [WEBDL...].mkv' -> 'City Hunter - S01E39'."""
-    stem = re.sub(r"\.[A-Za-z0-9]{2,4}$", "", fname or "")
-    m = re.match(r"(.+?)(?: \(\d{4}\))?(?: \{[^}]*\})? - (S\d+E\d+)", stem)
-    return f"{m.group(1)} - {m.group(2)}" if m else stem.split(" [")[0]
+    try:
+        from .db import pretty_from_filename
+        return pretty_from_filename(fname or "") or (fname or "")
+    except Exception:                                    # noqa: BLE001
+        stem = re.sub(r"\.[A-Za-z0-9]{2,4}$", "", fname or "")
+        return stem.split(" [")[0]
 
 
 def _loaded() -> dict | None:

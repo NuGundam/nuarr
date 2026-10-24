@@ -177,6 +177,18 @@ def log(text: str, level: str = "info", job_id: str | None = None,
     with _lock:
         _RECENT.append(ln)
         if job_id:
+            if job_id not in _LIVE and len(_LIVE) > 64:
+                # A BUFFER PER JOB ID, RELEASED WHEN THE WORKER ENDS - but
+                # "queued", "reaped" and "removed from queue" lines named
+                # jobs that never had a worker, and those buffers stayed
+                # for the life of the process (thousands, over weeks).
+                try:
+                    from . import jobs as _j
+                    live_ids = set(_j.RUNNING)
+                except Exception:                                # noqa: BLE001
+                    live_ids = set()
+                for k in [k for k in _LIVE if k not in live_ids][:-32]:
+                    _LIVE.pop(k, None)
             buf = _LIVE.setdefault(job_id, deque(maxlen=_LIVE_MAX))
             buf.append(ln)
             _write(JOB_LOG_DIR / f"{job_id}.log", formatted)

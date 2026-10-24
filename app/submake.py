@@ -116,6 +116,31 @@ def _remember(row: dict) -> None:
         kv_set(KV_TRIED, json.dumps(t))
 
 
+def gate_many(file_ids: list) -> dict:
+    """gate() for a list, with the queue and the tried-record read once."""
+    q = {int(x["file_id"]) for x in _queue()}
+    t = _tried()
+    now = time.time()
+    out = {}
+    for fid in file_ids:
+        fid = int(fid)
+        if STATE.get("file_id") == fid or fid in q:
+            out[fid] = "pending"
+            continue
+        tr = t.get(str(fid))
+        if not tr:
+            out[fid] = "none"
+        elif tr.get("ok"):
+            out[fid] = "ok"
+        elif tr.get("skipped"):
+            out[fid] = "skipped"
+        elif tr.get("error"):
+            out[fid] = "none" if now - float(tr.get("at") or 0) > RETRY_S else "retry"
+        else:
+            out[fid] = "failed"
+    return out
+
+
 def gate(file_id: int) -> str:
     """Where the maker stands on this file, for a check that would delete it.
 

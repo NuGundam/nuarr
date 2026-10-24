@@ -326,13 +326,17 @@ def choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durati
     if not _acquire(False):
         t0 = time.time()
         STATE[job_id] = {"label": os.path.basename(src), "probe": 0, "cq": None, "at": t0, "waiting": True}
-        while not _acquire(True, 5.0):
-            if tick:
-                try:
-                    tick(f"waiting for a quality-search slot ({int(time.time() - t0)}s) - "
-                         f"{searches()} run at once", 0.0, {})
-                except TypeError:
-                    tick("waiting for a quality-search slot", 0.0)
+        try:
+            while not _acquire(True, 5.0):
+                if tick:
+                    try:
+                        tick(f"waiting for a quality-search slot ({int(time.time() - t0)}s) - "
+                             f"{searches()} run at once", 0.0, {})
+                    except TypeError:
+                        tick("waiting for a quality-search slot", 0.0)
+        except BaseException:
+            STATE.pop(job_id, None)           # the waiting entry must not outlive the wait
+            raise
     try:
         return _choose(job_id, file_id, src, plan, probe, duration, library, work_dir, tick)
     finally:

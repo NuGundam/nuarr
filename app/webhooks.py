@@ -591,15 +591,18 @@ async def _sync_file(cfg, file_id: int, parent_id: int | None, why: str,
                         "release_group=? WHERE id=?",
                         (cf_score, cf_names, rel_grp, row["id"]))
             if state:
+                # COALESCE: parent_title() answers None on any error, and that
+                # None was written over a good title - the first-minute
+                # "(untitled)" rows, and on every Rename resync too.
                 cur.execute(
-                    "UPDATE files SET arr_parent_id=?,path=?,library=?,title=?,"
+                    "UPDATE files SET arr_parent_id=?,path=?,library=?,title=COALESCE(?, title),"
                     "season=?,episode=?,size=?,mtime=?,pool_disk=?,state=?,"
                     "state_reason=?,last_seen=?,updated_at=? WHERE id=?",
                     (parent, path, lib, title, season, episode, size, mtime, disk,
                      state, why, now, now, row["id"]))
             else:
                 cur.execute(
-                    "UPDATE files SET arr_parent_id=?,path=?,library=?,title=?,"
+                    "UPDATE files SET arr_parent_id=?,path=?,library=?,title=COALESCE(?, title),"
                     "season=?,episode=?,size=?,mtime=?,pool_disk=?,last_seen=?,"
                     "updated_at=? WHERE id=?",
                     (parent, path, lib, title, season, episode, size, mtime, disk,

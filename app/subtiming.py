@@ -106,8 +106,14 @@ def set_paused(on: bool) -> None:
 
 
 def _label(path: str) -> str:
-    b = os.path.splitext(os.path.basename(path))[0]
-    return b.split(" [")[0][:90]
+    try:
+        from .db import label_for
+        with cursor() as cur:
+            r = cur.execute("SELECT id FROM files WHERE path=?", (path,)).fetchone()
+        return label_for(path=path, file_id=(r["id"] if r else None))
+    except Exception:                                            # noqa: BLE001
+        b = os.path.splitext(os.path.basename(path))[0]
+        return b.split(" [")[0][:90]
 
 
 # ------------------------------------------------------------------ queue ----
@@ -155,8 +161,8 @@ def _measure(path: str, tracks: str = "", check_only: bool = False) -> dict:
         cmd += ["--check-only"]
     from . import outside as _out
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
-                         errors="replace", cwd=root, creationflags=NO_WINDOW, startupinfo=hidden_si(),
-                         stdin=subprocess.DEVNULL)
+                         errors="replace", cwd=root, creationflags=NO_WINDOW | 0x00004000,   # below normal
+                         startupinfo=hidden_si(), stdin=subprocess.DEVNULL)
     _out.set_pid("subtiming", p.pid)
     # PROGRESS AS IT GOES: the worker says "PROG i/n what" on stderr per piece
     base, span = (82.0, 8.0) if check_only else (5.0, 30.0)
@@ -428,6 +434,15 @@ def snapshot() -> dict:
             r["tracks"] = json.loads(r["tracks"] or "[]")
         except Exception:                                        # noqa: BLE001
             r["tracks"] = []
+        # THE PAGE DRAWS THE SLICES, NOT THE SEARCH. The sums, every slice's
+        # match figures and the search's bookkeeping made 60 rows 232 KB on
+        # a poll every 30 s; what is drawn is the lag per slice and the words.
+        for t in r["tracks"]:
+            for k in ("before_sum", "after_sum", "r_before", "r_after", "cues_extra"):
+                t.pop(k, None)
+            for key in ("before", "after", "check"):
+                if isinstance(t.get(key), list):
+                    t[key] = [{"t": s.get("t"), "late": s.get("late"), "r": s.get("r")} for s in t[key]]
     wait = _WAIT["n"]          # counted by watch(), never on the page's request
     avg = sum(last) / len(last) if last else 0.0
     eta = 0.0

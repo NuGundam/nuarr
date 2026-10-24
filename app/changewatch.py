@@ -236,12 +236,12 @@ async def watch() -> None:
              "writes settle - so the full scan can run as a backstop rather "
              "than the only way to notice anything.")
     await asyncio.sleep(25)
-    start()
+    await asyncio.to_thread(start)
     while True:
         schedules.beat("changewatch")
         try:
             if enabled():
-                start()                                      # revive dead watchers
+                await asyncio.to_thread(start)                                      # revive dead watchers
                 now = time.time()
                 due = []
                 with _lock:

@@ -927,6 +927,58 @@ def film_year(path: str | None) -> str:
     return m.group(1) if m else ""
 
 
+_DIR_TITLE: dict = {}
+
+
+def label_for(title: str | None = None, season=None, episode=None, path: str | None = None,
+              file_id: int | None = None) -> str:
+    """THE ONE ANSWER TO "WHAT IS THIS FILE CALLED", for every card, row and
+    log line. Fifteen places built a name their own way - a bare basename
+    with its tags, a regex that kept "{tvdb-1234}", a film without its year,
+    "(untitled)" for a file whose title had not arrived yet - so one file
+    showed under three names. Title from the files row, else from a titled
+    file in the same folder, else read off the filename; season/episode
+    from the row, else the name; the film year from the path."""
+    import ntpath
+    import re as _re
+    if file_id and (title is None or path is None):
+        try:
+            with cursor() as cur:
+                r = cur.execute("SELECT title, season, episode, path FROM files WHERE id=?",
+                                (int(file_id),)).fetchone()
+            if r:
+                title = title or r["title"]
+                path = path or r["path"]
+                if season is None:
+                    season, episode = r["season"], r["episode"]
+        except Exception:                                        # noqa: BLE001
+            pass
+    title = (title or "").strip()
+    if title.startswith("(untitled)"):
+        title = ""
+    if not title and path:
+        d = ntpath.dirname(path).rstrip("\\") + "\\"
+        if d not in _DIR_TITLE:
+            try:
+                with cursor() as cur:
+                    r = cur.execute("SELECT title FROM files WHERE COALESCE(title,'') <> '' "
+                                    "AND substr(path, 1, ?) = ? LIMIT 1", (len(d), d)).fetchone()
+                _DIR_TITLE[d] = (r["title"] if r else None)
+            except Exception:                                    # noqa: BLE001
+                _DIR_TITLE[d] = None
+            if len(_DIR_TITLE) > 5000:
+                _DIR_TITLE.clear()
+        title = _DIR_TITLE.get(d) or ""
+    if not title:
+        return pretty_from_filename(ntpath.basename(path or "")) or "(untitled)"
+    if season is None and path:
+        m = _re.search(r"[Ss](\d{1,4})[Ee](\d{1,4})(?:-?[Ee](\d{1,4}))?", ntpath.basename(path))
+        if m:
+            season = int(m.group(1))
+            episode = m.group(2) + (f"-{m.group(3)}" if m.group(3) else "")
+    return display_label(title, season, episode, path)
+
+
 def display_label(title: str | None, season=None, episode=None, path: str | None = None) -> str:
     """'Sword Art Online - S02E13' rather than just 'Sword Art Online'.
 

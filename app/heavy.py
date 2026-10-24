@@ -93,6 +93,14 @@ def claim(what: str, ttl: float = 0.0) -> tuple[bool, str]:
         return True, ""
 
 
+def touch(what: str) -> None:
+    """A holder still at work resets its clock, so a 200-file batch is not
+    silently expired out of the lane half way through."""
+    with _lock:
+        if _holder["what"] == what:
+            _holder["since"] = time.time()
+
+
 def release(what: str = "") -> None:
     """Give the lane back. A mismatched name is ignored, not an error -
     releasing something you do not hold should never raise inside a

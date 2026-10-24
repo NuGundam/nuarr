@@ -306,6 +306,20 @@ def _raw_rows(existing: list) -> list:
         return []
     by_file = {int(r["file_id"]): r for r in existing
                if r.get("source") == PICTURE}
+    # THE PICTURE STATE FOR EVERY RAW ROW IN ONE QUERY. It was one SELECT
+    # per row - 2,000 rows at the worst - on a board polled every 2.5 s.
+    hs: dict = {}
+    try:
+        from .db import cursor as _cur
+        ids = [int(u.get("file_id") or 0) for u in (d.get("rows") or [])]
+        with _cur() as cur:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                for h in cur.execute(f"SELECT file_id, state, words FROM hardsub WHERE file_id IN "
+                                     f"({','.join('?' * len(chunk))})", chunk):
+                    hs[int(h["file_id"])] = (str(h["state"] or ""), str(h["words"] or ""))
+    except Exception:                                        # noqa: BLE001
+        hs = {}
     out = []
     for u in (d.get("rows") or []):
         fid = int(u.get("file_id") or 0)
@@ -326,18 +340,7 @@ def _raw_rows(existing: list) -> list:
         # question on this row is "is this a film nobody here can follow".
         # The picture is one term in it; see subneed.raw_score.
         score = int(u.get("sure") or 0)
-        words, pst = "", ""
-        try:
-            from .db import cursor as _cur
-            with _cur() as cur:
-                h = cur.execute(
-                    "SELECT h.state, h.words FROM hardsub h "
-                    " WHERE h.file_id=?", (fid,)).fetchone()
-            if h is not None:
-                pst = str(h["state"] or "")
-                words = str(h["words"] or "")
-        except Exception:                                        # noqa: BLE001
-            words, pst = "", ""
+        pst, words = hs.get(fid, ("", ""))
         out.append({
             "id": f"{fid}:{RAW}",
             "file_id": fid, "source": RAW,

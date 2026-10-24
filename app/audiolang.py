@@ -889,6 +889,12 @@ def _model():
                 last = RuntimeError(why)
                 continue
             try:
+                if dev != "cpu":
+                    try:
+                        from . import gpubudget as _gb
+                        _gb.make_room(_gb.COST_GB.get("whisper_small", 1.2), "audio language ID", 20)
+                    except Exception:                            # noqa: BLE001
+                        pass
                 _MODEL = _start_worker(dev, ct)
                 _MODEL_ERR = ""
                 global _MODEL_DEV
@@ -1873,8 +1879,16 @@ def pending(limit: int = 5000) -> list[dict]:
             # ONLY THE COLUMNS FRESHNESS NEEDS. This was SELECT * over
             # 35,000 verdict rows - votes, why, overall, every blob - to
             # answer size and mtime, and it ran on the gate's poll.
+            # ONLY THE VERDICTS THAT CAN MATTER HERE. This pulled every
+            # audio_lang row - 57,000 of them, 97 MB of row objects - on each
+            # call, and the readers' feeder calls it every minute; the rows
+            # for files whose every track is tagged can never be looked at.
             have = {(r["file_id"], r["track"]): r for r in cur.execute(
-                "SELECT file_id, track, size, mtime FROM audio_lang").fetchall()}
+                "SELECT a.file_id, a.track, a.size, a.mtime FROM audio_lang a "
+                "  JOIN files f ON f.id = a.file_id "
+                " WHERE f.audio_langs IS NOT NULL "
+                "   AND (f.audio_langs = '-' OR f.audio_langs LIKE '-,%' "
+                "        OR f.audio_langs LIKE '%,-' OR f.audio_langs LIKE '%,-,%')").fetchall()}
             busy = _busy_files(cur)
             rows = cur.execute(
                 "SELECT id, path, title, season, episode, library, audio_langs, "

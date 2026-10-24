@@ -2324,6 +2324,17 @@ def _spindle_used(disk: str, running=None) -> int:
 # under half a core - is let through whatever the budget says, because making
 # a language tag wait behind a subtitle read is all cost and no saving.
 CPU_FREE_UNDER = 0.5
+
+# ONE HEAVY START AT A TIME. After a restart, or when a batch lands, the pump
+# claimed everything it could in one tick - 4 encodes, 6 remuxes, 6 OCRs -
+# and every one of them opened its file, probed it and spun its disk up in
+# the same second, which is the stall a viewer notices. A heavy job now
+# starts no sooner than START_GAP_S after the last heavy start, so the box
+# ramps instead of lurching; the cheap pools (a header edit, a title fix)
+# are not held back by it.
+START_GAP_S = 6.0
+HEAVY_POOLS = frozenset({"encode", "passthrough", "subocr", "decode", "subread", "listen"})
+_LAST_START = {"heavy": 0.0}
 # AND THE WORK YOU CAN SEE KEEPS A CORNER OF THE BUDGET. The measurements
 # that prompted this are all background work - checking files decode, reading
 # subtitles, listening for a language - and background work is both the
@@ -2358,9 +2369,36 @@ def cpu_cost(pool_name: str, plan_json: str = "") -> float:
     return float(boxspec.COST_CORES.get(pool_name, 0.5))
 
 
+def _outside_cores() -> float:
+    """Cores the work OUTSIDE the queue is using right now. The VMAF search
+    alone runs 6 threads per search inside an encode priced at half a core;
+    with two searches that is 12 cores the budget never saw."""
+    total = 0.0
+    try:
+        from . import vmaftarget as _vt
+        n = int(_vt.active() or 0)
+        if n:
+            total += n * max(2, (os.cpu_count() or 8) // (_vt.searches() + 1))
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        from . import subtiming as _st
+        if _st.STATE.get("running"):
+            total += 2.0                      # the voice detector + ffmpeg
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        from . import groupscore as _gs
+        if _gs.STATE.get("running"):
+            total += 3.0                      # ffmpeg + libvmaf, 3 threads
+    except Exception:                                            # noqa: BLE001
+        pass
+    return total
+
+
 def cpu_used(running=None) -> float:
     """Cores nuarr already has in flight, by the same prices."""
-    total = 0.0
+    total = _outside_cores()
     for w in (RUNNING.values() if running is None else running):
         pool = getattr(w, "pool", "") or ""
         if pool == "subread":
@@ -2859,6 +2897,12 @@ def _claim(pool: str) -> Job | None:
             hot = set(gate.busy_disks())
         except Exception:
             hot = set()
+        # A STALLING OR LANDING VIEWER'S DISK is avoided the same way - the
+        # pump no longer stops for them once the disk is known.
+        try:
+            hot |= set(gate.hold_disks() or ())
+        except Exception:
+            pass
 
         # MEASURED LOAD AS A TIE-BREAK, not just as a veto.
         #
@@ -3245,6 +3289,9 @@ async def pump() -> None:
                             if not st.open_for(pool):
                                 continue
                             while _in_pool(pool) < _capacity(pool):
+                                if pool in HEAVY_POOLS and \
+                                        time.time() - _LAST_START["heavy"] < START_GAP_S:
+                                    break                    # next tick
                                 # OFF THE LOOP. _claim is a handful of queries
                                 # plus disk_report, and it was the single
                                 # biggest on-loop database caller in the
@@ -3264,6 +3311,8 @@ async def pump() -> None:
                                                          started_at=time.time(),
                                                          disk=job.disk)
                                 asyncio.create_task(_run(job, pool))
+                                if pool in HEAVY_POOLS:
+                                    _LAST_START["heavy"] = time.time()
             else:
                 PAUSED_REASON = None
         except Exception as e:
@@ -3868,6 +3917,16 @@ def _suspend_for_viewers() -> None:
         # The per-spindle test below is the everyday rule; this is the
         # one for the moment it has already failed. See gate.buffer_hold.
         buf_hold, hold_why = _buffer_hold_on()
+        # ...ON THE DISKS THE HOLD PROTECTS. Only when nuarr cannot tell
+        # which disk the viewer reads is every job frozen.
+        if buf_hold:
+            try:
+                from . import gate as _g
+                _hd = _g.hold_disks()
+            except Exception:                                    # noqa: BLE001
+                _hd = None
+            if _hd is not None and not (disks & _hd):
+                buf_hold = False
         want_stop = buf_hold or (bool(disks) and _viewer_starving(disks))
         # NEVER hold one past the cap. A viewer stuck under the threshold for
         # minutes is a different problem, and a permanently frozen encode
@@ -4125,7 +4184,7 @@ async def io_priority_watch() -> None:
                         "debug")
             # ASKED EVERY CYCLE, because the case that must not be missed
             # is DrivePool left demoted after the reason for it has gone.
-            await asyncio.to_thread(_drivepool_yield, watched, not want,
+            await asyncio.to_thread(_drivepool_yield, watched, False,
                                     live, nxt)
         except Exception as e:
             playing = False
@@ -6263,6 +6322,7 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
         joblog.log(f"file was renamed during the encode -> committing to "
                    f"{os.path.basename(target)}", "warn", job.id)
         job.path = target
+        _relabel(job)
 
     # THE BYTES MUST STILL BE THE BYTES WE READ.
     #
@@ -6394,6 +6454,7 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
             with cursor() as cur:
                 cur.execute("UPDATE files SET path=? WHERE id=?",
                             (job.path, job.file_id))
+            _relabel(job)
             joblog.log(f"renamed to match its container: "
                        f"{os.path.basename(old)} -> {os.path.basename(job.path)}",
                        "ok", job.id)
@@ -7782,6 +7843,19 @@ def _why_idle(workers, depth: int) -> dict:
     out["elsewhere"] = {k: v for k, v in els.items() if v}
     out["queued_all"] = int(depth or 0)
     return out
+
+
+def _relabel(job) -> None:
+    """The job's name and path, brought up to date after a rename - on the
+    worker card now and in the jobs row the Finished list reads later."""
+    try:
+        from .db import label_for
+        t = label_for(file_id=job.file_id, path=job.path) or job.title
+        job.title = t
+        with cursor() as cur:
+            cur.execute("UPDATE jobs SET title=?, path=? WHERE job_id=?", (t, job.path, job.id))
+    except Exception:                                            # noqa: BLE001
+        pass
 
 
 def _oldest_first(rows: list) -> list:
