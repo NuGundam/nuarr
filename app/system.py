@@ -670,6 +670,26 @@ def _self_usage() -> dict:
             x["pool"] = parent.get("pool") or ""
             x["detail"] = f"console for {parent['activity'].lower()}"
 
+    # AND THEN FOLDED INTO IT. A console is part of the process it hosts, not
+    # a job of its own: listed separately it doubled every group ("6 x
+    # Transcode" for three encodes) and split each process's memory across
+    # two rows. Its CPU, memory and I/O are added to the parent's row and the
+    # row itself goes; `consoles` says how many were folded in.
+    by_pid = {x["pid"]: x for x in procs}
+    keep = []
+    for x in procs:
+        parent = by_pid.get(x["ppid"]) if x["ppid"] else None
+        if (x["name"] or "").lower() == "conhost.exe" and parent is not None                 and (parent["name"] or "").lower() != "conhost.exe":
+            parent["rss_mb"] = round(parent["rss_mb"] + x["rss_mb"], 1)
+            parent["cpu_pct"] = round(parent["cpu_pct"] + x["cpu_pct"], 1)
+            parent["read_bps"] += x["read_bps"]
+            parent["write_bps"] += x["write_bps"]
+            parent["consoles"] = parent.get("consoles", 0) + 1
+            parent.setdefault("folded_pids", []).append(x["pid"])
+            continue
+        keep.append(x)
+    procs = keep
+
     for pid in [p for p in _PROCS if p not in alive]:
         _PROCS.pop(pid, None)
         _CMD.pop(pid, None)

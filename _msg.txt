@@ -1,5 +1,5 @@
-﻿subtiming: tick start-to-start so per_hour is actually reached
+subtiming: Check now uses the typed number
 
-At 200/hour the loop slept 120 s after each ~80 s batch, giving ~126/hour.
+The button reads 'Check N now' from the per-hour box and checks that many; batches over 5 run in the background (Stop ends them between files).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
