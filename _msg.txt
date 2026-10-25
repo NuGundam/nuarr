@@ -1,5 +1,3 @@
-submake: listen and decode verdicts follow the file over the maker's embed
-
-Only a subtitle track changes, so audiolang.restamp + integrity.carry re-key the facts instead of a listen and a decode running again.
+subs/sub_ocr rewrites: listen and decode verdicts follow the file
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

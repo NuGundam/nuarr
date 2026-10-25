@@ -42694,7 +42694,12 @@ function smRowHtml(r){
           :`<span style="color:#7fd4a3">${fmt(r.narration||0)} spoken + ${fmt(r.onscreen||0)} on-screen</span>`)
         :`<span style="color:${burned?'#e8a33d':'#e0575b'}">${burned?'skipped':'failed'}</span>`}
       <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.why||'')}</div></td>`;
-    where=`<td class="c" style="font-size:10.5px">${r.ok?(r.where==='embedded'
+    // WHERE IT IS NOW - the server checks the file as it stands (r.now);
+    // r.where is only where it was put at the time.
+    const NOWC={'in the file':'#7fd4a3','waiting to go in':'#e3b341','beside it':'var(--dim)',replaced:'#8b949e',gone:'#e0575b'};
+    where=`<td class="c" style="font-size:10.5px">${r.ok?(r.now
+        ?`<span style="color:${NOWC[r.now]||'var(--dim)'}" title="${esc(r.now_why||'')}">${esc(r.now)}</span>`
+        :r.where==='embedded'
         ?'<span style="color:#7fd4a3" title="inside the file as a track called English (nuarr)">in the file</span>'
         :r.where==='pending'
         ?'<span style="color:#e3b341" title="made; waiting in subs-pending to go inside the file - the embed is retried, or the next rewrite of the file carries it in">waiting to go in</span>'

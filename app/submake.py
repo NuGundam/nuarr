@@ -1177,7 +1177,64 @@ def snapshot() -> dict:
             rows.append({"file_id": r["id"], "label": display_label(r["title"], r["season"], r["episode"], r["path"]),
                          "library": r["library"] or "", "file": os.path.basename(r["path"]),
                          "lang": _lang_of(r), "at": x.get("at")})
-    return {"state": dict(STATE), "queue": rows, "recent": _recent(), "lane": heavy.state()}
+    return {"state": dict(STATE), "queue": rows, "recent": _where_now(_recent()), "lane": heavy.state()}
+
+
+def _where_now(recent: list) -> list:
+    """WHERE THE SUBTITLES ARE NOW, not where they were put. A row said
+    "beside it" for a file whose loose copy had since been taken inside (the
+    Maoyu six), or for a file that was deleted and downloaded again, or for a
+    make whose track the duplicate rule later dropped in favour of the
+    release's own. Read off the stored probe, so it is cheap."""
+    out = []
+    try:
+        ids = list({int(x["file_id"]) for x in recent if x.get("ok") and x.get("file_id")})
+        probes: dict = {}
+        files: dict = {}
+        with cursor() as cur:
+            for i in range(0, len(ids), 400):
+                chunk = ids[i:i + 400]
+                q = ",".join("?" * len(chunk))
+                for r in cur.execute(f"SELECT file_id, json FROM file_probes WHERE file_id IN ({q})", chunk):
+                    probes[int(r["file_id"])] = r["json"] or ""
+                for r in cur.execute(f"SELECT id, path, state FROM files WHERE id IN ({q})", chunk):
+                    files[int(r["id"])] = (r["path"] or "", r["state"] or "")
+    except Exception:                                            # noqa: BLE001
+        return recent
+    for x in recent:
+        x = dict(x)
+        fid = int(x.get("file_id") or 0)
+        if x.get("ok") and fid:
+            path, st = files.get(fid, ("", ""))
+            now, why = "", ""
+            if not path or st in ("deleted", "duplicate") or not os.path.exists(path):
+                now, why = "gone", "the file is no longer in the library"
+            else:
+                ours = other_eng = False
+                try:
+                    for s_ in (json.loads(probes.get(fid) or "{}").get("streams") or []):
+                        if s_.get("codec_type") != "subtitle":
+                            continue
+                        t = s_.get("tags") or {}
+                        if (t.get("title") or "") == TRACK_NAME:
+                            ours = True
+                        elif (t.get("language") or "").lower() in ("eng", "en"):
+                            other_eng = True
+                except Exception:                                # noqa: BLE001
+                    pass
+                if ours:
+                    now, why = "in the file", f"inside the file as the track {TRACK_NAME}"
+                elif _have_sidecar(path):
+                    now, why = "beside it", "a loose .en file beside the video"
+                elif pending_item(fid):
+                    now, why = "waiting to go in", "made; in subs-pending until it is embedded"
+                elif other_eng:
+                    now, why = "replaced", "the file carries the release's own English track; nuarr's was dropped as the lesser duplicate"
+                else:
+                    now, why = "gone", "neither inside the file nor beside it any more"
+            x["now"], x["now_why"] = now, why
+        out.append(x)
+    return out
 
 
 async def watch() -> None:
