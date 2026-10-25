@@ -11080,7 +11080,7 @@ def api_verify_budget(sure: int | None = None, per_hour: int | None = None):
 async def api_verify_run(n: int = 3):
     """Verify the next N unsure rows now (the heavy lane permitting)."""
     from . import subverify
-    n = max(1, min(60, int(n)))
+    n = max(1, min(600, int(n)))
     if n <= 3:
         return await asyncio.to_thread(subverify.run_batch, n)
     # A big batch runs behind the answer (a file takes a minute or more); the
@@ -38645,7 +38645,7 @@ function vfyBlock(kind){
           ${[['off','Off'],['advise','Suggest only'],['auto','Decide & fix']].map(([k,w])=>`<option value="${k}" ${v.mode===k?'selected':''}>${w}</option>`).join('')}</select>
         <span title="It only decides on its own at or above this confidence">decide when ≥</span>
         <input type="number" min="50" max="100" value="${v.sure_at}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="vfyBudget(this.value,null)">% sure
-        · <input id="vfyN" type="number" min="1" max="60" value="${v.per_hour}" style="width:52px;box-sizing:border-box;font-size:11px" oninput="vfyNLabel()" onchange="vfyBudget(null,this.value)"> files/hour
+        · <input id="vfyN" type="number" min="1" max="600" value="${v.per_hour}" style="width:62px;box-sizing:border-box;font-size:11px" oninput="vfyNLabel()" onchange="vfyBudget(null,this.value)"> files/hour
         <button id="vfyRunBtn" class="rmb" onclick="vfyRun(this)" ${v.running?'disabled':''}>Check ${v.per_hour} now</button>
         ${v.running?`<button class="rmb" onclick="fetch('/api/verify/stop',{method:'POST'})">Stop</button>`:''}</span></div>
     ${_vfyMsg&&Date.now()-_vfyMsg.at<120000?`<div style="font-size:11.5px;margin:5px 0 0;color:${_vfyMsg.c}">${esc(_vfyMsg.t)}</div>`:''}
@@ -38694,7 +38694,7 @@ function vfyBlock(kind){
 }
 async function vfyMode(m){ await fetch('/api/verify/mode?mode='+m,{method:'POST'}); await vfyLoad(true); for(const k of ['whisper','qwen','ocr','subai']) lrnPaint(k); }
 async function vfyBudget(sure,ph){ const q=[]; if(sure!=null) q.push('sure='+encodeURIComponent(sure)); if(ph!=null) q.push('per_hour='+encodeURIComponent(ph)); await fetch('/api/verify/budget?'+q.join('&'),{method:'POST'}); await vfyLoad(true); for(const k of ['whisper','qwen','ocr','subai']) lrnPaint(k); }
-function vfyNVal(){ const e=document.getElementById('vfyN'); return Math.max(1,Math.min(60,parseInt(e&&e.value,10)||1)); }
+function vfyNVal(){ const e=document.getElementById('vfyN'); return Math.max(1,Math.min(600,parseInt(e&&e.value,10)||1)); }
 function vfyNLabel(){ const b=document.getElementById('vfyRunBtn'); if(b&&!b.disabled) b.textContent='Check '+vfyNVal()+' now'; }
 async function vfyRun(btn){
   if(btn){ btn.disabled=true; btn.innerHTML='<span class="dlspin"></span>verifying…'; }

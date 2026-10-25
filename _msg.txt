@@ -1,5 +1,5 @@
-processes: fold each conhost into the process it hosts
+second opinion: Check now uses the typed number
 
-Its CPU, memory and I/O are added to the parent's row and the row goes; groups no longer count consoles as jobs.
+Button reads 'Check N now' from the files/hour box; batches over 3 run in the background.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

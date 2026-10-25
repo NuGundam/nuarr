@@ -99,7 +99,7 @@ def sure_at() -> int:
 
 def per_hour() -> int:
     try:
-        return max(1, min(60, int(kv_get(KV_PER_HOUR) or DEFAULT_PER_HOUR)))
+        return max(1, min(600, int(kv_get(KV_PER_HOUR) or DEFAULT_PER_HOUR)))
     except Exception:                                            # noqa: BLE001
         return DEFAULT_PER_HOUR
 
@@ -108,7 +108,7 @@ def set_budget(sure: int | None = None, hourly: int | None = None) -> dict:
     if sure is not None:
         kv_set(KV_SURE, str(max(50, min(100, int(sure)))))
     if hourly is not None:
-        kv_set(KV_PER_HOUR, str(max(1, min(60, int(hourly)))))
+        kv_set(KV_PER_HOUR, str(max(1, min(600, int(hourly)))))
     return {"sure_at": sure_at(), "per_hour": per_hour()}
 
 
@@ -614,7 +614,8 @@ async def watch() -> None:
     import asyncio
     await asyncio.sleep(600)
     while True:
-        STATE["next_run"] = time.time() + TICK_S
+        t_tick = time.time()
+        STATE["next_run"] = t_tick + TICK_S
         try:
             if mode() != "off" and not paused():
                 now = time.time()
@@ -627,7 +628,9 @@ async def watch() -> None:
                     STATE["hour_count"] += int(r.get("done") or 0)
         except Exception as e:                                   # noqa: BLE001
             joblog.log(f"second opinion: {type(e).__name__}: {e}", "error")
-        await asyncio.sleep(TICK_S)
+        # start to start, as in subtiming.watch: sleeping a full tick after
+        # the batch put the batch's own time into every cycle
+        await asyncio.sleep(max(10.0, TICK_S - (time.time() - t_tick)))
 
 
 def as_running() -> list:
