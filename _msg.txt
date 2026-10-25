@@ -1,3 +1,5 @@
-submake.enqueue: say when the one-job-per-file rule skipped a file
+submake: listen and decode verdicts follow the file over the maker's embed
+
+Only a subtitle track changes, so audiolang.restamp + integrity.carry re-key the facts instead of a listen and a decode running again.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

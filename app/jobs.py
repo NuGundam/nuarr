@@ -7119,6 +7119,18 @@ def _finish(job: Job, state: str, before: int, after: int,
             event: str = "") -> None:
     _remember_fate(job.id, state)
     _finish_stage(job.id, state)
+    if state == "done" and job.kind in ("subs", "sub_ocr") and job.file_id:
+        # A SUBTITLE REWRITE LEAVES THE AUDIO AND THE PICTURE AS THEY WERE,
+        # in the same order - only subtitle tracks come and go. The listen
+        # and decode verdicts follow the new bytes instead of being earned
+        # again (a 17 s listen ran after a dropped duplicate track; the
+        # subtitle facts are not carried, those tracks did change).
+        try:
+            from . import audiolang as _al, integrity as _integ
+            _al.restamp(int(job.file_id), job.path)
+            _integ.carry(int(job.file_id), job.path)
+        except Exception:                                        # noqa: BLE001
+            pass
     if state == "done" and job.kind == "transcode" and job.file_id:
         # A STREAM COPY KEEPS ITS DECODE VERDICT - see integrity.carry.
         try:
