@@ -1,5 +1,5 @@
-subtiming: Check now uses the typed number
+processes: fold each conhost into the process it hosts
 
-The button reads 'Check N now' from the per-hour box and checks that many; batches over 5 run in the background (Stop ends them between files).
+Its CPU, memory and I/O are added to the parent's row and the row goes; groups no longer count consoles as jobs.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

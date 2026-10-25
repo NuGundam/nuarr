@@ -11080,7 +11080,15 @@ def api_verify_budget(sure: int | None = None, per_hour: int | None = None):
 async def api_verify_run(n: int = 3):
     """Verify the next N unsure rows now (the heavy lane permitting)."""
     from . import subverify
-    return await asyncio.to_thread(subverify.run_batch, max(1, min(20, int(n))))
+    n = max(1, min(60, int(n)))
+    if n <= 3:
+        return await asyncio.to_thread(subverify.run_batch, n)
+    # A big batch runs behind the answer (a file takes a minute or more); the
+    # panel's poll shows it going and Stop ends it between files.
+    if subverify.STATE.get("running"):
+        return {"busy": True}
+    asyncio.get_running_loop().run_in_executor(None, subverify.run_batch, n)
+    return {"started": n}
 
 
 @app.post("/api/verify/stop")
@@ -38637,8 +38645,8 @@ function vfyBlock(kind){
           ${[['off','Off'],['advise','Suggest only'],['auto','Decide & fix']].map(([k,w])=>`<option value="${k}" ${v.mode===k?'selected':''}>${w}</option>`).join('')}</select>
         <span title="It only decides on its own at or above this confidence">decide when ≥</span>
         <input type="number" min="50" max="100" value="${v.sure_at}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="vfyBudget(this.value,null)">% sure
-        · <input type="number" min="1" max="60" value="${v.per_hour}" style="width:52px;box-sizing:border-box;font-size:11px" onchange="vfyBudget(null,this.value)"> files/hour
-        <button class="rmb" onclick="vfyRun(this)" ${v.running?'disabled':''}>Check 3 now</button>
+        · <input id="vfyN" type="number" min="1" max="60" value="${v.per_hour}" style="width:52px;box-sizing:border-box;font-size:11px" oninput="vfyNLabel()" onchange="vfyBudget(null,this.value)"> files/hour
+        <button id="vfyRunBtn" class="rmb" onclick="vfyRun(this)" ${v.running?'disabled':''}>Check ${v.per_hour} now</button>
         ${v.running?`<button class="rmb" onclick="fetch('/api/verify/stop',{method:'POST'})">Stop</button>`:''}</span></div>
     ${_vfyMsg&&Date.now()-_vfyMsg.at<120000?`<div style="font-size:11.5px;margin:5px 0 0;color:${_vfyMsg.c}">${esc(_vfyMsg.t)}</div>`:''}
     <style>.vfybar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;position:relative;flex:1;min-width:120px}
@@ -38681,16 +38689,19 @@ function vfyBlock(kind){
             ${r.confidence?`<div style="font-size:10px">${pctBar(r.confidence,ok)}<span class="dim">${r.confidence}% sure</span></div>`:''}</td>
           <td class="l" style="white-space:normal;font-size:11px">${happened(r)}</td></tr>
           ${op?`<tr><td colspan="5" style="background:rgba(255,255,255,.025);padding:6px 10px;font-size:11px;white-space:normal">${whoSaid(r)}</td></tr>`:''}`; }).join('')}
-      </tbody></table></div>`:`<div class="dim" style="font-size:11px">Nothing checked yet${v.mode==='off'?' - it is switched off':v.waiting?' - the first check is minutes away, or press Check 3 now':' - nothing is unsure right now'}.</div>`}
+      </tbody></table></div>`:`<div class="dim" style="font-size:11px">Nothing checked yet${v.mode==='off'?' - it is switched off':v.waiting?' - the first check is minutes away, or press Check now':' - nothing is unsure right now'}.</div>`}
   </div>`;
 }
 async function vfyMode(m){ await fetch('/api/verify/mode?mode='+m,{method:'POST'}); await vfyLoad(true); for(const k of ['whisper','qwen','ocr','subai']) lrnPaint(k); }
 async function vfyBudget(sure,ph){ const q=[]; if(sure!=null) q.push('sure='+encodeURIComponent(sure)); if(ph!=null) q.push('per_hour='+encodeURIComponent(ph)); await fetch('/api/verify/budget?'+q.join('&'),{method:'POST'}); await vfyLoad(true); for(const k of ['whisper','qwen','ocr','subai']) lrnPaint(k); }
+function vfyNVal(){ const e=document.getElementById('vfyN'); return Math.max(1,Math.min(60,parseInt(e&&e.value,10)||1)); }
+function vfyNLabel(){ const b=document.getElementById('vfyRunBtn'); if(b&&!b.disabled) b.textContent='Check '+vfyNVal()+' now'; }
 async function vfyRun(btn){
   if(btn){ btn.disabled=true; btn.innerHTML='<span class="dlspin"></span>verifying…'; }
   const say=(t,c)=>{ _vfyMsg={t:t,c:c||'var(--dim)',at:Date.now()}; vfyLoad(true).then(()=>{ for(const k of ['whisper','qwen','ocr','subai']) lrnPaint(k); }).catch(()=>{}); };
-  fetch('/api/verify/run?n=3',{method:'POST'}).then(r=>r.ok?r.json():Promise.reject(new Error('HTTP '+r.status))).then(d=>{
+  fetch('/api/verify/run?n='+vfyNVal(),{method:'POST'}).then(r=>r.ok?r.json():Promise.reject(new Error('HTTP '+r.status))).then(d=>{
     if(d.busy) say('Already verifying - the run in progress has to finish first.','#d29922');
+    else if(d.started) say('Verifying the next '+d.started+' unsure files - follow it below; Stop ends it after the current file.','#3fb950');
     else if(d.skipped) say('Not started: '+d.skipped+' - try again when it is free.','#d29922');
     else if(!d.done) say('Nothing to verify - there are no unsure rows on the board right now.');
     else say('Verified '+d.done+(d.done===1?' file':' files')+', answered '+d.answered+(d.done>d.answered?' - '+(d.done-d.answered)+' left for you':'')+'.','#3fb950');
