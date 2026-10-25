@@ -910,6 +910,18 @@ def restyle_one(file_id: int, style: str = "", srt_text: str = "", add: bool = F
         rep = fileops.safe_replace(path, tmp, **_oc(path, "submake"))
         if not getattr(rep, "ok", False):
             return {"ok": False, "why": f"could not put the rebuilt file in place: {getattr(rep, 'why', '')}"}
+        # THE FILE'S FACTS FOLLOW IT. Only a subtitle track was added or
+        # swapped; the audio and the picture are the same streams in the
+        # same order, so the listen verdicts and the decode verdict are
+        # re-keyed to the new bytes rather than earned again (a 9 s listen
+        # and a decode check ran after the first embed, for nothing). The
+        # subtitle facts are NOT carried: those tracks did change.
+        try:
+            from . import audiolang as _al, integrity as _integ
+            _al.restamp(int(file_id), path)
+            _integ.carry(int(file_id), path)
+        except Exception:                                        # noqa: BLE001
+            pass
     finally:
         fileops._quiet_remove(tmp)
         try:
