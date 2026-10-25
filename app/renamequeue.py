@@ -209,6 +209,47 @@ def _why(d, prefix: str = "") -> str:
     return ". ".join(bits) + "."
 
 
+def _carry_companions(old_abs: str, new_abs: str) -> list:
+    """Sidecars named after the old file go with it.
+
+    The arr renames the extras IT imported; a subtitle nuarr made afterwards
+    (the Subtitle maker's .en.ass, a timing fix's copy) stayed behind under
+    the old name, where nothing would ever find it again (Beerus S01E03,
+    2026-10-25). Anything in the folder named <old stem>.<more> with a
+    subtitle extension is renamed to <new stem>.<same more>; an existing
+    file at the new name is left alone."""
+    if not old_abs or not new_abs or os.path.normcase(old_abs) == os.path.normcase(new_abs):
+        return []
+    d_old = os.path.dirname(old_abs)
+    stem_old = os.path.splitext(os.path.basename(old_abs))[0]
+    stem_new = os.path.splitext(os.path.basename(new_abs))[0]
+    try:
+        names = os.listdir(d_old)
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        if n == os.path.basename(old_abs) or not n.startswith(stem_old + "."):
+            continue
+        if not n.lower().endswith((".srt", ".ass", ".ssa", ".sup", ".idx", ".sub", ".vtt")):
+            continue
+        dst = os.path.join(os.path.dirname(new_abs), stem_new + n[len(stem_old):])
+        if os.path.exists(dst):
+            continue
+        try:
+            os.replace(os.path.join(d_old, n), dst)
+            out.append(os.path.basename(dst))
+        except OSError:
+            continue
+    if out:
+        try:
+            from . import subembed
+            subembed.forget_sidecars(new_abs)
+        except Exception:                                        # noqa: BLE001
+            pass
+    return out
+
+
 async def _attempt_batch(rows: list[dict]) -> list[tuple[dict, bool, str]]:
     r"""Attempt every queued rename that shares one parent, in ONE pass.
 
@@ -327,8 +368,13 @@ async def _attempt_batch(rows: list[dict]) -> list[tuple[dict, bool, str]]:
                 with cursor() as cur:
                     cur.execute("UPDATE files SET path=? WHERE id=?",
                                 (p.new_abs, row["file_id"]))
+                try:
+                    carried = await asyncio.to_thread(_carry_companions, cur_path, p.new_abs)
+                except Exception:                                # noqa: BLE001
+                    carried = []
                 out.append((row, True,
-                            f"renamed -> {os.path.basename(p.new_rel)}"))
+                            f"renamed -> {os.path.basename(p.new_rel)}"
+                            + (f" (+ {len(carried)} subtitle file(s) carried along)" if carried else "")))
             else:
                 # .say(), not .detail - the holders are the point. See
                 # fileops.OpResult.say().

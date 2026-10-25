@@ -2757,6 +2757,42 @@ def _viewer_disk_held(disk: str, share_pct: float, busy_now: dict) -> bool:
     return share_pct <= 0 or busy_now.get(disk, 100) >= share_pct
 
 
+def busy_with(file_id: int) -> str:
+    """Who in the queue has this file right now - '' when nobody.
+
+    The Subtitle maker asks before it starts: a make takes minutes, an encode
+    commits and renames the file under it, and the maker's sidecar lands
+    under a name nothing is called any more (Beerus S01E03, 2026-10-25)."""
+    try:
+        fid = int(file_id)
+    except (TypeError, ValueError):
+        return ""
+    for w in list(RUNNING.values()):
+        try:
+            if int(w.job.file_id or 0) == fid:
+                return f"the {w.job.kind} job {w.job.id}"
+        except Exception:                                        # noqa: BLE001
+            continue
+    return ""
+
+
+def _outside_files() -> set:
+    """Files the systems outside the queue are rewriting this moment: the
+    Subtitle maker (a sidecar, then an embed) and the timing fixer (mkvmerge
+    in place). The queue does not start on one of these any more than on a
+    file one of its own workers has."""
+    out = set()
+    for mod in ("submake", "subtiming"):
+        try:
+            m = __import__(f"app.{mod}", fromlist=["STATE"])
+            st = getattr(m, "STATE", {}) or {}
+            if st.get("running") and st.get("file_id"):
+                out.add(int(st["file_id"]))
+        except Exception:                                        # noqa: BLE001
+            continue
+    return out
+
+
 def _claim(pool: str) -> Job | None:
     """Atomically take the next queued job for a pool.
 
@@ -2805,6 +2841,7 @@ def _claim(pool: str) -> Job | None:
         # and removes workers while it does. list() of a dict's values is one
         # C call under the GIL; a comprehension over the live view is not.
         live_files = {w.job.file_id for w in list(RUNNING.values()) if w.job.file_id}
+        live_files |= _outside_files()
         base = ("SELECT j.id,j.job_id,j.file_id,j.kind,j.priority,j.path,"
                 "       j.title,j.plan_json, f.pool_disk AS pool_disk "
                 "FROM jobs j LEFT JOIN files f ON f.id = j.file_id "

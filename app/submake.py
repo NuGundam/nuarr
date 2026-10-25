@@ -348,6 +348,21 @@ async def _runner() -> None:
             if not q:
                 break
             job = q[0]
+            # NOT WHILE THE QUEUE HAS IT. The job commits a new file and the
+            # arr renames it; a make running across that writes beside a
+            # name that no longer exists. Behind the others it goes, and
+            # the lane is given back meanwhile.
+            try:
+                from . import jobs as _jobs
+                who = _jobs.busy_with(int(job["file_id"]))
+            except Exception:                                    # noqa: BLE001
+                who = ""
+            if who:
+                STATE["waiting_for"] = f"{who} has this file - the maker waits for it"
+                if len(q) > 1:
+                    _save_queue(q[1:] + [job])
+                await asyncio.sleep(60)
+                continue
             try:
                 await _one(int(job["file_id"]), bool(job.get("overwrite")), job.get("by") or "you")
             except Exception as e:                               # noqa: BLE001
@@ -450,6 +465,25 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
         _remember(row)
         joblog.log(f"subtitle maker: {label} failed - {row['why']}", "warn")
         return
+    # THE FILE MAY HAVE MOVED WHILE THE MAKER WORKED - an encode that
+    # committed and was renamed under it. The sidecar is named after the
+    # file as it is NOW, not as it was when the make began; written under
+    # the old name it was never found again.
+    cur_r = _row(file_id)
+    if not cur_r or not os.path.exists(cur_r["path"]):
+        row.update(ok=False, why="the file is gone from the library")
+        _remember(row)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return
+    if cur_r["path"] != r["path"]:
+        joblog.log(f"subtitle maker: {label} - the file was renamed while the subtitles were made; "
+                   f"following it to {os.path.basename(cur_r['path'])}", "info")
+        r = cur_r
+        side = _sidecar(r["path"], os.path.splitext(side)[1])
+        row["file"] = os.path.basename(r["path"])
     # ACROSS DRIVES IS A COPY. The worker writes on the data drive and the
     # file lives on the pool; os.replace cannot cross that, so the copy lands
     # beside the video under a temporary name and is renamed there.
@@ -513,18 +547,25 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
             _remember(row)
             joblog.log(f"subtitle maker: {label} - remade, nuarr's track replaced", "ok")
             return
-    if subembed.enabled(lib):
+    # ALWAYS INSIDE, when the container allows it. The library's sidecar rule
+    # is about other people's loose files; this one is nuarr's own work, and
+    # a loose file is exactly what the arrs lose when the file is renamed,
+    # upgraded or edited. Beside the file only when it is not an mkv or the
+    # embed itself failed - and then the reason is said.
+    if r["path"].lower().endswith(".mkv") and subembed.have_mkvmerge():
         STATE.update(stage="putting it inside the file", pct=98)
         try:
-            res = await asyncio.to_thread(subembed.embed_one, file_id)
+            res = await asyncio.to_thread(subembed.embed_one, file_id, None, "", True)
         except Exception as e:                                   # noqa: BLE001
             res = {"ok": False, "why": f"{type(e).__name__}: {e}"}
         if res.get("ok") and res.get("embedded"):
-            row.update(where="embedded", why="embedded in the file - the library embeds sidecars")
+            row.update(where="embedded", why="embedded in the file")
         else:
             row.update(where="sidecar", why="kept beside the file - could not embed: " + str(res.get("why") or "nothing to take")[:160])
+    elif not r["path"].lower().endswith(".mkv"):
+        row.update(where="sidecar", why="kept beside the file - only an mkv can take a subtitle track")
     else:
-        row.update(where="sidecar", why=f"kept beside the file - {lib or 'this library'} does not embed sidecars")
+        row.update(where="sidecar", why="kept beside the file - mkvmerge is not installed")
     _learnt()
     _remember(row)
     joblog.log(f"subtitle maker: {label} - "

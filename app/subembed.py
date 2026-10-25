@@ -1014,7 +1014,7 @@ def _note(file_id: int, path: str, side: str, lang: str, ok: bool,
         pass
 
 
-def embed_one(file_id: int, report=None, disk: str = "") -> dict:
+def embed_one(file_id: int, report=None, disk: str = "", force: bool = False) -> dict:
     r"""Remux this file's eligible sidecars into it, then recycle them.
 
     ONE mkvmerge FOR ALL OF THEM. Two sidecars means two subtitle tracks and
@@ -1022,7 +1022,7 @@ def embed_one(file_id: int, report=None, disk: str = "") -> dict:
     just been copied, for no reason.
     """
     from . import fileops
-    p = plan_one(int(file_id))
+    p = plan_one(int(file_id), force=force)
     if not p.get("ok"):
         return {**p, "embedded": 0}
     takes, drops = (p.get("take") or []), (p.get("drop") or [])
