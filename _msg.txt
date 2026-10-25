@@ -1,5 +1,3 @@
-second opinion: say 'English subtitles inside', and only count a dialogue track
-
-The panel read verdict 'english' as 'English is spoken' when the kind was 'english subtitles'. _eng_sub_inside now skips signs/forced/marker titles and tracks the reader judged signs-only.
+jobs.snapshot: submake in the capacity/in_use strip
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

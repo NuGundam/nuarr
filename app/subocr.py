@@ -1695,7 +1695,7 @@ def clear_pending(file_id: int, root: str | None = None) -> None:
 # collect - and only those two wait: spent and orphaned are cleared on the
 # next sweep, stranded after STRANDED_KEEP_S.
 STRANDED_KEEP_S = 24 * 3600
-_REWRITE_KINDS = ("transcode", "sub_ocr", "subs")
+_REWRITE_KINDS = ("transcode", "sub_ocr", "subs", "submake")
 # Text subtitle codecs. A picture track does not count: the whole point of the
 # OCR is that the file had pictures and needed words.
 _TEXT_SUB = ("subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text")

@@ -375,6 +375,25 @@ async def make_job(w, file_id: int, overwrite: bool, by: str = "you") -> dict:
     _W[0] = w
     t0 = time.time()
     try:
+        it = pending_item(int(file_id))
+        if it:
+            # MADE ALREADY, NOT YET INSIDE: only the embed is owed.
+            r = _row(int(file_id))
+            label = display_label(r["title"], r["season"], r["episode"], r["path"]) if r else str(file_id)
+            STATE.update(running=True, file_id=int(file_id), label=label, started=t0)
+            _st(stage="putting the subtitles made earlier inside the file", pct=95)
+            try:
+                res = await asyncio.to_thread(embed_pending, int(file_id))
+            except Exception as e:                               # noqa: BLE001
+                res = {"ok": False, "why": f"{type(e).__name__}: {e}"}
+            if res.get("ok"):
+                _remember({"at": time.time(), "file_id": int(file_id), "label": label, "ok": True,
+                           "where": "embedded", "by": by, "style": it.get("style") or "",
+                           "why": "embedded in the file - made earlier, carried in on a later pass"})
+                joblog.log(f"subtitle maker: {label} - the subtitles made earlier are in the file now", "ok")
+                return {"ok": True, "why": "made earlier, now inside the file"}
+            return {"ok": False, "retry": True,
+                    "why": "still waiting to go inside the file: " + str(res.get("why") or "")[:160]}
         await _one(int(file_id), bool(overwrite), by)
     finally:
         _W[0] = None
@@ -382,6 +401,8 @@ async def make_job(w, file_id: int, overwrite: bool, by: str = "you") -> dict:
     for x in _recent():
         if int(x.get("file_id") or 0) == int(file_id) and float(x.get("at") or 0) >= t0 - 1:
             why = str(x.get("why") or "")
+            if x.get("where") == "pending":
+                return {"ok": False, "retry": True, "why": why}
             return {"ok": bool(x.get("ok")), "why": why,
                     "skipped": (not x.get("ok")) and ("already" in why or "burned into the picture" in why)}
     return {"ok": False, "skipped": True, "why": "nothing to do - the file is gone or already has English subtitles"}
@@ -552,25 +573,6 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
         r = cur_r
         side = _sidecar(r["path"], os.path.splitext(side)[1])
         row["file"] = os.path.basename(r["path"])
-    # ACROSS DRIVES IS A COPY. The worker writes on the data drive and the
-    # file lives on the pool; os.replace cannot cross that, so the copy lands
-    # beside the video under a temporary name and is renamed there.
-    import shutil
-    if style == "plain":
-        shutil.copyfile(tmp, side + ".part")
-    else:
-        with open(tmp, encoding="utf-8", errors="replace") as f:
-            ass = substyle.to_ass(f.read(), style, label, override=sublearn.style_for(show))
-        with open(side + ".part", "w", encoding="utf-8-sig") as f:
-            f.write(ass)
-    os.replace(side + ".part", side)
-    for other in (".srt", ".ass"):
-        o = _sidecar(r["path"], other)
-        if o != side and os.path.exists(o) and overwrite:
-            try:
-                os.remove(o)
-            except OSError:
-                pass
     try:
         made_text = open(tmp, encoding="utf-8", errors="replace").read()
     except OSError:
@@ -579,6 +581,24 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
         os.remove(tmp)
     except OSError:
         pass
+    is_mkv = r["path"].lower().endswith(".mkv")
+    from . import subembed
+    if not (is_mkv and subembed.have_mkvmerge()):
+        # NOT AN MKV (or no mkvmerge): beside the file is the only place.
+        # ACROSS DRIVES IS A COPY - the copy lands under a temporary name
+        # and is renamed there.
+        body = made_text if style == "plain" else substyle.to_ass(made_text, style, label,
+                                                                     override=sublearn.style_for(show))
+        with open(side + ".part", "w", encoding="utf-8" if style == "plain" else "utf-8-sig") as f:
+            f.write(body)
+        os.replace(side + ".part", side)
+        for other in (".srt", ".ass"):
+            o = _sidecar(r["path"], other)
+            if o != side and os.path.exists(o) and overwrite:
+                try:
+                    os.remove(o)
+                except OSError:
+                    pass
 
     def _learnt():
         # kept as written, to learn later from what you change in it
@@ -589,51 +609,38 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
             pass
     row.update(ok=True, narration=end.get("narration", 0), onscreen=end.get("onscreen", 0),
                translated=end.get("translated", 0), source=(src or {}).get("what", ""),
-               sidecar=os.path.basename(side), style=style)
-    # THE LIBRARY'S RULE DECIDES WHERE IT LIVES - see the module docstring.
-    from . import subembed
+               style=style)
     try:
         subembed.forget_sidecars(r["path"])
     except Exception:                                            # noqa: BLE001
         pass
-    lib = r["library"] or ""
-    if overwrite and subembed.enabled(lib) and r["path"].lower().endswith(".mkv"):
-        _st(stage="replacing nuarr's track inside the file", pct=98)
+    if is_mkv and subembed.have_mkvmerge():
+        # ALWAYS INSIDE. The made text goes to the baton area first, then
+        # into the file; if that cannot be done now (the file in use, a
+        # viewer on its disk, mkvmerge unhappy) the baton stays and the job
+        # tries the embed again later without re-running the models - and a
+        # transcode that rewrites the file meanwhile carries it in.
+        item = await asyncio.to_thread(keep_pending, file_id, made_text, style, label)
+        row["sidecar"] = os.path.basename(item["srt"])
+        _st(stage="putting it inside the file", pct=98)
         try:
-            text = open(side, encoding="utf-8-sig", errors="replace").read()
-            srt = text if side.endswith(".srt") else substyle.ass_to_srt(text)
-            res = await asyncio.to_thread(restyle_one, file_id, style, srt)
+            res = await asyncio.to_thread(embed_pending, file_id)
         except Exception as e:                                   # noqa: BLE001
             res = {"ok": False, "why": f"{type(e).__name__}: {e}"}
         if res.get("ok"):
-            try:
-                os.remove(side)
-            except OSError:
-                pass
-            row.update(where="embedded", why="replaced nuarr's own track inside the file")
-            _learnt()
-            _remember(row)
-            joblog.log(f"subtitle maker: {label} - remade, nuarr's track replaced", "ok")
-            return
-    # ALWAYS INSIDE, when the container allows it. The library's sidecar rule
-    # is about other people's loose files; this one is nuarr's own work, and
-    # a loose file is exactly what the arrs lose when the file is renamed,
-    # upgraded or edited. Beside the file only when it is not an mkv or the
-    # embed itself failed - and then the reason is said.
-    if r["path"].lower().endswith(".mkv") and subembed.have_mkvmerge():
-        _st(stage="putting it inside the file", pct=98)
-        try:
-            res = await asyncio.to_thread(subembed.embed_one, file_id, None, "", True)
-        except Exception as e:                                   # noqa: BLE001
-            res = {"ok": False, "why": f"{type(e).__name__}: {e}"}
-        if res.get("ok") and res.get("embedded"):
-            row.update(where="embedded", why="embedded in the file")
+            row.update(where="embedded",
+                       why="embedded in the file" + (" - nuarr's earlier track replaced"
+                                                    if res.get("was") not in (None, "none") else ""))
         else:
-            row.update(where="sidecar", why="kept beside the file - could not embed: " + str(res.get("why") or "nothing to take")[:160])
-    elif not r["path"].lower().endswith(".mkv"):
-        row.update(where="sidecar", why="kept beside the file - only an mkv can take a subtitle track")
+            row.update(where="pending", pending=True,
+                       why="made - waiting to go inside the file: " + str(res.get("why") or "")[:140]
+                           + ". Kept in subs-pending; the embed is retried, or the next rewrite carries it in")
+    elif not is_mkv:
+        row.update(where="sidecar", sidecar=os.path.basename(side),
+                   why="kept beside the file - only an mkv can take a subtitle track")
     else:
-        row.update(where="sidecar", why="kept beside the file - mkvmerge is not installed")
+        row.update(where="sidecar", sidecar=os.path.basename(side),
+                   why="kept beside the file - mkvmerge is not installed")
     _learnt()
     _remember(row)
     joblog.log(f"subtitle maker: {label} - "
@@ -682,7 +689,104 @@ def _style_of_track(path: str, t: dict, sub_ord: int) -> str:
     return m.group(1) if m else "?"
 
 
-def restyle_one(file_id: int, style: str = "", srt_text: str = "") -> dict:
+# ------------------------------------------------------------ the baton --
+# THE RESULT WAITS WHERE A PREPARED OCR SUBTITLE WAITS. Minutes of GPU work
+# used to end as a loose .en.ass beside the file when the embed could not
+# be done - the one place the arrs lose things - or be thrown away with the
+# failed run. Now the made text (and its styled .ass) goes into subocr's
+# subs-pending/<file_id>/ under the same manifest, so everything that
+# already knows that area knows this too: the Pending panel lists it, a
+# transcode that rewrites the file carries it in, Collect queues a job for
+# it, the sweep keeps it a day, and the submake job itself retries the embed
+# from here without running the models again.
+
+def pending_item(file_id: int) -> dict | None:
+    """The maker's baton for this file, if one is waiting."""
+    from . import subocr
+    from .config import SETTINGS
+    for it in subocr.pending_for(int(file_id), SETTINGS.cache_dir):
+        if it.get("maker"):
+            return it
+    return None
+
+
+def _write_manifest(d: str, items: list) -> None:
+    with open(os.path.join(d, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(items, f)
+
+
+def keep_pending(file_id: int, srt_text: str, style: str, label: str) -> dict:
+    """Put the made text in the baton area; returns the manifest item."""
+    from . import subocr, substyle
+    from .config import SETTINGS
+    d = subocr.pending_dir(int(file_id), SETTINGS.cache_dir)
+    os.makedirs(d, exist_ok=True)
+    srt_path = os.path.join(d, "nuarr.en.srt")
+    with open(srt_path, "w", encoding="utf-8") as f:
+        f.write(srt_text)
+    track = srt_path
+    if style != "plain":
+        track = os.path.join(d, "nuarr.en.ass")
+        with open(track, "w", encoding="utf-8-sig") as f:
+            f.write(substyle.to_ass(srt_text, style, label))
+    man = os.path.join(d, "manifest.json")
+    try:
+        with open(man, encoding="utf-8") as f:
+            items = [x for x in json.load(f) if not x.get("maker")]
+    except Exception:                                            # noqa: BLE001
+        items = []
+    # "srt" is what the OCR carry-in muxes (it takes any text subtitle
+    # mkvmerge reads); "text" is the plain SRT the maker re-styles from.
+    item = {"srt": track, "text": srt_path, "name": TRACK_NAME, "lang": "eng",
+            "maker": True, "style": style, "at": time.time()}
+    items.append(item)
+    _write_manifest(d, items)
+    return item
+
+
+def drop_pending(file_id: int) -> None:
+    """The maker's baton is spent: remove its files, leave any OCR items."""
+    from . import subocr
+    from .config import SETTINGS
+    d = subocr.pending_dir(int(file_id), SETTINGS.cache_dir)
+    man = os.path.join(d, "manifest.json")
+    try:
+        with open(man, encoding="utf-8") as f:
+            items = json.load(f)
+    except Exception:                                            # noqa: BLE001
+        return
+    keep = [x for x in items if not x.get("maker")]
+    for x in items:
+        if x.get("maker"):
+            for k in ("srt", "text"):
+                try:
+                    os.remove(x.get(k) or "")
+                except OSError:
+                    pass
+    if keep:
+        _write_manifest(d, keep)
+    else:
+        subocr.clear_pending(int(file_id), SETTINGS.cache_dir)
+
+
+def embed_pending(file_id: int) -> dict:
+    """Put the waiting baton inside the file: nuarr's track added, or
+    replaced if the file already has one. {ok, why, was}."""
+    it = pending_item(int(file_id))
+    if not it:
+        return {"ok": False, "why": "nothing is waiting for this file"}
+    try:
+        with open(it.get("text") or it["srt"], encoding="utf-8-sig", errors="replace") as f:
+            text = f.read()
+    except OSError as e:
+        return {"ok": False, "why": f"the waiting subtitle could not be read: {e}"}
+    res = restyle_one(int(file_id), it.get("style") or "", text, add=True)
+    if res.get("ok"):
+        drop_pending(int(file_id))
+    return res
+
+
+def restyle_one(file_id: int, style: str = "", srt_text: str = "", add: bool = False) -> dict:
     """Rewrite one made subtitle in the style its group has now. With
     srt_text, the track inside the file is REPLACED by that text - a remake
     with overwrite, which the sidecar embed would otherwise throw away as a
@@ -729,16 +833,20 @@ def restyle_one(file_id: int, style: str = "", srt_text: str = "") -> dict:
     made_here = any(x.get("file_id") == int(file_id) and x.get("ok") and x.get("where") == "embedded"
                     for x in _recent())
     pick = named[0] if named else (eng_text[0] if len(eng_text) == 1 and made_here else None)
-    if not pick:
+    if not pick and not (srt_text and add):
         return {"ok": False, "why": "cannot tell which English track is the one nuarr made - left alone"}
-    ordn, t = pick
-    was = _style_of_track(path, t, ordn)
-    if was == style and not srt_text:
-        return {"ok": True, "same": True, "why": "already in that style"}
-    fmt = "srt" if "SubRip" in (t.get("codec") or "") else "ass"
-    raw = quiet_run([_ffmpeg_exe(), "-v", "error", "-i", path, "-map", f"0:s:{ordn}", "-f", fmt, "-"],
-                    capture_output=True, timeout=300).stdout.decode("utf-8", "replace")
-    srt = srt_text or (raw if fmt == "srt" else substyle.ass_to_srt(raw))
+    if pick:
+        ordn, t = pick
+        was = _style_of_track(path, t, ordn)
+        if was == style and not srt_text:
+            return {"ok": True, "same": True, "why": "already in that style"}
+        fmt = "srt" if "SubRip" in (t.get("codec") or "") else "ass"
+        raw = quiet_run([_ffmpeg_exe(), "-v", "error", "-i", path, "-map", f"0:s:{ordn}", "-f", fmt, "-"],
+                        capture_output=True, timeout=300).stdout.decode("utf-8", "replace")
+        srt = srt_text or (raw if fmt == "srt" else substyle.ass_to_srt(raw))
+    else:
+        # ADDING, not replacing: the file has no track of nuarr's yet
+        t, was, srt = None, "none", srt_text
     if len(substyle.srt_cues(srt)) < (1 if srt_text else 3):
         return {"ok": False, "why": "could not read the track back out"}
     work = os.path.join(str(DATA_DIR), f"restyle.{file_id}" + (".srt" if style == "plain" else ".ass"))
@@ -749,8 +857,9 @@ def restyle_one(file_id: int, style: str = "", srt_text: str = "") -> dict:
         return {"ok": False, "why": why_room}
     tmp = fileops.cache_temp(".mkv", "restyle")
     have = {(a.get("file_name") or "").lower() for a in j.get("attachments", [])}
-    cmd = [subembed._mkvmerge(), "-o", tmp, "--subtitle-tracks", "!" + str(t["id"]), path,
-           "--language", "0:eng", "--track-name", f"0:{TRACK_NAME}", "--default-track-flag", "0:yes", work]
+    cmd = ([subembed._mkvmerge(), "-o", tmp]
+           + (["--subtitle-tracks", "!" + str(t["id"])] if t else []) + [path,
+           "--language", "0:eng", "--track-name", f"0:{TRACK_NAME}", "--default-track-flag", "0:yes", work])
     for fp in ([] if style == "plain" else substyle.font_paths(style)):
         if os.path.basename(fp).lower() not in have:
             cmd += ["--attachment-mime-type", "application/x-truetype-font", "--attach-file", fp]
@@ -762,7 +871,7 @@ def restyle_one(file_id: int, style: str = "", srt_text: str = "") -> dict:
         k = _mkvj(tmp)
         kinds = lambda d, ty: sum(1 for x in d.get("tracks", []) if x.get("type") == ty)
         if kinds(k, "video") != kinds(j, "video") or kinds(k, "audio") != kinds(j, "audio") \
-                or kinds(k, "subtitles") != kinds(j, "subtitles"):
+                or kinds(k, "subtitles") != kinds(j, "subtitles") + (0 if t else 1):
             return {"ok": False, "why": "the rebuilt file does not have the same tracks - nothing was replaced"}
         new = [x for x in k.get("tracks", []) if (x.get("properties") or {}).get("track_name") == TRACK_NAME]
         want = "SubRip" if style == "plain" else "SubStationAlpha"
@@ -792,7 +901,10 @@ def restyle_one(file_id: int, style: str = "", srt_text: str = "") -> dict:
             _jobs.cache_probe(int(file_id), data)
     except Exception:                                            # noqa: BLE001
         pass
-    joblog.log(f"subtitle maker: {label} restyled {was} -> {style}", "ok")
+    if was == "none":
+        joblog.log(f"subtitle maker: {label} - nuarr's track added to the file ({style})", "ok")
+    else:
+        joblog.log(f"subtitle maker: {label} restyled {was} -> {style}", "ok")
     return {"ok": True, "where": "embedded", "was": was, "now": style}
 
 

@@ -17793,7 +17793,7 @@ html.mobile #logsPane{height:auto;min-height:60vh}
        job; this panel exists so a dropped baton is visible instead of being
        a directory nobody looks in. -->
   <div class="panel">
-    <h2 style="color:#b48bf2">Pending OCR subtitles <span id="socrpCount" class="dim"></span></h2>
+    <h2 style="color:#b48bf2">Pending subtitles <span id="socrpCount" class="dim"></span></h2>
     <div id="socrp"></div>
   </div>
 
@@ -42644,9 +42644,10 @@ function smShell(){
       <span class="subskind k-yours" title="Nothing is made until you ask: a file found below, or the Make subtitles button on a raw.">when you ask</span>
       <span class="dim subssub" title="Whisper large-v3 for what is said, timed by the voice detector so a line starts when the voice does; PaddleOCR for what is written on screen, translated by Qwen2.5-7B and shown at the top. A file with English already burned into the picture is skipped. The first run on a new install downloads about 11 GB of models.">English subtitles for a file that has none - listens, reads the picture, translates</span>
       <span class="subsn" id="smCount"></span></div>
-    <div class="dim" style="font-size:11px;margin:2px 0 6px">Where the result lives follows the library's sidecar rule: with
-      <i>embed sidecars</i> on it goes inside the file, otherwise it stays beside it as <span class="mono">name.en.ass</span> (or <span class="mono">.en.srt</span> when the style is plain).
-      One file at a time, on the same lane as the other heavy GPU jobs.</div>
+    <div class="dim" style="font-size:11px;margin:2px 0 6px">The result always goes <i>inside</i> an mkv, as a track called <span class="mono">English (nuarr)</span>.
+      Until it is in, it waits in the Pending subtitles area (like a prepared OCR subtitle) and the embed is retried; a loose
+      <span class="mono">name.en.ass</span> beside the file only for a file that is not an mkv.
+      Runs as a queue job, one file at a time, after the file's checks and its encode.</div>
     <div id="smStyles" style="margin:0 0 8px"></div>
     <div style="display:flex;gap:6px;align-items:center;margin-bottom:4px">
       <input id="smQ" placeholder="make subtitles for… (title or file name)" style="flex:1;font-size:11px"
@@ -42694,8 +42695,10 @@ function smRowHtml(r){
         :`<span style="color:${burned?'#e8a33d':'#e0575b'}">${burned?'skipped':'failed'}</span>`}
       <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.why||'')}</div></td>`;
     where=`<td class="c" style="font-size:10.5px">${r.ok?(r.where==='embedded'
-        ?'<span style="color:#7fd4a3" title="inside the file - the library embeds sidecars">in the file</span>'
-        :'<span class="dim" title="beside the file as name.en.srt - this library keeps sidecars">beside it</span>'):'—'}</td>`;
+        ?'<span style="color:#7fd4a3" title="inside the file as a track called English (nuarr)">in the file</span>'
+        :r.where==='pending'
+        ?'<span style="color:#e3b341" title="made; waiting in subs-pending to go inside the file - the embed is retried, or the next rewrite of the file carries it in">waiting to go in</span>'
+        :'<span class="dim" title="beside the file as name.en.srt - not an mkv, so it cannot hold a track">beside it</span>'):'—'}</td>`;
     ans=`<td class="r">${burned
         ?`<button class="rmb" onclick="smMake(${r.file_id},this,1)" title="Make them even though English is already in the picture - the file gets a second English track.">Make anyway</button>`
         :(!r.ok?`<button class="rmb" onclick="smMake(${r.file_id},this)">Try again</button>`:'')}</td>`;

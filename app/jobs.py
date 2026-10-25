@@ -5364,6 +5364,17 @@ async def _submake_job(w: Worker) -> None:
         heavy.release(submake.LANE)
     after = os.path.getsize(job.path) if os.path.exists(job.path) else before
     why = str(res.get("why") or "")[:200]
+    if res.get("retry"):
+        # MADE, NOT YET INSIDE. The baton waits in subs-pending; this job
+        # goes back on the queue (backing off to ten minutes) and the next
+        # pass only embeds. Six tries - over an hour - and it is left to the
+        # Pending panel: a transcode carries it in, or Collect does.
+        if _DEFERS.get(job.id, 0) < 6:
+            _defer(job, why)
+            return
+        _finish(job, "failed", before, after,
+                why + " - left in subs-pending for the next rewrite of the file, or Collect")
+        return
     if res.get("ok"):
         _finish(job, "done", before, after, note=why)
     elif res.get("skipped"):
