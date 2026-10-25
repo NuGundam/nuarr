@@ -38593,7 +38593,7 @@ function vfyBlock(kind){
     chi:'Chinese',rus:'Russian',por:'Portuguese',ara:'Arabic',hin:'Hindi',tha:'Thai',pol:'Polish',tur:'Turkish',nld:'Dutch',swe:'Swedish'};
   const QWORD={picture:'Are subtitles burned into the picture?',raw:'No English at all (a raw), or English audio?'};
   const qOf=r=>r.source==='raw'?QWORD.raw:r.source==='picture'?QWORD.picture:'Is this subtitle track dialogue, or only signs & songs?';
-  const AWORD={raw:'A raw - no English',english:'English is spoken','english audio':'English is spoken',dialogue:'Yes - dialogue',
+  const AWORD={raw:'A raw - no English',english:'English is spoken','english audio':'English is spoken','english subtitles':'English subtitles inside',dialogue:'Yes - dialogue',
     hybrid:'Yes - dialogue + signs',signs:'No - signs & songs only',none:'No subtitles in the picture',not:'No'};
   const aOf=r=>AWORD[r.kind]||AWORD[r.verdict]||(r.kind||r.verdict||'Not sure');
   const pctBar=(p,ok)=>`<span style="display:inline-block;width:46px;height:5px;background:var(--line);border-radius:3px;vertical-align:middle;margin-right:5px;overflow:hidden"><i style="display:block;height:5px;width:${Math.max(0,Math.min(100,p))}%;background:${ok?'#3fb950':'#e3b341'}"></i></span>`;
@@ -38602,6 +38602,7 @@ function vfyBlock(kind){
     if(a.startsWith('answered')){
       const rest=a.replace(/^answered:\s*/,'');
       const tail=/Subtitle maker/.test(rest)?'sent to the Subtitle maker for English subtitles'
+        :/English subtitles inside/.test(rest)?'marked as not a raw - it carries an English subtitle track, so nothing was listened to'
         :/not a raw/.test(rest)?'marked as not a raw'+(/retag/.test(rest)?', audio language being fixed':'')
         :rest;
       return `<span style="color:#3fb950">Done</span> <span class="dim">- ${esc(tail)}</span>`;

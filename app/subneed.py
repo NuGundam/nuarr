@@ -1715,16 +1715,38 @@ def learn_init() -> None:
 
 
 def _eng_sub_inside(cur, file_id: int) -> bool:
-    """Does the probe show an English subtitle track (not counting the
-    'English (nuarr)' one the Subtitle maker adds)?"""
+    """Does the file carry an English DIALOGUE subtitle track (not counting
+    the 'English (nuarr)' one the Subtitle maker adds)?
+
+    Not every English track answers "is this a raw": a signs-and-songs
+    track, a forced track, a marker, or - the Maoyu case - a lone track
+    called "English" that turns out to hold only signs. So a track is
+    counted only when its title is not a signs/forced title AND, where the
+    reader has judged it (subtitle_qwen), the reader did not call it signs."""
     try:
+        from . import subembed as _se
+        try:
+            from . import qwenjudge as _qj
+            tv = _qj.track_verdicts()
+        except Exception:                                        # noqa: BLE001
+            tv = {}
         r = cur.execute("SELECT json FROM file_probes WHERE file_id=?", (int(file_id),)).fetchone()
+        ordinal = 0
         for s_ in (json.loads((r["json"] if r else "") or "{}").get("streams") or []):
             if s_.get("codec_type") != "subtitle":
                 continue
+            ordinal += 1                      # the reader numbers subtitle tracks from 1
             t = s_.get("tags") or {}
-            if (t.get("language") or "").lower() in ("eng", "en") and "nuarr" not in (t.get("title") or "").lower():
-                return True
+            title = t.get("title") or ""
+            if (t.get("language") or "").lower() not in ("eng", "en") or "nuarr" in title.lower():
+                continue
+            forced = bool((s_.get("disposition") or {}).get("forced"))
+            if _se._track_class(title, forced) != "full":
+                continue                      # signs, forced, sdh-marker: not dialogue for everyone
+            v = tv.get((int(file_id), ordinal))
+            if v and (v.get("kind") == "signs" or (v.get("kind") and int(v.get("p") or 0) < 40)):
+                continue                      # the reader looked and saw signs only
+            return True
     except Exception:                                            # noqa: BLE001
         pass
     return False
