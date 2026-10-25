@@ -1,5 +1,5 @@
-Subtitle maker runs as a queue job (pool submake)
+second opinion: say 'English subtitles inside', and only count a dialogue track
 
-Shows in the Processing panel like subread: stage, progress, R/W, Cancel. The queue's per-file rule keeps it off a file another job has; precedence holds an automatic make behind decode/listen/audio/subread/transcode; the pump staggers it. The maker's own kv queue is gone - its panel reads the jobs table; the GPU lane is still claimed inside the job. New knob submake_workers (0-1).
+The panel read verdict 'english' as 'English is spoken' when the kind was 'english subtitles'. _eng_sub_inside now skips signs/forced/marker titles and tracks the reader judged signs-only.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
