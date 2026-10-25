@@ -1008,6 +1008,12 @@ class Worker:
             return ("Listening to this file's audio through Whisper to learn "
                     "what language each track is. GPU work in its own pool, "
                     "so it neither takes an encode slot nor waits behind one.")
+        if self.pool == "submake":
+            return ("Making English subtitles for a file that has none: Whisper "
+                    "listens to what is said, PaddleOCR reads what is written on "
+                    "screen, Qwen translates - then the track goes inside the "
+                    "file. GPU work on the heavy lane, one file at a time, after "
+                    "the file's checks and its encode are done.")
         if self.pool == "subread":
             return ("Reading what this file's subtitles actually carry \u2014 "
                     "sampling the picture for burned-in words, or reading a "
@@ -1696,6 +1702,8 @@ def _capacity(pool: str) -> int:
         return max(0, int(getattr(w, "listen_workers", 1)))
     if pool == "subread":
         return max(0, int(getattr(w, "subread_workers", 2)))
+    if pool == "submake":
+        return max(0, int(getattr(w, "submake_workers", 1)))
     if pool == "audio":
         return max(0, int(getattr(w, "audio_workers", 4)))
     if pool == "subs":
@@ -1726,8 +1734,8 @@ def enqueue_many(rows: list, kind: str, priority: int = 50,
     from . import scanner as _sc
     from .db import display_label
     pool = {"subs": "subs", "audio": "audio", "decode": "decode",
-            "listen": "listen", "subread": "subread"}.get(kind, "handler")
-    if kind not in ("transcode", "decode", "listen", "subread"):
+            "listen": "listen", "subread": "subread", "submake": "submake"}.get(kind, "handler")
+    if kind not in ("transcode", "decode", "listen", "subread", "submake"):
         priority = min(priority, 50)
     want = [r for r in rows if r.get("file_id") and r.get("path")
             and not _sc.is_excluded(r["path"])]
@@ -2049,8 +2057,9 @@ async def enqueue(file_id: int, path: str, title: str = "",
             else "audio" if kind == "audio"
             else "decode" if kind == "decode"
             else "listen" if kind == "listen"
-            else "subread" if kind == "subread" else "handler")
-    if kind not in ("transcode", "decode", "listen", "subread"):
+            else "subread" if kind == "subread"
+            else "submake" if kind == "submake" else "handler")
+    if kind not in ("transcode", "decode", "listen", "subread", "submake"):
         priority = min(priority, 50)
     # ...EXCEPT subtitle OCR, which is explicitly background work. The clamp
     # above exists because repairs and pool maps are quick and want to jump the
@@ -2263,7 +2272,7 @@ def _heavy(pool_name: str, plan_obj=None) -> bool:
 # encode already on a disk never kept a copy off it, and making it do so now
 # would be a tightening nobody asked for.
 SPINDLE_WEIGHT = {"passthrough": 3, "subocr": 3, "subs": 3,
-                  "subread": 2, "decode": 2,
+                  "subread": 2, "decode": 2, "submake": 2,
                   "encode": 1, "listen": 1,
                   "audio": 0, "probe": 0, "handler": 0}
 SPINDLE_BUDGET = 4
@@ -2333,7 +2342,7 @@ CPU_FREE_UNDER = 0.5
 # ramps instead of lurching; the cheap pools (a header edit, a title fix)
 # are not held back by it.
 START_GAP_S = 6.0
-HEAVY_POOLS = frozenset({"encode", "passthrough", "subocr", "decode", "subread", "listen"})
+HEAVY_POOLS = frozenset({"encode", "passthrough", "subocr", "decode", "subread", "listen", "submake"})
 _LAST_START = {"heavy": 0.0}
 # AND THE WORK YOU CAN SEE KEEPS A CORNER OF THE BUDGET. The measurements
 # that prompted this are all background work - checking files decode, reading
@@ -2344,7 +2353,7 @@ _LAST_START = {"heavy": 0.0}
 # check. Two cores held back is one repack's audio conversion plus the
 # encoder's feeder: enough that the visible half of nuarr never queues behind
 # the invisible half.
-BACKGROUND_POOLS = frozenset({"decode", "subread", "probe", "listen"})
+BACKGROUND_POOLS = frozenset({"decode", "subread", "probe", "listen", "submake"})
 VIDEO_RESERVE = 2.0
 
 
@@ -3318,10 +3327,10 @@ async def pump() -> None:
                         # for the next top-up.
                         for pool in ("handler", "subs", "audio", "encode",
                                      "passthrough", "subocr", "decode",
-                                     "listen", "subread"):
+                                     "listen", "subread", "submake"):
                             if pool not in ("handler", "subs", "audio",
                                             "subocr", "decode", "listen",
-                                            "subread") and blocked:
+                                            "subread", "submake") and blocked:
                                 continue
                             if not st.open_for(pool):
                                 continue
@@ -4398,6 +4407,10 @@ async def _run(job: Job, pool: str) -> None:
             await _reader_job(w)
             return
 
+        if job.kind == "submake":
+            await _submake_job(w)
+            return
+
         if job.kind == "sub_ocr":
             data = await probe(job.path)
             if not data:
@@ -4559,6 +4572,10 @@ async def _run(job: Job, pool: str) -> None:
 
         if job.kind in ("listen", "subread"):
             await _reader_job(w)
+            return
+
+        if job.kind == "submake":
+            await _submake_job(w)
             return
 
         if job.kind == "sub_ocr":
@@ -5298,6 +5315,61 @@ async def _decode_job(w: Worker) -> None:
         # failure of the file - the row stays untested and the feeder offers
         # it again another day.
         _finish(job, "skipped", before, before, note=f"no verdict - {why}"[:300])
+
+
+async def _submake_job(w: Worker) -> None:
+    r"""One file through the Subtitle maker, inside a job.
+
+    The maker used to run its own queue beside this one, and the two met on
+    the same file (Beerus S01E03: a make across an encode and its rename).
+    As a job it is one more thing the queue schedules: never on a file
+    another worker has, held by precedence until the file's facts and its
+    transcode are done, staggered with the rest, shown on the same card.
+    The GPU lane is still claimed, because the second opinion and the
+    restyle run outside the queue and share the card with it."""
+    from . import submake, heavy
+    from . import gpubudget as _gb
+    job = w.job
+    if submake.paused():
+        _defer(job, "the Subtitle maker is paused")
+        return
+    got, holder = heavy.claim(submake.LANE, ttl=4 * 3600)
+    if not got:
+        _defer(job, f"{holder} has the GPU lane")
+        return
+    before = os.path.getsize(job.path) if os.path.exists(job.path) else 0
+    try:
+        ok, why = await asyncio.to_thread(_gb.make_room, _gb.COST_GB["qwen"], "submake", 300)
+        if not ok:
+            _defer(job, f"GPU memory - {why}")
+            return
+        if not getattr(w, "disk", ""):
+            try:
+                with cursor() as cur:
+                    r = cur.execute("SELECT pool_disk FROM files WHERE id=?",
+                                    (job.file_id,)).fetchone()
+                w.disk = (r["pool_disk"] if r else "") or ""
+            except Exception:                                # noqa: BLE001
+                w.disk = ""
+        try:
+            with cursor() as cur:
+                r = cur.execute("SELECT plan_json FROM jobs WHERE job_id=?", (job.id,)).fetchone()
+            plan = json.loads((r["plan_json"] if r else "") or "{}")
+        except Exception:                                    # noqa: BLE001
+            plan = {}
+        w.set_stage("starting")
+        res = await submake.make_job(w, int(job.file_id), bool(plan.get("overwrite")),
+                                     str(plan.get("by") or "you"))
+    finally:
+        heavy.release(submake.LANE)
+    after = os.path.getsize(job.path) if os.path.exists(job.path) else before
+    why = str(res.get("why") or "")[:200]
+    if res.get("ok"):
+        _finish(job, "done", before, after, note=why)
+    elif res.get("skipped"):
+        _finish(job, "skipped", before, after, note=why)
+    else:
+        _finish(job, "failed", before, after, why or "the Subtitle maker failed")
 
 
 async def _reader_job(w: Worker) -> None:

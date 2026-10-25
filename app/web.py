@@ -16026,6 +16026,7 @@ button[disabled]{opacity:.5;cursor:default}
 .e-listen{color:#e5d352;border-color:#4a4512}        /* poolColor: yellow */
 .e-audio{color:#39d3c3;border-color:#12443f}         /* poolColor: teal   */
 .e-subread{color:#c9d1d9;border-color:#3a4250}       /* poolColor: grey   */
+.e-submake{color:#79c0ff;border-color:#1f4a7a}       /* poolColor: blue   */
 .e-sub_ocr{color:#b48bf2;border-color:#3c2a5a}       /* poolColor: purple */
 .e-subs{color:#f778ba;border-color:#5a2340}          /* poolColor: pink   */
 .e-passthrough{color:var(--ok);border-color:#1f4426} /* poolColor: green  */
@@ -17696,7 +17697,8 @@ html.mobile #logsPane{height:auto;min-height:60vh}
         <option value="audio">audio</option>
         <option value="decode">decode</option>
         <option value="listen">listen</option>
-        <option value="subread">subread</option></select>
+        <option value="subread">subread</option>
+        <option value="submake">submake</option></select>
       <select id="qfDisk" onchange="qReload(this.value?('filtering to '+this.value+'…'):'showing all disks…')">
         <option value="">all disks</option></select>
       <input id="qfText" placeholder="filter by title or path" style="width:200px"
@@ -25261,6 +25263,7 @@ function poolColor(pool){
        : pool==='subs'        ? '#f778ba'         // pink - was the page's blue, too close to encode
        : pool==='listen'      ? '#e5d352'         // yellow - Whisper on the card
        : pool==='subread'     ? '#c9d1d9'         // grey - a measurement, not a change
+       : pool==='submake'     ? '#79c0ff'         // blue - the Subtitle maker
        : pool==='handler'     ? '#d2a8ff'         // lilac - script handlers
        : pool==='passthrough' ? 'var(--ok)'       // green - stream copy
        : pool==='audio'       ? '#39d3c3'         // teal - was violet, too close to subocr
@@ -26338,7 +26341,7 @@ async function loadQueue(){
     // These were sorted by count, which reshuffled the legend every few
     // seconds as the queue drained, moving the chip you were reading.
     const QPOOL_ORDER = ['decode','listen','audio','subread','encode',
-                         'passthrough','subocr','subs'];
+                         'passthrough','subocr','submake','subs'];
     const qn={}; for(const p of (q.by_pool||[])) qn[p.pool]=p.n;
     const qrun={}; for(const w of (q.running||[])) qrun[w.pool]=(qrun[w.pool]||0)+1;
     const caps = q.capacity||{};
@@ -26714,7 +26717,7 @@ async function loadJobs(){
     // does not appear here is a pool nobody can tell is running. Erik's
     // words for this strip were "missing the new integrated systems". The
     // name wears its pool colour, so the strip and the card pills agree.
-    + ['audio','decode','listen','subread'].map(p=>
+    + ['audio','decode','listen','subread','submake'].map(p=>
         capCell(p, (j.in_use||{})[p]||0, (j.capacity||{})[p]||0, p)).join('')
     // AND EVERYTHING OUTSIDE THE QUEUE, each in its own colour - the quality
     // search, the Subtitle maker, the Qwen judge, the second opinion, Qwen-VL.
@@ -26818,7 +26821,8 @@ resolved to a pool disk, so the per-spindle avoidance cannot apply">unknown disk
 const IDLE_WHERE = {decode:['the decode check','#health'],
                     listen:['audio listening','#alang'],
                     audio:['audio tag fixes','#alang'],
-                    subread:['subtitle reads','#lang']};
+                    subread:['subtitle reads','#lang'],
+                    submake:['the subtitle maker','#subs']};
 function whyIdleHtml(j){
   const w = j && j.why_idle;
   if(!w || !Object.keys(w).length) return '';           // something is running
@@ -27247,7 +27251,7 @@ function wkStatsHtml(w, pct, indet){
       : ''}>${indet?'—':pct.toFixed(1)+'%'
       }${(w.by_bytes&&w.stage==='encoding')?'<span class="dim" style="font-size:10px">~</span>':''}</span>
     ${(w.kind==='subs'||w.kind==='audio'||w.kind==='decode'
-       ||w.kind==='subread'||w.kind==='listen'||w.kind==='sub_ocr')
+       ||w.kind==='subread'||w.kind==='listen'||w.kind==='sub_ocr'||w.kind==='submake')
       // NO FPS AND NO SPEED, BECAUSE THERE IS NO VIDEO TIMELINE. These jobs
       // move bytes and write headers; two dashes where a number belongs read
       // as "something is missing", and nothing is. The bytes moved are on
@@ -27526,7 +27530,7 @@ function renderDone(j){
   // the same fact as the job row beside it. These have to be here or every
   // completion reads twice - once as the job, once as its own echo.
                          'transcode','passthrough','encode','decode','listen',
-                         'subread','sub_ocr','subs','audio']);
+                         'subread','sub_ocr','submake','subs','audio']);
   // TAKES THE JOB ROWS IT IS JUDGED AGAINST, because there are two feeds and
   // both of them carry the echo. See the history branch below.
   const echoOf=(e,rows)=>{
@@ -27849,7 +27853,7 @@ function renderDone(j){
   // result, verdict class for everything else - one colour means one thing
   // across the whole page.
   const POOLS=['passthrough','encode','subocr','transcode','job',
-               'subs','audio','decode','listen','subread','handler'];
+               'subs','audio','decode','listen','subread','submake','handler'];
   // THE PILLS READ IN THE ORDER THE WORK HAPPENS, not in the order the rows
   // were written. Erik: "make sure the bubbles are ordered correctly as the
   // flow chart dictates". This is precedence.ORDER with the landing at the
@@ -27858,7 +27862,7 @@ function renderDone(j){
   const FLOW=['imported','replaced','checked',
               'decode','listen','audio','subread',
               'passthrough','encode','transcoded','transcode',
-              'subocr','sub_ocr','subs','subtitled',
+              'subocr','sub_ocr','submake','subs','subtitled',
               'content_changed','moved_disk','renamed','name_repaired',
               'skipped','deferred','failed','error','cancelled',
               'deleted','recycled'];
@@ -27926,6 +27930,7 @@ function renderDone(j){
     listen:          ['Audio Heard',               '#e2b341'],
     audio:           ['Audio Tag Fixed',           '#e2b341'],
     subread:         ['Subtitles Read',            '#b48bf2'],
+    submake:         ['Subtitles Made',            '#79c0ff'],
     passthrough:     ['Remuxed',                   '#7fd18c'],
     encode:          ['Re-encoded',                '#e0575b'],
     transcoded:      ['Rewritten',                 '#7fd18c'],
@@ -30926,6 +30931,7 @@ const TM_POOL_WHY = {
   passthrough:'Remuxes at once - a stream copy, no encoder involved.',
   subocr:'Subtitle OCR at once - reading words out of a picture.',
   subread:'Subtitle track reads at once - sampling frames for burned-in words. The most expensive thing in the background.',
+  submake:'Subtitles made at once - Whisper, PaddleOCR and Qwen on the card, one file at a time.',
   subs:'Subtitle fixes at once - a sidecar taken in, a track removed, a title corrected.',
   audio:'Audio tag fixes at once - one header write with mkvpropedit.',
   decode:'Decode checks at once - reading a file through to see whether the bytes are good.',
@@ -50472,7 +50478,7 @@ let _outLive=[];   // what runs outside the queue, live from the jobs feed   // 
 function workersCompact(w){
   const KEYS = ['encode_workers','passthrough_workers','subocr_workers',
                 'subs_workers','audio_workers','decode_workers',
-                'listen_workers','subread_workers',
+                'listen_workers','subread_workers','submake_workers',
                 'probe_workers','arr_concurrency'];
   const cell = (k)=>{
     const v = w[k]; if(!v) return '';

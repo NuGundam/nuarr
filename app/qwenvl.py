@@ -385,7 +385,7 @@ def as_running() -> list:
         try:
             from . import jobs as _j
             for w in list(_j.RUNNING.values()):
-                if getattr(w, "sub_ocr_active", False) or getattr(w, "pool", "") in ("subocr", "subread"):
+                if getattr(w, "sub_ocr_active", False) or getattr(w, "pool", "") in ("subocr", "subread", "submake"):
                     fname = os.path.basename(w.job.path)
                     break
         except Exception:                                # noqa: BLE001

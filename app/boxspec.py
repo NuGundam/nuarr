@@ -59,6 +59,9 @@ COST_CORES = {
     "encode": 0.5, "passthrough": 1.1, "subocr": 1.0, "subs": 0.3,
     "audio": 0.05, "decode": 3.2, "listen": 0.5, "subread": 9.1,
     "probe": 0.1,
+    # the Subtitle maker: Whisper large-v3 on the card with an ffmpeg decode
+    # feeding it, then PaddleOCR and Qwen - about two cores while it runs
+    "submake": 2.0,
 }
 # A subread is two different jobs wearing one name. The pump asks for the
 # shape it is about to run; the recommender sizes for the expensive one.

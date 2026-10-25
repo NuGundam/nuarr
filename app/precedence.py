@@ -63,7 +63,7 @@ import time
 
 from .db import cursor
 
-ORDER = ("decode", "listen", "audio", "subread", "transcode", "sub_ocr", "subs")
+ORDER = ("decode", "listen", "audio", "subread", "transcode", "sub_ocr", "submake", "subs")
 RANK = {k: i for i, k in enumerate(ORDER)}
 # WHAT EACH KIND ACTUALLY WAITS FOR - not everything before it in ORDER,
 # only the things whose absence makes its work wrong or wasted. A title fix
@@ -76,10 +76,14 @@ RANK = {k: i for i, k in enumerate(ORDER)}
 #   subs       planned against the container the transcode leaves behind
 PREREQS = {"transcode": ("decode", "listen", "audio", "subread"),
            "sub_ocr": ("decode", "transcode"),
+           # the maker embeds a track: not into a file the transcode is about
+           # to replace (Beerus S01E03, 2026-10-25), and only once the facts
+           # say the file really has nothing to read
+           "submake": ("decode", "listen", "audio", "subread", "transcode"),
            "subs": ("transcode",)}
 POOL_OF_KIND = {"decode": "decode", "listen": "listen", "audio": "audio",
                 "subread": "subread", "transcode": "encode",
-                "sub_ocr": "subocr", "subs": "subs"}
+                "sub_ocr": "subocr", "submake": "submake", "subs": "subs"}
 MAX_WAIT_S = 6 * 3600
 UNHELD_SOURCES = ("manual", "ui")
 

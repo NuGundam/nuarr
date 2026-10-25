@@ -71,14 +71,34 @@ def stop() -> bool:
 
 
 def _queue() -> list:
+    """What is waiting, read off the job queue (kind submake). The maker's
+    own kv list is gone: a second queue beside the real one was how a make
+    ran across an encode of the same file."""
     try:
-        return json.loads(kv_get(KV_QUEUE) or "[]")
+        with cursor() as cur:
+            rows = cur.execute("SELECT job_id, file_id, plan_json, created_at FROM jobs "
+                               "WHERE kind='submake' AND state='queued' "
+                               "ORDER BY priority, created_at").fetchall()
     except Exception:                                            # noqa: BLE001
         return []
+    out = []
+    for r in rows:
+        try:
+            pj = json.loads(r["plan_json"] or "{}")
+        except Exception:                                        # noqa: BLE001
+            pj = {}
+        out.append({"file_id": int(r["file_id"] or 0), "overwrite": bool(pj.get("overwrite")),
+                    "at": float(r["created_at"] or 0), "by": pj.get("by") or "you", "job_id": r["job_id"]})
+    return out
 
 
 def _save_queue(q: list) -> None:
-    kv_set(KV_QUEUE, json.dumps(q))
+    """Kept for the callers that still hand a list back; the rows live in the
+    jobs table, so only removals mean anything here."""
+    keep = {int(x["file_id"]) for x in q}
+    for x in _queue():
+        if int(x["file_id"]) not in keep:
+            cancel(int(x["file_id"]))
 
 
 def _recent() -> list:
@@ -264,19 +284,33 @@ def enqueue(file_ids: list, overwrite: bool = False, by: str = "you") -> dict:
         if _have_sidecar(r["path"]) and not overwrite:
             skipped.append(f"{display_label(r['title'], r['season'], r['episode'], r['path'])}: "
                            "already has an English subtitle beside it"); continue
-        q.append({"file_id": fid, "overwrite": bool(overwrite), "at": time.time(), "by": by})
+        q.append({"file_id": fid, "overwrite": bool(overwrite), "at": time.time(), "by": by,
+                  "path": r["path"], "name": display_label(r["title"], r["season"], r["episode"], r["path"])})
         have.add(fid)
         added += 1
-    _save_queue(q)
-    kick()
-    return {"added": added, "skipped": skipped, "queued": len(q)}
+    new = [x for x in q if "path" in x]
+    if new:
+        from . import jobs as _jobs
+        rows = [{"file_id": x["file_id"], "path": x["path"], "name": x["name"],
+                 "plan_json": json.dumps({"overwrite": bool(x["overwrite"]), "by": x["by"]})} for x in new]
+        # A PERSON'S CLICK IS NOT HELD by precedence; the Raws check's
+        # automatic make waits until the file's checks and its encode are done.
+        got = _jobs.enqueue_many(rows, "submake", priority=60,
+                                 source="ui" if by == "you" else "subneed")
+        added = int(got.get("made") or 0)
+        held = got.get("held") or {}
+        if held:
+            skipped.append("held until earlier work on the file is done: "
+                           + ", ".join(f"{k} x{v}" for k, v in held.items()))
+    return {"added": added, "skipped": skipped, "queued": len(_queue())}
 
 
 def cancel(file_id: int) -> bool:
-    q = _queue()
-    keep = [x for x in q if int(x["file_id"]) != int(file_id)]
-    _save_queue(keep)
-    return len(keep) != len(q)
+    with cursor() as cur:
+        cur.execute("UPDATE jobs SET state='cancelled', finished_at=? "
+                    "WHERE kind='submake' AND state='queued' AND file_id=?",
+                    (time.time(), int(file_id)))
+        return bool(cur.rowcount)
 
 
 KV_PAUSED = "submake.paused"
@@ -314,13 +348,43 @@ def forget(ats: list) -> int:
 
 
 def kick() -> None:
-    global _TASK
+    """The job queue's pump claims submake jobs; nothing to start here."""
+    return None
+
+
+_W: list = [None]            # the queue Worker whose card mirrors STATE
+
+
+def _st(**kw) -> None:
+    """STATE for the Subtitles page, and the same stage/progress on the job card."""
+    STATE.update(**kw)
+    w = _W[0]
+    if w is not None:
+        try:
+            if "stage" in kw:
+                w.set_stage(str(kw["stage"])[:60])
+            if "pct" in kw:
+                w.progress = max(0.0, min(1.0, float(kw["pct"] or 0) / 100.0))
+        except Exception:                                        # noqa: BLE001
+            pass
+
+
+async def make_job(w, file_id: int, overwrite: bool, by: str = "you") -> dict:
+    """_one() for the job queue: the Worker's card follows, and the outcome
+    the maker remembered for this file comes back as {ok, skipped, why}."""
+    _W[0] = w
+    t0 = time.time()
     try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return
-    if _TASK is None or _TASK.done():
-        _TASK = loop.create_task(_runner())
+        await _one(int(file_id), bool(overwrite), by)
+    finally:
+        _W[0] = None
+        STATE.update(running=False, file_id=None, label="", stage="", pct=0.0, note="")
+    for x in _recent():
+        if int(x.get("file_id") or 0) == int(file_id) and float(x.get("at") or 0) >= t0 - 1:
+            why = str(x.get("why") or "")
+            return {"ok": bool(x.get("ok")), "why": why,
+                    "skipped": (not x.get("ok")) and ("already" in why or "burned into the picture" in why)}
+    return {"ok": False, "skipped": True, "why": "nothing to do - the file is gone or already has English subtitles"}
 
 
 async def _runner() -> None:
@@ -413,7 +477,7 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
     show = sublearn.show_of(r["path"])
     learn = os.path.join(str(DATA_DIR), "submake.learn.json")
     try:
-        STATE.update(stage="gathering the show's names", pct=1)
+        _st(stage="gathering the show's names", pct=1)
         await asyncio.wait_for(asyncio.to_thread(sublearn.build_names, show), timeout=600)
     except Exception:                                            # noqa: BLE001
         pass
@@ -439,6 +503,8 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
                                              stderr=asyncio.subprocess.DEVNULL,
                                              creationflags=NO_WINDOW)
     _PROC = p
+    if _W[0] is not None:
+        _W[0].proc = p           # the card's R/W and Cancel follow the worker
     _out.set_pid("submake", p.pid)
     end: dict = {}
     while True:
@@ -450,11 +516,13 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
         except Exception:                                        # noqa: BLE001
             continue                                             # a library printing to stdout
         if "stage" in d:
-            STATE.update(stage=d["stage"], pct=float(d.get("pct") or 0), note=d.get("note") or "")
+            _st(stage=d["stage"], pct=float(d.get("pct") or 0), note=d.get("note") or "")
         if d.get("done") or d.get("error"):
             end = d
     await p.wait()
     _PROC = None
+    if _W[0] is not None:
+        _W[0].proc = None
     if _STOPPED and not end.get("done"):
         end = {"error": "stopped by you"}
     row = {"at": time.time(), "file_id": file_id, "label": label, "lang": lang,
@@ -530,7 +598,7 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
         pass
     lib = r["library"] or ""
     if overwrite and subembed.enabled(lib) and r["path"].lower().endswith(".mkv"):
-        STATE.update(stage="replacing nuarr's track inside the file", pct=98)
+        _st(stage="replacing nuarr's track inside the file", pct=98)
         try:
             text = open(side, encoding="utf-8-sig", errors="replace").read()
             srt = text if side.endswith(".srt") else substyle.ass_to_srt(text)
@@ -553,7 +621,7 @@ async def _one(file_id: int, overwrite: bool, by: str = "you") -> None:
     # upgraded or edited. Beside the file only when it is not an mkv or the
     # embed itself failed - and then the reason is said.
     if r["path"].lower().endswith(".mkv") and subembed.have_mkvmerge():
-        STATE.update(stage="putting it inside the file", pct=98)
+        _st(stage="putting it inside the file", pct=98)
         try:
             res = await asyncio.to_thread(subembed.embed_one, file_id, None, "", True)
         except Exception as e:                                   # noqa: BLE001
@@ -792,6 +860,7 @@ def as_running() -> list:
     Processing System draw from - so a file being given subtitles shows where
     every other piece of running work does, not only on the Subtitles page.
     Empty when nothing is being made."""
+    return []                    # the maker is a queue job now; its card comes from RUNNING
     if not STATE.get("running"):
         return []
     from . import outside as _out
@@ -963,7 +1032,5 @@ def snapshot() -> dict:
 
 
 async def watch() -> None:
-    """Resume a queue left by a restart."""
-    await asyncio.sleep(120)
-    if _queue():
-        kick()
+    """The queue resumes its own rows after a restart; nothing to do."""
+    return None

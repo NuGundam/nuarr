@@ -84,6 +84,10 @@ LIMITS = {
     # Weight 2 under the spindle budget, so two of them may share a disk and
     # four across twelve disks is comfortable. Median 6.3 s.
     "subread_workers": (0, 6, 4),
+    # The Subtitle maker. Three models on the card one after another and
+    # the GPU lane claimed for the whole run, so one is the only sane count;
+    # two would load Whisper twice.
+    "submake_workers": (0, 1, 1),
     # ffprobe is cheap but still a pool read each - one seek per file, rated
     # disk 2 / cpu 1. Eight keeps a library walk moving without making the
     # pool sound like a scan.
@@ -317,6 +321,7 @@ LABELS = {
     "decode_workers": "Decode checks at once",
     "listen_workers": "Audio listens at once",
     "subread_workers": "Subtitle track reads at once",
+    "submake_workers": "Subtitles made at once",
     "probe_workers": "File scans at once",
     "arr_concurrency": "Sonarr/Radarr calls at once",
     "hold_minutes": "Settle time (minutes)",
@@ -375,6 +380,11 @@ HINTS = {
                       "language identifier on the graphics card. One model "
                       "is loaded; a second job shares it and each runs at "
                       "half speed, so one is the honest default.",
+    "submake_workers": "How many files may have English subtitles made at once. "
+                       "Whisper large-v3 listens, PaddleOCR reads the picture, "
+                       "Qwen translates - all on the graphics card, one after "
+                       "another, holding the GPU lane. One: a second would load "
+                       "the models twice and halve both.",
     "subread_workers": "How many files may have their subtitles read at once "
                        "- frames sampled for burned-in words, or a track's "
                        "events read to judge its title. The frame sampler is "
@@ -490,7 +500,7 @@ POOL_OF = {"encode_workers": "encode", "passthrough_workers": "passthrough",
            "subocr_workers": "subocr", "subocr_gpu_lanes": "subocr",
            "subs_workers": "subs", "audio_workers": "audio",
            "decode_workers": "decode", "listen_workers": "listen",
-           "subread_workers": "subread"}
+           "subread_workers": "subread", "submake_workers": "submake"}
 
 # Which tab each setting belongs to in the UI.
 TIMING_KEYS = ("hold_minutes", "scan_every_min", "ffmpeg_check_h",
@@ -514,6 +524,7 @@ class WorkerConfig:
     decode_workers: int
     listen_workers: int
     subread_workers: int
+    submake_workers: int
     probe_workers: int
     arr_concurrency: int
     hold_minutes: int
@@ -650,6 +661,12 @@ COST = {
                "only a few minutes of audio is ever read off the disk, and "
                "pulling those five windows out is the whole processor share "
                "- one cpu-second a track, measured."},
+    "submake_workers": {
+        "cpu": 2, "gpu": 3, "ram": 2, "disk": 1, "lead": "gpu",
+        "why": "THREE MODELS, ONE AFTER ANOTHER, ALL ON THE CARD. Whisper "
+               "large-v3 listens to every stretch of speech (about 3 GB of "
+               "video memory), PaddleOCR reads the on-screen text, Qwen "
+               "translates. Minutes a file; the lane is held throughout."},
     "subread_workers": {
         "cpu": 3, "gpu": 1, "ram": 1, "disk": 2, "lead": "cpu",
         "why": "THE HEAVIEST THING NUARR ASKS OF THE PROCESSOR, measured. A "
@@ -678,7 +695,7 @@ _COST_POOL = {"encode_workers": "encode", "passthrough_workers": "passthrough",
               "subocr_workers": "subocr", "subocr_gpu_lanes": "subocr",
               "subs_workers": "subs", "audio_workers": "audio",
               "decode_workers": "decode", "listen_workers": "listen",
-              "subread_workers": "subread"}
+              "subread_workers": "subread", "submake_workers": "submake"}
 
 _MED: dict = {"at": 0.0, "data": {}}
 
@@ -767,7 +784,7 @@ def cost_of(key: str) -> dict:
 
 
 PAUSABLE = ("encode", "passthrough", "subocr", "subs", "audio", "decode",
-            "listen", "subread")
+            "listen", "subread", "submake")
 
 
 def paused() -> set:

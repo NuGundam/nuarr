@@ -1,3 +1,10 @@
-second opinion: per-hour cap 60 -> 600, tick start-to-start
+Subtitle maker and the queue stop treading on each other
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+- jobs.busy_with(): the maker waits while a job has its file; _claim skips files the maker / timing fixer hold
+- the maker re-reads the path after the worker and follows a rename
+- nuarr's own subtitle always goes inside an mkv (embed_one force), sidecar only when it cannot
+- rename queue carries sidecars named after the old file along
+
+Beerus S01E03 2026-10-25: make ran across an encode+rename, sidecar left under the old name.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
