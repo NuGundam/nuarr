@@ -1,5 +1,8 @@
-Subtitle maker: the result waits in subs-pending and the embed is retried
+Fresh file: the subtitle question is asked the moment its rewrite lands
 
-The made text (and styled .ass) goes into subocr's subs-pending/<file_id>/ under the same manifest, so the Pending panel, the transcode carry-in, Collect and the sweep all see it. restyle_one(add=True) adds nuarr's track when the file has none. A submake job whose embed cannot be done defers (up to six times) and retries the embed from the baton without re-running the models; a job that finds a baton skips the models. No loose .en.ass beside an mkv any more.
+- subneed.fresh_followup (hooked from jobs._finish on a done transcode and from the no-work-needed path): judge, second opinion if unsure, Subtitle maker queued if a raw - no waiting for the 5/15-minute ticks
+- subverify.verify_file: the second opinion on one file; candidates put files landed in the last day first
+- submake.enqueue: a file landed in the last day gets FRESH_PRIORITY
+- integrity.carry: a passthrough keeps its ok decode verdict under the new size (no second decode)
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

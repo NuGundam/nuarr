@@ -315,6 +315,13 @@ def enqueue(file_ids: list, overwrite: bool = False, by: str = "you") -> dict:
                 got["made"] += int(g.get("made") or 0)
                 for k, v in (g.get("held") or {}).items():
                     got["held"][k] = got["held"].get(k, 0) + v
+                # THE QUEUE TAKES ONE JOB PER FILE AT A TIME. A file with a
+                # decode check or an encode still queued is skipped here, and
+                # the raws sweep offers it again on its next pass - said so,
+                # rather than "added 0" with no reason.
+                if int(g.get("skipped") or 0):
+                    skipped.append(f"{g['skipped']} file(s) have another job queued or running - "
+                                   "the maker is offered them again when that is done")
         added = int(got.get("made") or 0)
         held = got.get("held") or {}
         if held:
