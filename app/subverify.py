@@ -177,8 +177,49 @@ def candidates(limit: int = 50, findings: dict | None = None) -> list:
             continue
         out.append(r)
     mid = (subkind.dismiss_at() + subkind.mark_at()) / 2.0
-    out.sort(key=lambda r: abs(int(r.get("sure") or 50) - mid))
+    # THE NEWEST ARRIVALS FIRST, then the most unsure. A file that landed
+    # today is the one somebody is about to look for; the thousand that
+    # have waited a week have, by definition, been waited for.
+    fresh: set = set()
+    try:
+        ids = [int(r["file_id"]) for r in out]
+        with cursor() as cur:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                fresh |= {int(x["id"]) for x in cur.execute(
+                    f"SELECT id FROM files WHERE id IN ({','.join('?' * len(chunk))}) "
+                    "AND COALESCE(first_seen, 0) > ?", (*chunk, time.time() - 24 * 3600.0))}
+    except Exception:                                            # noqa: BLE001
+        fresh = set()
+    out.sort(key=lambda r: (int(r["file_id"]) not in fresh, abs(int(r.get("sure") or 50) - mid)))
     return out[:limit]
+
+
+def verify_file(file_id: int) -> dict:
+    """The second opinion on ONE file, now - for the fresh-file follow-up.
+    {done, answered} like run_batch, or {busy}/{skipped}/{none}."""
+    from . import heavy
+    rows = [r for r in candidates(800) if int(r.get("file_id") or 0) == int(file_id)]
+    if not rows:
+        return {"none": True}
+    if not _LOCK.acquire(blocking=False):
+        return {"busy": True}
+    try:
+        got, holder = heavy.claim(LANE, ttl=1800)
+        if not got:
+            return {"skipped": f"{holder} has the GPU lane"}
+        from . import gpubudget as _gb
+        _ok, _why = _gb.make_room(_gb.COST_GB.get("whisper_small", 1.2), "verify", 300)
+        if not _ok:
+            heavy.release(LANE)
+            return {"skipped": f"GPU memory - {_why}"}
+        try:
+            d = verify_one(rows[0])
+            return {"done": 1, "answered": int(str(d.get("action") or "").startswith("answered")), "results": [d]}
+        finally:
+            heavy.release(LANE)
+    finally:
+        _LOCK.release()
 
 
 # ----------------------------------------------------------- helpers -----

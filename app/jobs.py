@@ -2118,6 +2118,12 @@ async def enqueue(file_id: int, path: str, title: str = "",
                 SKIPPED_EARLY["last"] = title or os.path.basename(path)
                 joblog.log(f"no work needed, not queued: {title} - "
                            f"{plan.summary()}", "debug")
+                # the file is as it will stay: the subtitle question now
+                try:
+                    from . import subneed as _sn
+                    asyncio.get_running_loop().create_task(_sn.fresh_followup(int(file_id)))
+                except Exception:                                # noqa: BLE001
+                    pass
                 raise NothingToDo(f"{why}: {path}")
 
     try:
@@ -7113,6 +7119,20 @@ def _finish(job: Job, state: str, before: int, after: int,
             event: str = "") -> None:
     _remember_fate(job.id, state)
     _finish_stage(job.id, state)
+    if state == "done" and job.kind == "transcode" and job.file_id:
+        # A STREAM COPY KEEPS ITS DECODE VERDICT - see integrity.carry.
+        try:
+            if (RUNNING.get(job.id).pool if RUNNING.get(job.id) else "") == "passthrough":
+                from . import integrity as _integ
+                _integ.carry(int(job.file_id), job.path)
+        except Exception:                                        # noqa: BLE001
+            pass
+        # AND THE SUBTITLE QUESTION IS ASKED NOW - see subneed.fresh_followup.
+        try:
+            from . import subneed as _sn
+            asyncio.get_running_loop().create_task(_sn.fresh_followup(int(job.file_id), job.id))
+        except Exception:                                        # noqa: BLE001
+            pass
     # Count every outcome toward completion, but only jobs that actually ran an
     # encoder contribute to the RATE. 'skipped' means nothing was transcoded, so
     # its near-zero wall time says nothing about how fast the queue drains.

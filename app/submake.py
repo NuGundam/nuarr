@@ -295,8 +295,26 @@ def enqueue(file_ids: list, overwrite: bool = False, by: str = "you") -> dict:
                  "plan_json": json.dumps({"overwrite": bool(x["overwrite"]), "by": x["by"]})} for x in new]
         # A PERSON'S CLICK IS NOT HELD by precedence; the Raws check's
         # automatic make waits until the file's checks and its encode are done.
-        got = _jobs.enqueue_many(rows, "submake", priority=60,
-                                 source="ui" if by == "you" else "subneed")
+        # A FILE THAT LANDED TODAY GOES FIRST - the fresh band the rest of
+        # the queue uses, so its subtitles are made before the backlog's.
+        try:
+            with cursor() as cur:
+                fresh = {int(x["id"]) for x in cur.execute(
+                    f"SELECT id FROM files WHERE id IN ({','.join('?' * len(rows))}) "
+                    "AND COALESCE(first_seen, 0) > ?",
+                    (*[r["file_id"] for r in rows], time.time() - 24 * 3600.0))}
+        except Exception:                                        # noqa: BLE001
+            fresh = set()
+        got = {"made": 0, "held": {}}
+        for part, prio in ((lambda r: r["file_id"] in fresh, _jobs.FRESH_PRIORITY),
+                           (lambda r: r["file_id"] not in fresh, 60)):
+            sub = [r for r in rows if part(r)]
+            if sub:
+                g = _jobs.enqueue_many(sub, "submake", priority=prio,
+                                       source="ui" if by == "you" else "subneed")
+                got["made"] += int(g.get("made") or 0)
+                for k, v in (g.get("held") or {}).items():
+                    got["held"][k] = got["held"].get(k, 0) + v
         added = int(got.get("made") or 0)
         held = got.get("held") or {}
         if held:

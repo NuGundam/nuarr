@@ -164,6 +164,29 @@ _NO_DECODER = re.compile(
 OK, CORRUPT, UNREADABLE, SHORT = "ok", "corrupt", "unreadable", "short"
 
 
+def carry(file_id: int, path: str) -> bool:
+    """After a STREAM COPY, the verdict follows the file.
+
+    A passthrough rewrites the container and not the streams, so the "ok"
+    the decoder gave the old bytes is as true of the new ones - yet the
+    verdict was keyed by size, and the feeder decoded the whole file again
+    ten minutes after the copy (Beerus S01E03, 2026-10-25: 65 s of decoding
+    for nothing). Only an ok is carried; anything else is re-checked."""
+    try:
+        from .db import cursor
+        st = os.stat(path)
+        with cursor() as cur:
+            r = cur.execute("SELECT verdict FROM integrity WHERE file_id=?", (int(file_id),)).fetchone()
+            if not r or (r["verdict"] or "") != OK:
+                return False
+            cur.execute("UPDATE integrity SET path=?, size=?, mtime=?, at=?, "
+                        "detail=COALESCE(detail,'') || ' (carried over a stream copy)' "
+                        "WHERE file_id=?", (path, int(st.st_size), float(st.st_mtime), time.time(), int(file_id)))
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _no_decoder(rc: int, err: str) -> str:
     """Did this run decode anything at all? -> why not, or "".
 

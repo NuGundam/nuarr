@@ -1,3 +1,5 @@
-jobs.snapshot: submake in the capacity/in_use strip
+Subtitle maker: the result waits in subs-pending and the embed is retried
+
+The made text (and styled .ass) goes into subocr's subs-pending/<file_id>/ under the same manifest, so the Pending panel, the transcode carry-in, Collect and the sweep all see it. restyle_one(add=True) adds nuarr's track when the file has none. A submake job whose embed cannot be done defers (up to six times) and retries the embed from the baton without re-running the models; a job that finds a baton skips the models. No loose .en.ass beside an mkv any more.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

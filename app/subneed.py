@@ -2764,6 +2764,55 @@ def sweep_all() -> dict:
             "took": round(time.time() - started, 1), **counts()}
 
 
+async def fresh_followup(file_id: int, job_id: str = "") -> None:
+    """THE SUBTITLE QUESTION FOR THIS FILE, NOW.
+
+    A fresh file's rewrite has just landed (or its facts said no rewrite was
+    owed). It used to wait for the second opinion's five-minute tick and
+    then the raws sweep's fifteen-minute pass before the Subtitle maker heard
+    of it - twenty minutes of nothing on a file somebody is about to watch.
+    This asks straight away: judge it; if unsure, the second opinion on it;
+    if a raw, the maker queued (held by precedence behind nothing - the
+    rewrite is done). In manual mode it judges and stops, as act_now does."""
+    fid = int(file_id or 0)
+    if not fid or mode() == "off":
+        return
+    try:
+        from . import joblog as _jl
+        await asyncio.to_thread(check_one, fid)
+        if mode() != "auto":
+            return
+
+        def _state():
+            with cursor() as cur:
+                r = cur.execute("SELECT state FROM sub_need WHERE file_id=? ORDER BY "
+                                "CASE state WHEN ? THEN 0 WHEN ? THEN 1 ELSE 2 END LIMIT 1",
+                                (fid, MISSING, UNKNOWN)).fetchone()
+            return str(r["state"]) if r else ""
+        st = await asyncio.to_thread(_state)
+        if st == UNKNOWN:
+            from . import subverify
+            r = await asyncio.to_thread(subverify.verify_file, fid)
+            if r.get("done"):
+                _jl.log("second opinion asked straight away for the fresh file", "info", job_id or None,
+                        system="subneed")
+                await asyncio.to_thread(check_one, fid)
+                st = await asyncio.to_thread(_state)
+        if st == MISSING:
+            from . import submake
+            if submake.gate(fid) == "none":
+                got = submake.enqueue([fid], by="Raws (auto)")
+                if got.get("added"):
+                    _jl.log("raws: the fresh file is a raw - queued for the subtitle maker now",
+                            "info", job_id or None, system="subneed")
+    except Exception as e:                                       # noqa: BLE001
+        try:
+            from . import joblog as _jl
+            _jl.log(f"fresh-file follow-up: {type(e).__name__}: {e}", "debug", system="subneed")
+        except Exception:                                        # noqa: BLE001
+            pass
+
+
 async def act_now(limit: int = 50) -> dict:
     r"""Hand what is missing to the shared remedy, now.
 
