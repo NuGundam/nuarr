@@ -33158,9 +33158,10 @@ function pxTick(){
     const band = c.querySelector('.pxbar b');
     if(band){
       const lead = (leadNow||0)*1000;
-      band.style.width = (n.dur && lead)
-        ? Math.min(100,(n.off+lead)/n.dur*100).toFixed(2)+'%'
+      const bw = (n.dur && lead)
+        ? Math.min(100,(n.off+lead)/n.dur*100).toFixed(1)+'%'
         : '0%';
+      if(band.style.width !== bw) band.style.width = bw;
     }
     // THE PAUSE LINE, drawn where the playhead will be after `floor` seconds.
     // Putting it on the same axis as the buffered edge is what makes it
@@ -33187,9 +33188,11 @@ function pxTick(){
     c.classList.toggle('px-starved', !!starved);
     c.classList.toggle('px-safe', floor > 0 && leadNow != null && !starved);
     if(thr){
-      thr.style.left = (floor > 0 && n.dur)
-        ? Math.min(100, (n.off + floor*1000)/n.dur*100).toFixed(2)+'%' : '0%';
-      thr.style.display = (floor > 0 && n.dur) ? '' : 'none';
+      const tl = (floor > 0 && n.dur)
+        ? Math.min(100, (n.off + floor*1000)/n.dur*100).toFixed(1)+'%' : '0%';
+      if(thr.style.left !== tl) thr.style.left = tl;
+      const td = (floor > 0 && n.dur) ? '' : 'none';
+      if(thr.style.display !== td) thr.style.display = td;
     }
     if(lbl){
       // WHERE THE BUFFER REACHES, not merely how long it is.
@@ -33214,12 +33217,13 @@ function pxTick(){
       // reader does not need the arithmetic spelled out, only the answer, so
       // the tail is now a single word for the state and the working stays in
       // the gauge where it is shown rather than told.
-      lbl.textContent = s.floor_s === 0 ? 'buffered to the end'
+      const lt = s.floor_s === 0 ? 'buffered to the end'
         : s.state === 'paused' ? `${upto} — player paused`
         : !floor ? ''
         : leadNow == null ? 'buffer not measured'
         : starved ? `${upto} · ${Math.round(leadNow)}s ahead — Nuarr paused`
         : `${upto} · ${Math.round(leadNow)}s ahead — clear`;
+      if(lbl.textContent !== lt) lbl.textContent = lt;
     }
     // The runway gauge, on its own axis: 0 .. 3x the floor, in seconds. Past
     // the top of the scale it simply pins full - the difference between four
@@ -33228,8 +33232,9 @@ function pxTick(){
     const run = c.querySelector('.pxrun i');
     if(run && floor > 0){
       const span = floor * 3.6;
-      run.style.width = leadNow == null ? '0%'
-        : Math.min(100, leadNow/span*100).toFixed(2)+'%';
+      const rw = leadNow == null ? '0%'
+        : Math.min(100, leadNow/span*100).toFixed(1)+'%';
+      if(run.style.width !== rw) run.style.width = rw;
       const rl = c.querySelector('.pxrunlbl');
       // If this disk is actually being HELD, say what it is waiting for
       // rather than just how much buffer there is. "Paused" with a healthy

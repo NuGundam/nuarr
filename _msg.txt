@@ -1,9 +1,3 @@
-﻿Dashboard: the 8 Hz progress ticker writes only when the rounded value moves
-
-Measured: tickProgress set a bar width and a label for every running job
-eight times a second, and at encode speeds the value moved a hundredth of a
-percent per tick - every write a style recalc and a layout, most of the
-page's ~60 layouts/s. Now one decimal, written only on change; the probe-age
-ticker likewise, at 500 ms.
+﻿Dashboard: the rest of the Plex ticker writes only on change (lead label, band, threshold, run bar)
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
