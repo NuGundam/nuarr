@@ -1,7 +1,7 @@
-﻿Dashboard polls wait twice as long when nothing is running
+﻿poll(): idle test inside the callback - runningJobs is a let declared later, and reading it at load threw
 
-poll(): the delay is chosen fresh before each fire - with no job in the
-pump every poll under five seconds doubles (host 1->2 s, queue 2.5->5,
-jobs 3->6); the first fire after a job starts is back at its own pace.
+The previous commit's typeof check hit the temporal dead zone at the first
+poll() call and stopped every loader after it from registering (dashboard
+measured at 1 request/s with no jobs, queue or host polls at all).
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

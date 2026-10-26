@@ -18018,11 +18018,16 @@ function poll(fn, ms, id){
   // moving. With no job in the pump every poll under five seconds waits
   // twice as long; the first poll after a job starts goes back to its own
   // pace, because the delay is chosen fresh each time (Erik, 2026-10-25).
-  const arm=()=>{
-    const idle = ms < 5000 && typeof runningJobs !== 'undefined' && runningJobs.size === 0;
-    setTimeout(()=>{ try{ g(); }catch(_){ } arm(); }, idle ? ms*2 : ms);
-  };
-  arm();
+  // The idle test runs INSIDE the callback: runningJobs is a let declared
+  // further down this script, and reading it here at load time is a
+  // temporal-dead-zone error that stopped every loader after the first poll.
+  const arm=(d)=>setTimeout(()=>{
+    try{ g(); }catch(_){ }
+    let idle=false;
+    try{ idle = ms < 5000 && runningJobs.size === 0; }catch(_){ }
+    arm(idle ? ms*2 : ms);
+  }, d);
+  arm(ms);
 }
 // THE SELF-RESCHEDULING LOADERS, THE SAME RULE. A dozen panels poll with a
 // setTimeout that re-arms itself and stopped only when its element was
