@@ -1,11 +1,15 @@
-﻿How files flow: facts top-down, tour shows the file, no waiting on counts, arrows
+﻿Settings page: 55 requests at open -> the ones it shows; random pick by id; cached CUDA answer
 
-- the four facts are one column (rows 5-8) with their own hand-offs labelled
-- the tour writes the file into the trace box (it only redrew the graph)
-- pipeline._slow() serves what it has and refreshes on a thread;
-  /api/pipeline is served from the last answer and refreshed behind it;
-  warmed 20 s after start-up
-- arrowheads on every edge; a traced route is a moving dashed line in the
-  direction the file went; lit = both ends on the route, in order
+Measured in headless Edge over DevTools: the page itself was quick (95 KB
+gz HTML, DOMContentLoaded 144 ms). What made it slow:
+- the shared script fired every dashboard loader once at top level, 55 API
+  requests for a page showing none of them, then ~4 requests/s from the
+  ungated host poll. First calls now go through the same visibility gate as
+  the polls; the 1 s host poll is gated on its bar.
+- /api/pipeline/random sorted 160k jobs JOIN files with ORDER BY RANDOM()
+  (0.5-18 s) and the tour's first file waited on it: now a random id and
+  the next qualifying row.
+- system.snapshot() -> audiolang.info() spawned nvidia-smi on every jobs
+  poll: the CUDA answer is cached ten minutes.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

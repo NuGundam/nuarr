@@ -7133,18 +7133,27 @@ def api_pipeline_random():
                 pool = [r[0] for r in cur.execute(
                     "SELECT file_id FROM sub_shape "
                     "ORDER BY RANDOM() LIMIT 1")]
+            # NOT ORDER BY RANDOM(): over 160k jobs joined to files that is
+            # half a second on a good day and eighteen behind a checkpoint,
+            # and the tour's first file - the trace box - waited on it. A
+            # random id and the next qualifying row from it is the same pick
+            # for the price of one index seek.
             if not pool:
-                pool = [r[0] for r in cur.execute(
-                    "SELECT j.file_id FROM jobs j JOIN files f "
-                    "ON f.id=j.file_id "
-                    "WHERE f.state NOT IN ('deleted','duplicate') "
-                    "  AND j.state IN ('done','failed','blocked') "
-                    "ORDER BY RANDOM() LIMIT 1")]
+                top = cur.execute("SELECT MAX(id) FROM jobs").fetchone()[0] or 0
+                for _ in range(4):
+                    pool = [r[0] for r in cur.execute(
+                        "SELECT j.file_id FROM jobs j JOIN files f ON f.id=j.file_id "
+                        "WHERE j.id >= ? AND f.state NOT IN ('deleted','duplicate') "
+                        "  AND j.state IN ('done','failed','blocked') "
+                        "ORDER BY j.id LIMIT 1", (random.randint(1, max(1, top)),))]
+                    if pool:
+                        break
             if not pool:
+                top = cur.execute("SELECT MAX(id) FROM files").fetchone()[0] or 0
                 pool = [r[0] for r in cur.execute(
-                    "SELECT id FROM files "
-                    "WHERE state NOT IN ('deleted','duplicate') "
-                    "ORDER BY RANDOM() LIMIT 1")]
+                    "SELECT id FROM files WHERE id >= ? "
+                    "  AND state NOT IN ('deleted','duplicate') ORDER BY id LIMIT 1",
+                    (random.randint(1, max(1, top)),))]
         except Exception:                                    # noqa: BLE001
             pool = []
     return {"file_id": pool[0] if pool else 0}
@@ -24652,7 +24661,7 @@ async function socrpClear(id){
   try{ await fetch('/api/subocr/pending/clear?file_id='+id, {method:'POST'}); }catch(_){}
   loadSocrPending();
 }
-loadSocrPending();
+gated(loadSocrPending,'socrp')();
 poll(loadSocrPending, 10000, 'socrp');
 
 async function retryRenames(){
@@ -25240,7 +25249,7 @@ async function loadSys(){
   catch(_){ }
   finally{ _sysBusy=false; }
 }
-loadSys(); poll(loadSys, 1000);
+gated(loadSys,'sysbar')(); poll(loadSys, 1000, 'sysbar');
 
 // A STABLE COLOUR PER SPINDLE.
 // Twelve near-identical "NU-DRIVE-n 264.1 MB/s" strings on one line is a wall
@@ -50734,12 +50743,16 @@ async function loadHookState(){
       +`<span class="mono">${esc(s.base_url||'')}</span><br>${pills}`;
   }catch(_){ el.textContent=''; }
 }
-loadPlayback(); loadAudit();
+// FIRST CALLS GATED LIKE THE POLLS. The settings page shares this script
+// and carries the dashboard's elements hidden; every loader below used to
+// fire once on open regardless - 55 requests for a page showing none of
+// them. gated() asks "is the element visible", which is the right question.
+gated(loadPlayback,'pb')(); gated(loadAudit,'au')();
 poll(loadHooks,10000,'hooks');
-loadHookState(); poll(loadHookState,60000,'hookstate');
+gated(loadHookState,'hookstate')(); poll(loadHookState,60000,'hookstate');
 poll(loadHistory,5000,'jobCap');
 poll(loadGate,6000,'gate');
-loadHandlerBtns();
+gated(loadHandlerBtns,'qLib')();
 // The FULL poll stays at 2 s - it carries the Finished list and the queue
 // preview, neither of which moves between frames.
 poll(loadJobs,3000,'jobCap');
@@ -50783,22 +50796,22 @@ document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) loadLiv
 // 700 ms was only ever to drive the auto-scroll smoothly. With that gone the
 // list just needs to stay current, and a 300-row query every 0.7 s is wasted
 // work on a 2,000-file queue.
-loadQueue(); poll(loadQueue,2500,'qfPool');
+gated(loadQueue,'qfPool')(); poll(loadQueue,2500,'qfPool');
 // Slower than the queue: the numbers here are library-wide totals that move in
 // minutes, not seconds, and each read counts rows across the whole files table.
-loadAuto(); poll(loadAuto,6000,'aqState');
+gated(loadAuto,'aqState')(); poll(loadAuto,6000,'aqState');
 // Tiles and library counts change as jobs finish, so refresh them too. Slower
 // than the job poll because the summary also stats every pool disk.
 poll(loadAll,15000,'cards');
 poll(loadLogs,3000,'logs');
-loadJobs();
+gated(loadJobs,'jobCap')();
 poll(loadLogJobs,15000,'logJob');
-loadLogs(); loadLogJobs();
+gated(loadLogs,'logs')(); gated(loadLogJobs,'logJob')();
 loadAll();
 // Once at boot and then slowly: the mode changes when a person changes it or
 // when nuarr appears/vanishes on the file server, neither of which is a
 // per-second event.
-loadObserver();
+gated(loadObserver,'obsBox')();
 poll(loadObserver, 60000, 'obsBox');
 // ARRIVING AT A PANEL, not just at the page. /#transcoding used to load the
 // dashboard and leave you at the top of it, which for a link that says "runs

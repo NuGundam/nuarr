@@ -905,6 +905,24 @@ def snapshot() -> dict:
     return out
 
 
+_WDEV = {"at": 0.0, "v": "cpu"}
+
+
+def _whisper_dev_cached(audiolang) -> str:
+    """audiolang.info() spawns nvidia-smi and globs site-packages to answer
+    whether CUDA is there - a tenth of a second, and it was asked on every
+    dashboard poll through snapshot(). The answer changes when a driver is
+    installed, not between polls: ten minutes."""
+    now = time.time()
+    if now - _WDEV["at"] > 600:
+        try:
+            _WDEV["v"] = "cuda" if audiolang.info().get("cuda_devices") else "cpu"
+        except Exception:                                    # noqa: BLE001
+            pass
+        _WDEV["at"] = now
+    return _WDEV["v"]
+
+
 def _gpu_work() -> list[dict]:
     """What nuarr is running on the GPU right now, besides encodes.
 
@@ -971,8 +989,7 @@ def _gpu_work() -> list[dict]:
         p = audiolang.progress()
         # The device the model actually loaded on, once it has; before that,
         # the one it was installed for. Same rule audiolang.info() applies.
-        dev = (audiolang._MODEL_DEV
-               or ("cuda" if audiolang.info().get("cuda_devices") else "cpu"))
+        dev = audiolang._MODEL_DEV or _whisper_dev_cached(audiolang)
         on_gpu = str(dev).lower().startswith("cuda")
         where = "gpu" if on_gpu else "cpu"
         if (p.get("state") or "") == "listening":
