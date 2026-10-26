@@ -1,8 +1,9 @@
-﻿Dashboard: Plex ticker writes only what changed; scroll-keeper idle at the top
+﻿Dashboard: the 8 Hz progress ticker writes only when the rounded value moves
 
-Measured in headless Edge: JS was 90% idle yet the page did ~60 layouts/s -
-the now-playing ticker rewrote five text nodes per card four times a second
-whether or not the text changed, and the scroll-keeper queued a frame with a
-forced layout after every DOM write even at the top of the page.
+Measured: tickProgress set a bar width and a label for every running job
+eight times a second, and at encode speeds the value moved a hundredth of a
+percent per tick - every write a style recalc and a layout, most of the
+page's ~60 layouts/s. Now one decimal, written only on change; the probe-age
+ticker likewise, at 500 ms.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

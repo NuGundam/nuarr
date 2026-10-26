@@ -26174,9 +26174,9 @@ setInterval(()=>{
     if(el.classList.contains('settled')) continue;
     const t=el.querySelector('.aqp-el');
     const at=parseFloat(el.dataset.at||'0');
-    if(t&&at) t.textContent=(now-at).toFixed(1)+'s';
+    if(t&&at){ const v=(now-at).toFixed(1)+'s'; if(t.textContent!==v) t.textContent=v; }
   }
-}, 250);
+}, 500);
 async function toggleAuto(on){
   if(_aqBusy) return; _aqBusy=true;
   try{ await fetch('/api/autoqueue/toggle?on='+(on?'true':'false'),{method:'POST'}); }
@@ -27365,10 +27365,14 @@ function tickProgress(){
       const cand = Math.min(s.p + s.rate*dt, s.p + 0.02, 0.999);
       if(cand > s.disp) s.disp = cand;
       const pct = s.disp * 100;
-      bar.style.width = pct.toFixed(2) + '%';
+      // WRITE ONLY WHEN THE ROUNDED VALUE MOVES. At eight ticks a second an
+      // encode advances a hundredth of a percent per tick; every write is a
+      // style recalc and a layout, and this loop was most of the page's.
+      const w = pct.toFixed(1) + '%';
+      if(bar.style.width !== w) bar.style.width = w;
       const lbl = card.querySelector('.m-pct');
-      if(lbl && lbl.childNodes.length && lbl.childNodes[0].nodeType===3)
-        lbl.childNodes[0].nodeValue = pct.toFixed(1) + '%';
+      if(lbl && lbl.childNodes.length && lbl.childNodes[0].nodeType===3 && lbl.childNodes[0].nodeValue !== w)
+        lbl.childNodes[0].nodeValue = w;
     }
     // side-OCR bar, same rules
     const sbar = card.querySelector('.socrbar > i');
@@ -27376,9 +27380,11 @@ function tickProgress(){
       const cand = Math.min(s.sp + s.srate*dt, s.sp + 0.02, 0.999);
       if(cand > s.sdisp) s.sdisp = cand;
       const spct = s.sdisp * 100;
-      sbar.style.width = spct.toFixed(2) + '%';
+      const sw = spct.toFixed(1) + '%';
+      if(sbar.style.width !== sw) sbar.style.width = sw;
       const slbl = card.querySelector('.socrpct');
-      if(slbl) slbl.textContent = spct.toFixed(0) + '%';
+      const st = spct.toFixed(0) + '%';
+      if(slbl && slbl.textContent !== st) slbl.textContent = st;
     }
   }
 }
