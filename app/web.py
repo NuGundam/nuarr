@@ -18013,7 +18013,16 @@ document.addEventListener('visibilitychange', ()=>{
 function poll(fn, ms, id){
   const g=gated(fn, id);
   _gatedOnShow.push(g);
-  return setInterval(g, ms);
+  // SLOWER WHEN NOTHING IS RUNNING. Measured on an idle dashboard: five
+  // requests a second and a repaint per answer, for numbers that were not
+  // moving. With no job in the pump every poll under five seconds waits
+  // twice as long; the first poll after a job starts goes back to its own
+  // pace, because the delay is chosen fresh each time (Erik, 2026-10-25).
+  const arm=()=>{
+    const idle = ms < 5000 && typeof runningJobs !== 'undefined' && runningJobs.size === 0;
+    setTimeout(()=>{ try{ g(); }catch(_){ } arm(); }, idle ? ms*2 : ms);
+  };
+  arm();
 }
 // THE SELF-RESCHEDULING LOADERS, THE SAME RULE. A dozen panels poll with a
 // setTimeout that re-arms itself and stopped only when its element was

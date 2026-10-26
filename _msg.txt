@@ -1,3 +1,7 @@
-﻿Dashboard: Plex progress bar width to a tenth of a percent (written ~1/s, not 4/s per card)
+﻿Dashboard polls wait twice as long when nothing is running
+
+poll(): the delay is chosen fresh before each fire - with no job in the
+pump every poll under five seconds doubles (host 1->2 s, queue 2.5->5,
+jobs 3->6); the first fire after a job starts is back at its own pace.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
