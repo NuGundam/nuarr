@@ -709,6 +709,17 @@ async def _startup() -> None:
     except Exception:                                            # noqa: BLE001
         pass
     BOOT["started"] = time.time()
+
+    def _warm_pipeline():
+        # the flow page's historical counts take seconds the first time;
+        # have them ready before anyone opens it
+        time.sleep(20)
+        try:
+            from . import pipeline as _pl
+            _pl.graph()
+        except Exception:                                        # noqa: BLE001
+            pass
+    threading.Thread(target=_warm_pipeline, daemon=True, name="pipeline-warm").start()
     # FIRST, BEFORE ANYTHING CAN SPAWN. This wraps subprocess.Popen so every
     # process nuarr starts records the line that started it - and a process
     # started before the wrapper is in place is one the console watcher can
@@ -6987,7 +6998,7 @@ def api_pathmap():
 
 
 @app.get("/api/pipeline")
-def api_pipeline(file_id: int = 0):
+async def api_pipeline(file_id: int = 0):
     """The pipeline diagram: the graph, and optionally one file's route."""
     from . import pipeline
     # Seventeen COUNT(*) queries, ~0.5 s, polled while the page is open. The
@@ -6995,10 +7006,11 @@ def api_pipeline(file_id: int = 0):
     # seconds of memo makes the poll free and nothing on the diagram late.
     # Copied, because the route below is written into the same dict and a
     # memoised object must not be mutated by one caller for the next.
-    out = dict(_memo("pipeline", 10.0, pipeline.graph))
     if file_id:
+        out = dict(_memo("pipeline", 10.0, pipeline.graph))
         out["route"] = pipeline.route(file_id)
-    return out
+        return out
+    return await _memo_json("pipeline", 10.0, pipeline.graph)
 
 
 @app.get("/api/notlanded")
@@ -14535,6 +14547,8 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
    slot, so a held card cannot make the panel look busier than it is. */
 .wk.fading{animation:wkfade .6s ease 2s forwards;pointer-events:none}
 @keyframes wkfade{0%{opacity:1}100%{opacity:0;transform:translateY(-4px)}}
+@keyframes pipeflow{to{stroke-dashoffset:-24}}
+.pipeLit{animation:pipeflow 0.9s linear infinite}
 /* and a card ARRIVES rather than snapping in, so a slot changing occupant
    reads as a handover instead of a flicker */
 .wk.arriving{animation:wkin .35s ease both}
@@ -38046,7 +38060,7 @@ async function pipeCycleTick(now){
       const d=await fetch('/api/pipeline/random').then(r=>r.json());
       if(d && d.file_id){
         const g=await fetch('/api/pipeline/route?file_id='+d.file_id).then(r=>r.json());
-        if(_pipeCycle){ _pipeRoute=g.route||null; pipeDrawGraphs(); }
+        if(_pipeCycle){ _pipeRoute=g.route||null; pipeTrace_(); pipeDrawGraphs(); }
       }
     }catch(e){}
   }
@@ -38077,7 +38091,7 @@ async function loadProcess(){
 // is what the branch labels live in.
 const _PIPE_WIDE ={w:196, h:56, gx:346, gy:104, pad:16, dir:'right'};
 const _PIPE_TIGHT={w:158, h:52, gx:232, gy:92, pad:14, dir:'right'};
-const _PIPE_DOWN ={w:204, h:54, gx:250, gy:96, pad:16, dir:'down'};
+const _PIPE_DOWN ={w:204, h:54, gx:250, gy:90, pad:16, dir:'down'};
 function pipeXY(n, g){
   g = g || _PIPE_WIDE;
   return {x:g.pad+n.col*g.gx, y:g.pad+n.row*g.gy};
@@ -38130,8 +38144,17 @@ function pipeSvg(g, route, idPrefix, geo){
   const lit=(a,b)=>{
     if(!route||!route.length) return false;
     const i=route.indexOf(a), j=route.indexOf(b);
-    return i>=0&&j>=0&&j===i+1;
+    return i>=0&&j>=0&&j>i;
   };
+  // ARROWHEADS, and a traced path that visibly runs the way the file went.
+  const defs=`<defs>
+    <marker id="${idPrefix}ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#39424e"/></marker>
+    <marker id="${idPrefix}arl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6fb0ff"/></marker>
+    <marker id="${idPrefix}ard" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2a313a"/></marker>
+  </defs>`;
   let svg='', labels='';
   edges.forEach((e,i)=>{
     const A=byId[e.a], B=byId[e.b];
@@ -38153,10 +38176,11 @@ function pipeSvg(g, route, idPrefix, geo){
     }
     const isLit=lit(e.a,e.b);
     const dim=e.muted&&!isLit;
-    svg+=`<path id="${idPrefix}p${i}" d="${d}" fill="none"
+    svg+=`<path id="${idPrefix}p${i}" d="${d}" fill="none" class="${isLit?'pipeLit':''}"
        stroke="${isLit?'#6fb0ff':(dim?'#2a313a':'#39424e')}"
-       stroke-width="${isLit?2.4:1.4}"
-       ${isLit?'':'stroke-dasharray="'+(dim?'3 4':'0')+'"'}/>`;
+       stroke-width="${isLit?2.6:1.4}"
+       marker-end="url(#${idPrefix}${isLit?'arl':(dim?'ard':'ar')})"
+       ${isLit?'stroke-dasharray="7 5"':'stroke-dasharray="'+(dim?'3 4':'0')+'"'}/>`;
     if(e.label){
       const room = geo.dir==='down' ? 34 : Math.max(8, Math.floor((geo.gx-geo.w)/5.1));
       const txt=e.label.length>room ? e.label.slice(0,room-1)+'…' : e.label;
@@ -38205,7 +38229,7 @@ function pipeSvg(g, route, idPrefix, geo){
     </g>`;
   });
   return `<svg viewBox="0 0 ${W} ${H}" width="100%"
-     style="max-width:${W}px;height:auto;overflow:visible">${svg}</svg>`;
+     style="max-width:${W}px;height:auto;overflow:visible">${defs}${svg}</svg>`;
 }
 // The poll's whole job: new numbers into the texts already on the page, and
 // the notes (which quote the numbers) refreshed on the boxes.

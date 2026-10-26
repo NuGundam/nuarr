@@ -175,8 +175,26 @@ def _slow() -> dict:
     never faster than the slowest of them. They count things that change on
     the scale of hours; five minutes is nothing on that scale."""
     now = time.time()
-    if now - _SLOW["at"] < _SLOW_TTL and _SLOW["v"]:
+    if _SLOW["v"] and now - _SLOW["at"] < _SLOW_TTL:
         return _SLOW["v"]
+    if _SLOW["v"]:
+        # STALE BUT PRESENT: hand it over and refresh behind the caller.
+        if not _SLOW.get("busy"):
+            _SLOW["busy"] = True
+            import threading as _th
+
+            def _bg():
+                try:
+                    _slow_compute()
+                finally:
+                    _SLOW["busy"] = False
+            _th.Thread(target=_bg, daemon=True, name="pipeline-slow").start()
+        return _SLOW["v"]
+    return _slow_compute()
+
+
+def _slow_compute() -> dict:
+    now = time.time()
     with cursor() as cur:
         v = dict(
             probed=_n(cur, "SELECT COUNT(*) FROM file_probes p JOIN files f ON f.id=p.file_id "
@@ -299,10 +317,10 @@ def graph() -> dict:
     n_req, n_rep = acted.get("requeue", 0), acted.get("replace", 0)
     n_fix, n_ask = acted.get("repair", 0), acted.get("reask", 0)
 
-    def fact(k, col):
+    def fact(k, row):
         lbl, note = _FACT_WORDS[k]
         pool = {"decode": "decode", "listen": "listen", "audio": "audio", "subread": "subread"}[k]
-        return dict(id=f"f_{k}", col=col, row=5, label=lbl, kind="pool", pool=pool,
+        return dict(id=f"f_{k}", col=1, row=row, label=lbl, kind="pool", pool=pool,
                     count=_busy(pool),
                     note=(note + (f" {held[k]:,} file(s) are held waiting for this "
                                   f"right now." if held.get(k) else "")))
@@ -363,52 +381,52 @@ def graph() -> dict:
                    f"{n_again:,} are back because a rule changed or somebody asked. "
                    f"A fresh file's jobs go in ahead of the backlog; a returning "
                    f"file's go in behind it.")),
-        fact("decode", 0), fact("listen", 1), fact("audio", 2), fact("subread", 3),
-        dict(id="plan", col=1, row=6, label="Planned", count=None, kind="stage",
+        fact("decode", 5), fact("listen", 6), fact("audio", 7), fact("subread", 8),
+        dict(id="plan", col=1, row=9, label="Planned", count=None, kind="stage",
              note=("the rules turn the probe and the four facts into a plan: which "
                    "video, which audio, which subtitles, and so which worker. "
                    f"{unprobed:,} files have not been probed yet; they are read the "
                    f"first time something needs them.")),
-        dict(id="nothing", col=2, row=6, label="Nothing to do", count=S["skipped"], kind="idle",
+        dict(id="nothing", col=2, row=9, label="Nothing to do", count=S["skipped"], kind="idle",
              note=(f"the commonest outcome and not a failure: the file already matches "
                    f"the policy. {S['skipped_ever']:,} such conclusions in total. A fresh "
                    f"file that needs no rewrite still gets its subtitle question asked "
                    f"the same second.")),
-        dict(id="gate", col=1, row=7, label="Job gate", count=q_all, kind="gate",
+        dict(id="gate", col=1, row=10, label="Job gate", count=q_all, kind="gate",
              note=("everything queued, in every pool. Held while someone is watching, "
                    "a disk is busy or a pool is paused; a fresh-band job is taken "
                    "first whichever disk it is on"
                    + (f". {sum(held.values()):,} file(s) are waiting on a fact" if sum(held.values()) else ""))),
-        dict(id="encode", col=0, row=8, label="Encode", count=r_enc, kind="pool", pool="encode",
+        dict(id="encode", col=0, row=11, label="Encode", count=r_enc, kind="pool", pool="encode",
              note="the picture is rebuilt on the graphics card"),
-        dict(id="passthrough", col=1, row=8, label="Passthrough", count=r_pass, kind="pool", pool="passthrough",
+        dict(id="passthrough", col=1, row=11, label="Passthrough", count=r_pass, kind="pool", pool="passthrough",
              note=("tracks and flags change, the picture is copied untouched. A copy "
                    "keeps its decode verdict, so the file is not decoded again.")),
-        dict(id="failed", col=2, row=8, label="Still not landed", count=S["bad_now"], kind="bad",
+        dict(id="failed", col=2, row=11, label="Still not landed", count=S["bad_now"], kind="bad",
              note=(f"most recent attempt failed or was blocked and nothing has put it "
                    f"right since. Retried on a backoff. {S['bad_ever']:,} failures ever; "
                    f"the rest were fixed later or belong to files since replaced.")),
-        dict(id="commit", col=1, row=9, label="Committed", count=S["files_done"], kind="stage",
+        dict(id="commit", col=1, row=12, label="Committed", count=S["files_done"], kind="stage",
              note=(f"written back over the original, paced so a viewer never feels it. "
                    f"{S['d_enc'] + S['d_pass'] + S['d_sub'] + S['d_subs'] + S['d_make']:,} "
                    f"commits in total. The moment a fresh file's rewrite lands, the "
                    f"subtitle question is asked for it - no waiting for a sweep.")),
-        dict(id="subocr", col=0, row=10, label="Subtitle OCR", count=r_sub, kind="pool", pool="subocr",
+        dict(id="subocr", col=0, row=13, label="Subtitle OCR", count=r_sub, kind="pool", pool="subocr",
              note=(f"picture subtitles that survived the rewrite are read into text "
                    f"with {eng}, for {libtxt}. The text goes to the file through the "
                    f"subs-pending baton and is retried if the file is busy.")),
-        dict(id="submake", col=1, row=10, label="Subtitle maker", count=r_make, kind="pool", pool="submake",
+        dict(id="submake", col=1, row=13, label="Subtitle maker", count=r_make, kind="pool", pool="submake",
              note=(f"a raw - no English anywhere, judged by the raws check and the "
                    f"second opinion - gets English made from the audio and embedded "
                    f"as 'English (nuarr)'. Runs as a queue job, one job per file, "
                    f"never on a file something else is rewriting; the made text waits "
                    f"in the same baton as the OCR's and is retried. {n_raw:,} raw(s) "
                    f"known right now.")),
-        dict(id="subs", col=2, row=10, label="Subtitle fixes", count=r_subs, kind="pool", pool="subs",
+        dict(id="subs", col=2, row=13, label="Subtitle fixes", count=r_subs, kind="pool", pool="subs",
              note=("sidecars taken inside, duplicate tracks dropped, titles corrected, "
                    "on the final container. A subtitle-only rewrite re-keys the "
                    "verdicts, so nothing is listened to or decoded again.")),
-        dict(id="watch", col=1, row=11, label="Watchable", count=n_watch, kind="stage",
+        dict(id="watch", col=1, row=14, label="Watchable", count=n_watch, kind="stage",
              note=(f"fresh files with nothing left owed: rewritten, subtitled, done. "
                    f"The count is how many of today's arrivals are there now.")),
     ]
@@ -423,10 +441,10 @@ def graph() -> dict:
         dict(a="req", b="elig", label="behind fresh", n=n_req),
         dict(a="rep", b="found", label="the replacement lands", n=n_rep),
         dict(a="elig", b="f_decode", label="the facts first", n=n_elig),
-        dict(a="f_decode", b="f_listen", label="", n=_busy("listen")),
-        dict(a="f_listen", b="f_audio", label="", n=_busy("audio")),
-        dict(a="f_audio", b="f_subread", label="", n=_busy("subread")),
-        dict(a="f_listen", b="plan", label="all four answered", n=probed),
+        dict(a="f_decode", b="f_listen", label="it decodes", n=_busy("listen")),
+        dict(a="f_listen", b="f_audio", label="the language is known", n=_busy("audio")),
+        dict(a="f_audio", b="f_subread", label="tags written", n=_busy("subread")),
+        dict(a="f_subread", b="plan", label="all four answered", n=probed),
         dict(a="plan", b="nothing", label="already correct", n=S["skipped"], muted=True),
         dict(a="plan", b="gate", label="a change is needed", n=q_all),
         dict(a="gate", b="encode", label="picture must be rebuilt", n=r_enc),

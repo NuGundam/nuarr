@@ -1,19 +1,11 @@
-﻿How files flow: top-down two-lane chart, page loads in milliseconds
+﻿How files flow: facts top-down, tour shows the file, no waiting on counts, arrows
 
-- pipeline.graph(): picture 1 is top-down. Lane A "Imported or upgraded"
-  (an upgrade is a new arr file id, so a new file) rides the fresh band for
-  24 h; lane B "Already in the library" (six standing checks, a rule change,
-  the remedy verbs) re-enters behind it. Both meet at Ready to plan, then
-  the four facts, plan, gate, encode/passthrough, commit, Subtitle OCR /
-  Subtitle maker / Subtitle fixes, Watchable. Fresh-band counts added.
-- pipeline._slow(): the historical counts (1.5-2.5 s together) memoised
-  5 min; the live graph builds in ~0.2 s.
-- route(): lights the new node ids (fresh, elig, f_*, submake, subs, watch).
-- /api/pipeline/route serves one file's route alone (tour + trace).
-- the page shell is drawn once; the 15 s poll rewrites count texts in
-  place, so typing in the trace box is never lost and the animations never
-  restart. pipeSvg draws dir:'down' graphs with pill labels and side
-  detours for jumps over a row.
-- the order chain names the Subtitle maker.
+- the four facts are one column (rows 5-8) with their own hand-offs labelled
+- the tour writes the file into the trace box (it only redrew the graph)
+- pipeline._slow() serves what it has and refreshes on a thread;
+  /api/pipeline is served from the last answer and refreshed behind it;
+  warmed 20 s after start-up
+- arrowheads on every edge; a traced route is a moving dashed line in the
+  direction the file went; lit = both ends on the route, in order
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
