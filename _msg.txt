@@ -1,3 +1,9 @@
-subs/sub_ocr rewrites: listen and decode verdicts follow the file
+﻿Fresh band follows a file for 24 h - subs and all
+
+- jobs._fresh_priority: eligible OR first_seen within FRESH_S (24 h), so
+  sub_ocr and subs jobs queued after the transcode flips the file to done
+  still take the fresh band; enqueue/enqueue_many/lift_fresh carry first_seen
+- jobs._claim: a fresh-band job sorts ahead of the disk-balance terms
+- subocr.sweep_pick: newest arrivals first
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

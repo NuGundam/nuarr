@@ -706,6 +706,14 @@ class Job:
 # and a person's move-to-front still wins.
 FRESH_PRIORITY = 20
 FRESH_STATES = ("eligible",)
+# AND FOR A DAY AFTER IT LANDS, WHATEVER ITS STATE. 'eligible' ends the moment
+# the transcode finishes, and the sub_ocr the sweep queues five minutes later
+# - and any subs fix after that - went in at the backlog's priority (Erik,
+# 2026-10-25: "an imported/upgraded file should be fully processed and
+# watchable as soon as possible after it lands, subs and all"). first_seen is
+# when nuarr took the file in and is never updated, so an upgrade - a new arr
+# file id, a new row - is fresh again; a re-scan of an old file is not.
+FRESH_S = 24 * 3600.0
 
 # AND WITHIN THAT BAND, THE NEWEST ARRIVAL FIRST. Two files both waiting to
 # be processed are not equal: the one that landed ten minutes ago is the one
@@ -719,8 +727,8 @@ FRESH_TIEBREAK = (f"CASE WHEN j.priority <= {FRESH_PRIORITY} "
                   f"THEN -COALESCE(f.first_seen, 0) ELSE j.created_at END")
 
 
-def _fresh_priority(state: str, priority: int) -> int:
-    if (state or "") in FRESH_STATES:
+def _fresh_priority(state: str, priority: int, first_seen: float = 0.0) -> int:
+    if (state or "") in FRESH_STATES or float(first_seen or 0) > time.time() - FRESH_S:
         return min(int(priority), FRESH_PRIORITY)
     return int(priority)
 
@@ -739,8 +747,10 @@ def lift_fresh() -> int:
                 "UPDATE jobs SET priority=? WHERE state='queued' "
                 "  AND priority > ? AND file_id IN "
                 "  (SELECT id FROM files WHERE state IN "
-                f"   ({','.join('?' * len(FRESH_STATES))}))",
-                (FRESH_PRIORITY, FRESH_PRIORITY, *FRESH_STATES)).rowcount
+                f"   ({','.join('?' * len(FRESH_STATES))}) "
+                "   OR COALESCE(first_seen, 0) > ?)",
+                (FRESH_PRIORITY, FRESH_PRIORITY, *FRESH_STATES,
+                 time.time() - FRESH_S)).rowcount
         return int(n or 0)
     except Exception:                                        # noqa: BLE001
         return 0
@@ -1762,13 +1772,15 @@ def enqueue_many(rows: list, kind: str, priority: int = 50,
                 f"  AND file_id IN ({q})", chunk)}
         titles: dict = {}
         states: dict = {}
+        seen: dict = {}
         for i in range(0, len(ids), 900):
             chunk = ids[i:i + 900]
             q = ",".join("?" * len(chunk))
             for x in cur.execute(
-                    f"SELECT id, title, season, episode, state, path FROM files "
+                    f"SELECT id, title, season, episode, state, path, first_seen FROM files "
                     f" WHERE id IN ({q})", chunk):
                 states[int(x["id"])] = x["state"] or ""
+                seen[int(x["id"])] = float(x["first_seen"] or 0)
                 if x["title"]:
                     titles[int(x["id"])] = display_label(
                         x["title"], x["season"], x["episode"], x["path"])
@@ -1781,7 +1793,7 @@ def enqueue_many(rows: list, kind: str, priority: int = 50,
                 continue
             live.add(fid)
             batch.append((uuid.uuid4().hex[:12], fid, kind, "queued",
-                          _fresh_priority(states.get(fid, ""), priority),
+                          _fresh_priority(states.get(fid, ""), priority, seen.get(fid, 0.0)),
                           pool, r["path"],
                           titles.get(fid)
                           or (r.get("name") if not str(r.get("name") or "").startswith("(untitled)") else "")
@@ -2131,10 +2143,10 @@ async def enqueue(file_id: int, path: str, title: str = "",
             # See FRESH_PRIORITY: a file waiting to be processed goes ahead of
             # the backlog of files that already have been.
             try:
-                _st = cur.execute("SELECT state FROM files WHERE id=?",
+                _st = cur.execute("SELECT state, first_seen FROM files WHERE id=?",
                                   (file_id,)).fetchone()
                 priority = _fresh_priority(_st["state"] if _st else "",
-                                           priority)
+                                           priority, _st["first_seen"] if _st else 0.0)
             except Exception:                                # noqa: BLE001
                 pass
             cur.execute(
@@ -2995,7 +3007,11 @@ def _claim(pool: str) -> Job | None:
                 terms.append(f"CASE f.pool_disk {cases} ELSE 0 END")
                 for d, n in busy_rank.items():
                     params += [d, n]
-            ordr = ", ".join(terms + ["j.priority", FRESH_TIEBREAK])
+            # A FRESH FILE IS NOT BALANCED AWAY. The disk terms spread the
+            # backlog across spindles; a file that landed today goes first
+            # whichever disk it landed on (capacity still caps the pool).
+            ordr = ", ".join([f"CASE WHEN j.priority <= {FRESH_PRIORITY} THEN 0 ELSE 1 END"]
+                             + terms + ["j.priority", FRESH_TIEBREAK])
             return cur.execute(base + where_extra + f"ORDER BY {ordr} LIMIT 1",
                                tuple(params)).fetchone()
 

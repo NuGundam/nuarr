@@ -3448,7 +3448,11 @@ def sweep_pick(limit: int) -> list[dict]:
             # was written against was closed in embed() - see the note there.
             "AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.file_id=f.id "
             "  AND j.kind='sub_ocr' AND j.state='done' "
-            "  AND COALESCE(j.finished_at,0) >= p.at)")
+            "  AND COALESCE(j.finished_at,0) >= p.at) "
+            # THE NEWEST ARRIVAL FIRST, so a file that landed today is in the
+            # picked set on the first pass instead of whenever the scan
+            # happens to reach it (see jobs.FRESH_S).
+            "ORDER BY COALESCE(f.first_seen, 0) DESC")
         for r in rows:
             if len(picked) >= limit:
                 break
