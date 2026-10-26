@@ -1,3 +1,8 @@
-﻿pipeline/random: +j.state so the planner walks ids, not the state index (300 ms -> 0.2 ms)
+﻿Dashboard: Plex ticker writes only what changed; scroll-keeper idle at the top
+
+Measured in headless Edge: JS was 90% idle yet the page did ~60 layouts/s -
+the now-playing ticker rewrote five text nodes per card four times a second
+whether or not the text changed, and the scroll-keeper queued a frame with a
+forced layout after every DOM write even at the top of the page.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

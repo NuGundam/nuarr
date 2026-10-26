@@ -18101,7 +18101,9 @@ document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) setTime
   const start=()=>{
     pick();
     new MutationObserver(()=>{
-      if(queued) return;
+      // nothing to hold at the top of the page - and every poll's rewrite
+      // lands here, so this is the common case, not the rare one
+      if(queued || !anc || window.scrollY < 40) return;
       queued=true;
       requestAnimationFrame(hold);
     }).observe(document.body, {childList:true, subtree:true});
@@ -33126,9 +33128,13 @@ function pxTick(){
     const pct = c.querySelector('.pxpct');
     const clk = c.querySelector('.pxclock');
     const led = c.querySelector('.pxlead');
-    if(bar) bar.style.width = n.pct.toFixed(2)+'%';
-    if(pct) pct.textContent = n.pct.toFixed(0)+'%';
-    if(clk) clk.textContent = n.dur ? pxTime(n.off)+' / '+pxTime(n.dur) : '';
+    // WRITE ONLY WHAT CHANGED. Each write is a DOM mutation, a style recalc
+    // and a layout; this ticks four times a second per card and the clock
+    // text changes once a second, the percentage far less.
+    const _w=(el,k,v)=>{ if(el && el[k]!==v) el[k]=v; };
+    if(bar){ const w=n.pct.toFixed(2)+'%'; if(bar.style.width!==w) bar.style.width=w; }
+    _w(pct,'textContent', n.pct.toFixed(0)+'%');
+    _w(clk,'textContent', n.dur ? pxTime(n.off)+' / '+pxTime(n.dur) : '');
     // THE LEAD DRAINS IN REAL TIME between polls. The server's figure is a
     // snapshot at fetch; while the stream plays, every second watched is a
     // second spent from the buffer, so the display pays it out continuously
@@ -33140,7 +33146,7 @@ function pxTick(){
       const spent = Math.max(0, (n.off - (s.offset_ms||0))/1000);
       leadNow = Math.max(0, leadNow - spent);
     }
-    if(led) led.innerHTML = pxLead(s, leadNow);
+    if(led){ const h=pxLead(s, leadNow); if(led.innerHTML!==h) led.innerHTML=h; }
     // the lighter band behind the bar: position + buffered-ahead, whether
     // that lead is the encoder's (reported) or the client's (estimated)
     const band = c.querySelector('.pxbar b');
