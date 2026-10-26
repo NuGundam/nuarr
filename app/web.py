@@ -33367,7 +33367,13 @@ function pxRate(n){
   // 1500 matches the server's own session-cache TTL - polling faster than
   // that reads the same snapshot twice. Idle drops to 4s so a stream that
   // starts appears within a breath rather than after six seconds.
-  const want = n ? 1500 : 4000;
+  // SLOWER WHEN NOTHING MOVES (2026-10-26): nobody watching = 10 s - a new
+  // stream shows up within ten seconds, which is soon enough for a card that
+  // only reports it; every stream paused = 5 s, nothing on the card moves.
+  const all = (_pxRows||[]);
+  const want = !n ? 10000
+             : (all.length && all.every(s=>{ try{ return pxPaused(s); }catch(_){ return false; } })) ? 5000
+             : 1500;
   if(want === _pxRate || document.hidden) { _pxRate = want; return; }
   _pxRate = want;
   clearInterval(_pxPollTimer);
