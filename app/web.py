@@ -7094,6 +7094,14 @@ async def api_not_landed_rescan(file_id: int):
             "streams": len(data.get("streams") or [])}
 
 
+@app.get("/api/pipeline/route")
+def api_pipeline_route(file_id: int = 0):
+    """One file's route alone - the tour and the trace ask for this, not
+    for the whole graph again."""
+    from . import pipeline
+    return {"route": pipeline.route(int(file_id or 0))}
+
+
 @app.get("/api/pipeline/random")
 def api_pipeline_random():
     r"""One file for the auto tour, biased toward interesting journeys.
@@ -38009,23 +38017,24 @@ async function nlAll(what){
 // reads. This function knows nothing about subtitles or codecs; it draws
 // whatever it is handed. That is the only way a diagram stays true after
 // someone changes a threshold.
+//
+// DRAWN ONCE, COUNTED OFTEN. The shell (search box, tour button, trace box)
+// and the SVGs are built once; the poll only rewrites the count texts in
+// place. The old page rebuilt everything every eight seconds, which threw
+// away what you were typing and restarted every animation.
 let _pipe=null, _pipeRoute=null, _pipeTimer=null;
-let _pipeQ='', _pipeCycle=true, _pipeCycleT=null;
+let _pipeQ='', _pipeCycle=true, _pipeCycleT=null, _pipeShell=false;
 
-// THE TOUR. An empty diagram teaches the shape but not that anything travels
-// it, so with no file chosen it walks real ones, ten seconds apart. It stops
-// the moment you type or click a result - a demo that keeps interrupting the
-// thing you asked for is worse than no demo - and the button says which state
-// it is in rather than what it will do.
 function pipeCycleToggle(){
   _pipeCycle=!_pipeCycle;
   if(_pipeCycle) pipeCycleTick(true); else clearTimeout(_pipeCycleT);
-  pipeDraw();
+  pipeHeader();
 }
 function pipeCycleStop(){
   _pipeCycle=false;
   clearTimeout(_pipeCycleT);
   _pipeCycleT=null;
+  pipeHeader();
 }
 async function pipeCycleTick(now){
   clearTimeout(_pipeCycleT);
@@ -38036,9 +38045,8 @@ async function pipeCycleTick(now){
     try{
       const d=await fetch('/api/pipeline/random').then(r=>r.json());
       if(d && d.file_id){
-        const g=await fetch('/api/pipeline?file_id='+d.file_id).then(r=>r.json());
-        // A late arrival must not stomp a file the user has since chosen.
-        if(_pipeCycle){ _pipe=g; _pipeRoute=g.route||null; pipeDraw(); }
+        const g=await fetch('/api/pipeline/route?file_id='+d.file_id).then(r=>r.json());
+        if(_pipeCycle){ _pipeRoute=g.route||null; pipeDrawGraphs(); }
       }
     }catch(e){}
   }
@@ -38048,47 +38056,32 @@ async function pipeCycleTick(now){
 async function loadProcess(){
   const el=document.getElementById('processBody');
   if(!el) return;
+  _pipeShell=false;
   try{ _pipe=await fetch('/api/pipeline').then(r=>r.json()); }
   catch(e){ el.innerHTML='<div class="dim">could not load</div>'; return; }
   pipeDraw();
   pipeCycleTick(false);
   if(_pipeTimer) clearInterval(_pipeTimer);
-  // Counts move slowly; the animation is CSS and does not need the poll.
   _pipeTimer=setInterval(async()=>{
     const box=document.getElementById('processBody');
     if(!box || box.offsetParent===null){ clearInterval(_pipeTimer); _pipeTimer=null; return; }
     try{
-      const keep=_pipeRoute;
       _pipe=await fetch('/api/pipeline').then(r=>r.json());
-      _pipeRoute=keep;
-      pipeDraw();
+      pipeCounts();
     }catch(e){}
-  }, 8000);
+  }, 15000);
 }
 
-// Grid -> pixels. Kept here rather than in the payload so the layout can be
-// retuned without the server having an opinion about pixel geometry.
-// GAP BEFORE WIDTH. The first pass gave the columns 248px on 190px boxes,
-// leaving 58px for edge labels like "picture must be rebuilt" - so the text
-// overhung the boxes on both sides and the diagram read as broken. The gap is
-// what the labels live in, so it is sized first (150px), and the label is
-// truncated to what actually fits rather than trusted to be short.
-const _PIPE_W=196, _PIPE_H=56, _PIPE_GX=346, _PIPE_GY=104, _PIPE_PAD=16;
-const _PIPE_GAP=_PIPE_GX-_PIPE_W;
-// A SECOND GEOMETRY, FOR A CHAIN RATHER THAN A FAN. The order graph is seven
-// boxes in a straight line: at the main grid that is 2,304px, which the page
-// then scales into the panel and takes every label down with it - 12px became
-// 8. Narrower boxes and a shorter gap fit the same seven across without
-// scaling, and a chain needs no room for branch labels.
-const _PIPE_TIGHT={w:158, h:52, gx:232, gy:92, pad:14};
-const _PIPE_WIDE ={w:_PIPE_W, h:_PIPE_H, gx:_PIPE_GX, gy:_PIPE_GY, pad:_PIPE_PAD};
+// Grid -> pixels. Two geometries: a wide left-to-right one for the small
+// graphs, and a top-down one for the main chart, where the gap between rows
+// is what the branch labels live in.
+const _PIPE_WIDE ={w:196, h:56, gx:346, gy:104, pad:16, dir:'right'};
+const _PIPE_TIGHT={w:158, h:52, gx:232, gy:92, pad:14, dir:'right'};
+const _PIPE_DOWN ={w:204, h:54, gx:250, gy:96, pad:16, dir:'down'};
 function pipeXY(n, g){
   g = g || _PIPE_WIDE;
   return {x:g.pad+n.col*g.gx, y:g.pad+n.row*g.gy};
 }
-// The drawn width of a graph, so the wrapper can be given a definite size.
-// An inline-block sized by a child's max-width collapses instead of measuring,
-// which is how the centred pair ended up squeezed into a column.
 function pipeWidth(g, geo){
   geo = geo || _PIPE_WIDE;
   const maxCol=Math.max(...(g.nodes||[{col:0}]).map(n=>n.col));
@@ -38097,18 +38090,36 @@ function pipeWidth(g, geo){
 function pipeNodeColor(n){
   if(n.kind==='pool')  return poolColor(n.pool||'');
   if(n.kind==='bad')   return 'var(--bad)';
-  // A check holding findings is amber whatever it is called; a check holding
-  // none is green. Same box, and the colour is the count rather than a
-  // property of the check - which is the point, since all six go quiet.
   if(n.kind==='warn')  return 'var(--warn)';
   if(n.kind==='gate')  return 'var(--warn)';
   if(n.kind==='idle')  return 'var(--dim)';
   if(n.kind==='source')return '#6fb0ff';
+  if(n.kind==='lane')  return '#8b949e';
   return 'var(--ok)';
+}
+// Where an edge leaves A and enters B. Right-to-left graphs: side to side.
+// Top-down graphs: bottom to top when B is below, side to side on one row,
+// and round the outside when B is above (a back edge).
+function pipePorts(A, B, geo){
+  const p=pipeXY(A, geo), q=pipeXY(B, geo);
+  if(geo.dir!=='down')
+    return {x1:p.x+geo.w, y1:p.y+geo.h/2, x2:q.x, y2:q.y+geo.h/2, v:false};
+  if(B.row>A.row+1 && B.col===A.col){
+    // a jump over the row between: round the outside, not through the box
+    const l=A.col===0 || (A.col<=B.col && A.col>0);
+    return {x1:l?p.x:p.x+geo.w, y1:p.y+geo.h/2, x2:l?q.x:q.x+geo.w, y2:q.y+geo.h/2, v:false, back:true, side:l?-1:1};
+  }
+  if(B.row>A.row)
+    return {x1:p.x+geo.w/2, y1:p.y+geo.h, x2:q.x+geo.w/2, y2:q.y, v:true};
+  if(B.row===A.row){
+    const l=B.col>A.col;
+    return {x1:l?p.x+geo.w:p.x, y1:p.y+geo.h/2, x2:l?q.x:q.x+geo.w, y2:q.y+geo.h/2, v:false};
+  }
+  const l=B.col<A.col;                           // back edge: go round
+  return {x1:l?p.x:p.x+geo.w, y1:p.y+geo.h/2, x2:l?q.x+geo.w:q.x, y2:q.y+geo.h/2, v:false, back:true};
 }
 function pipeSvg(g, route, idPrefix, geo){
   geo = geo || _PIPE_WIDE;
-  const GAP = geo.gx - geo.w;
   const nodes=g.nodes, edges=g.edges;
   const byId={}; nodes.forEach(n=>byId[n.id]=n);
   const maxCol=Math.max(...nodes.map(n=>n.col));
@@ -38121,15 +38132,25 @@ function pipeSvg(g, route, idPrefix, geo){
     const i=route.indexOf(a), j=route.indexOf(b);
     return i>=0&&j>=0&&j===i+1;
   };
-  // Edges first so boxes sit on top of the lines.
-  let svg='';
+  let svg='', labels='';
   edges.forEach((e,i)=>{
     const A=byId[e.a], B=byId[e.b];
     if(!A||!B) return;
-    const p=pipeXY(A, geo), q=pipeXY(B, geo);
-    const x1=p.x+geo.w, y1=p.y+geo.h/2, x2=q.x, y2=q.y+geo.h/2;
-    const mx=(x1+x2)/2;
-    const d=`M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`;
+    const P=pipePorts(A,B,geo);
+    let d, lx, ly;
+    if(P.back){
+      const sx=P.side? P.side*150 : (P.x1<P.x2? -40 : 40);
+      d=`M ${P.x1} ${P.y1} C ${P.x1+sx} ${P.y1}, ${P.x2-sx} ${P.y2}, ${P.x2} ${P.y2}`;
+      lx=(P.x1+P.x2)/2+(P.side?P.side*40:0); if(P.side) ly-=14; ly=(P.y1+P.y2)/2;
+    }else if(P.v){
+      const my=(P.y1+P.y2)/2;
+      d=`M ${P.x1} ${P.y1} C ${P.x1} ${my}, ${P.x2} ${my}, ${P.x2} ${P.y2}`;
+      lx=(P.x1+P.x2)/2; ly=my;
+    }else{
+      const mx=(P.x1+P.x2)/2;
+      d=`M ${P.x1} ${P.y1} C ${mx} ${P.y1}, ${mx} ${P.y2}, ${P.x2} ${P.y2}`;
+      lx=mx; ly=(P.y1+P.y2)/2-7;
+    }
     const isLit=lit(e.a,e.b);
     const dim=e.muted&&!isLit;
     svg+=`<path id="${idPrefix}p${i}" d="${d}" fill="none"
@@ -38137,18 +38158,16 @@ function pipeSvg(g, route, idPrefix, geo){
        stroke-width="${isLit?2.4:1.4}"
        ${isLit?'':'stroke-dasharray="'+(dim?'3 4':'0')+'"'}/>`;
     if(e.label){
-      // ~5.1px per character at 9.5px in this face; clip to the gap so a long
-      // condition never reaches out over the boxes either side of it.
-      const room=Math.max(8, Math.floor(GAP/5.1));
+      const room = geo.dir==='down' ? 34 : Math.max(8, Math.floor((geo.gx-geo.w)/5.1));
       const txt=e.label.length>room ? e.label.slice(0,room-1)+'…' : e.label;
-      svg+=`<text x="${mx}" y="${(y1+y2)/2-7}" text-anchor="middle"
-         font-size="9.5" fill="${isLit?'#6fb0ff':'var(--dim)'}"
-         style="pointer-events:none"><title>${esc(e.label)}</title>${
-         esc(txt)}</text>`;
+      const tw=txt.length*5.3+10;
+      // a pill behind the words so a label over a line stays readable
+      labels+=`<g style="pointer-events:none"><title>${esc(e.label)}</title>
+         ${geo.dir==='down'?`<rect x="${lx-tw/2}" y="${ly-8}" width="${tw}" height="15" rx="7"
+            fill="#0d1117" opacity="0.92"/>`:''}
+         <text x="${lx}" y="${ly+(geo.dir==='down'?3.5:0)}" text-anchor="middle"
+         font-size="9.5" fill="${isLit?'#6fb0ff':'var(--dim)'}">${esc(txt)}</text></g>`;
     }
-    // AMBIENT FLOW. A dot per edge, its speed set by how much traffic the
-    // edge carries - so a busy path visibly runs faster than a quiet one
-    // rather than everything moving at one meaningless rate.
     const vol=Math.max(0, e.n||0);
     if(vol>0 && !dim){
       const dur=Math.max(1.6, 6.5-Math.log10(vol+1)*1.4);
@@ -38159,9 +38178,19 @@ function pipeSvg(g, route, idPrefix, geo){
            <mpath href="#${idPrefix}p${i}"/></animateMotion></circle>`;
     }
   });
+  svg+=labels;
   nodes.forEach(n=>{
     const p=pipeXY(n, geo), c=pipeNodeColor(n);
     const isOn=on.has(n.id);
+    if(n.kind==='lane'){
+      // a lane heading: no box, a rule under the words spanning two columns
+      svg+=`<g style="cursor:help"><title>${esc(n.note||'')}</title>
+        <text x="${p.x}" y="${p.y+16}" font-size="12.5" font-weight="700"
+          fill="#c9d1d9" letter-spacing="0.4">${esc(n.label).toUpperCase()}</text>
+        <line x1="${p.x}" y1="${p.y+24}" x2="${p.x+geo.gx*2-(geo.gx-geo.w)}" y2="${p.y+24}"
+          stroke="#2a313a" stroke-width="1"/></g>`;
+      return;
+    }
     svg+=`<g class="pipeNode" style="cursor:help">
       <title>${esc(n.note||'')}</title>
       <rect x="${p.x}" y="${p.y}" width="${geo.w}" height="${geo.h}" rx="9"
@@ -38171,119 +38200,125 @@ function pipeSvg(g, route, idPrefix, geo){
       <text x="${p.x+11}" y="${p.y+(geo.h>54?22:20)}" font-size="12"
         font-weight="600" fill="${isOn?'#cfe6ff':c}">${esc(n.label)}</text>
       ${n.count===null||n.count===undefined?'':
-        `<text x="${p.x+11}" y="${p.y+(geo.h>54?40:38)}" font-size="11.5"
+        `<text id="${idPrefix}n_${esc(n.id)}" x="${p.x+11}" y="${p.y+(geo.h>54?40:38)}" font-size="11.5"
            fill="var(--dim)">${fmt(n.count)}</text>`}
     </g>`;
   });
   return `<svg viewBox="0 0 ${W} ${H}" width="100%"
      style="max-width:${W}px;height:auto;overflow:visible">${svg}</svg>`;
 }
-function pipeDraw(){
-  const el=document.getElementById('processBody');
-  if(!el||!_pipe) return;
+// The poll's whole job: new numbers into the texts already on the page, and
+// the notes (which quote the numbers) refreshed on the boxes.
+function pipeCounts(){
+  if(!_pipe) return;
+  [['a',_pipe],['o',_pipe.order],['b',_pipe.sub]].forEach(([pre,g])=>{
+    if(!g) return;
+    (g.nodes||[]).forEach(n=>{
+      const t=document.getElementById(pre+'n_'+n.id);
+      if(t && n.count!==null && n.count!==undefined){
+        const v=fmt(n.count);
+        if(t.textContent!==v) t.textContent=v;
+        const ttl=t.parentNode && t.parentNode.querySelector('title');
+        if(ttl && ttl.textContent!==(n.note||'')) ttl.textContent=n.note||'';
+      }
+    });
+  });
+}
+function pipeHeader(){
+  const b=document.getElementById('pipeTourBtn');
+  if(b){
+    b.textContent=_pipeCycle?'⏸ Pause tour':'▶ Auto tour';
+    b.title=_pipeCycle?'stop picking a new file every ten seconds':'show a different real file every ten seconds';
+  }
+  pipeTrace_();
+}
+function pipeTrace_(){
+  const el=document.getElementById('pipeTraceBox');
+  if(!el) return;
   const r=_pipeRoute;
-  // THE TRACE BOX ALWAYS OCCUPIES THE SAME SPACE. Its height varies with the
-  // number of steps - four for a file that went straight through, nine for one
-  // that took the subtitle branch - and the auto tour changes files every ten
-  // seconds. Letting it size to its content made the diagram beneath it jump
-  // up and down while you were looking at it. So the box is a fixed height and
-  // the empty state lives inside it rather than collapsing it to nothing.
-  const trace = r && r.found ? `
+  el.innerHTML = r && r.found ? `
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <b style="color:#6fb0ff">${esc(r.title||'')}</b>
         <span class="dim" style="font-size:11px">${esc(r.library||'')}</span>
         <button style="margin-left:auto;font-size:11px;padding:2px 8px"
           onclick="pipeClear()">Clear trace</button>
       </div>
-      <div style="margin-top:6px;font-size:11.5px;overflow:auto;
-                  max-height:132px">
+      <div style="margin-top:6px;font-size:11.5px;overflow:auto;max-height:132px">
         ${(r.steps||[]).map(s=>`<div style="padding:1px 0">
            <span class="dim" style="display:inline-block;min-width:96px">
              ${esc(s[0])}</span> ${esc(s[1])}</div>`).join('')}
       </div>`
-    : `<div class="dim" style="font-size:11.5px;display:flex;
-             align-items:center;height:100%">
+    : `<div class="dim" style="font-size:11.5px;display:flex;align-items:center;height:100%">
          ${_pipeCycle
            ? 'Touring real files — a different one every ten seconds. '
              +'Search a title, or pause the tour, to hold one still.'
            : 'Search a title above to trace one file, or start the tour to '
              +'watch real ones go through.'}
        </div>`;
+}
+function pipeDrawGraphs(){
+  const el=document.getElementById('pipeGraphs');
+  if(!el||!_pipe) return;
+  const r=_pipeRoute;
+  const W=Math.max(pipeWidth(_pipe,_PIPE_DOWN),
+                   _pipe.order?pipeWidth(_pipe.order,_PIPE_TIGHT):0, pipeWidth(_pipe.sub));
   el.innerHTML=`
-    <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;
-                flex-wrap:wrap">
-      <input id="pipeQ" placeholder="trace a file — type part of a title"
-        oninput="pipeFind()" value="${esc(_pipeQ||'')}"
-        style="flex:1;min-width:220px;max-width:360px"/>
-      <button onclick="pipeCycleToggle()" style="font-size:11px;padding:2px 9px"
-        title="${_pipeCycle
-          ? 'stop picking a new file every ten seconds'
-          : 'show a different real file every ten seconds'}"
-        >${_pipeCycle?'⏸ Pause tour':'▶ Auto tour'}</button>
-      <span class="dim" style="font-size:11px">${esc(_pipe.engine||'')} ·
-        OCR on ${(_pipe.libraries||[]).length} librar${
-          (_pipe.libraries||[]).length===1?'y':'ies'}</span>
-    </div>
-    <div id="pipeHits"></div>
-    <div class="lkind" style="padding:9px 12px;margin-bottom:10px;
-                              height:170px;box-sizing:border-box;
-                              overflow:hidden">${trace}</div>
-    <!-- Centred AS A PAIR, not one each. The subtitle graph is narrower, so
-         centring it on its own would slide its columns out of line with the
-         main one directly above it - and the two reading as one picture is
-         most of why they are on the same page. -->
     <div style="overflow-x:auto;display:flex;justify-content:center">
-      <div style="width:${Math.max(pipeWidth(_pipe),
-                    _pipe.order?pipeWidth(_pipe.order,_PIPE_TIGHT):0,
-                    _pipe.checks?pipeWidth(_pipe.checks):0)}px;max-width:100%;flex:0 0 auto">
+      <div style="width:${W}px;max-width:100%;flex:0 0 auto">
         <div class="lkindhead" style="margin:2px 0 2px"><b style="color:#6fb0ff">
-          1 · A file nuarr has never seen — start to finish</b></div>
-        <div class="dim" style="font-size:11.5px;margin:0 0 8px;max-width:820px">
-          Left to right, once. An arr imports it, nuarr waits out the settle
-          hold in case it is still being written, four systems answer the
-          questions the plan is built from, the rules decide, and either there
-          is nothing to do — the commonest outcome — or one worker rewrites it
-          and the result is written back over the original. A file that has
-          just landed outranks the backlog at every step.</div>
-        ${pipeSvg(_pipe, r?r.path:null, 'a', _PIPE_TIGHT)}
+          1 · Two ways onto the line, one line to watchable</b></div>
+        <div class="dim" style="font-size:11.5px;margin:0 0 8px;max-width:860px">
+          Top to bottom. On the left, a file the arrs have just imported or
+          upgraded: it rides the fresh band for a day — every job on it ahead
+          of the backlog, newest first, whichever disk it is on — through the
+          facts, the rewrite, the OCR, the Subtitle maker and the fixes, until
+          it is watchable. On the right, a file already in the library: six
+          standing checks and a rule change put it back on the same line, at
+          the backlog's priority, behind anything that landed today. The two
+          lanes meet at <b>Ready to plan</b>.</div>
+        ${pipeSvg(_pipe, r?r.path:null, 'a', _PIPE_DOWN)}
         ${(_pipe.order&&(_pipe.order.nodes||[]).length)?`
         <div class="lkindhead" style="margin:18px 0 2px"><b style="color:#6fb0ff">
-          2 · The order those four are asked in — and why it is an order</b></div>
-        <div class="dim" style="font-size:11.5px;margin:0 0 8px;max-width:820px">
-          Seven systems feed the one queue and each decides on its own what to
-          do to a file. Nothing stopped them doing it in the wrong order, and
-          the wrong order is how the same file gets rewritten three times: the
-          rewrite keeps and drops audio by its language tags, so a tag that is
-          wrong gives a wrong plan and the listener finds it afterwards; the
-          OCR reads a picture track for a minute and the rewrite then drops it;
-          a subtitle fix is planned against tracks the rewrite moves. So a job
-          of one kind is not queued for a file while an earlier kind still owes
-          an answer on it — and the thing it is waiting for jumps to the front
-          of its own queue. Nothing starves: a paused pool is not owed, and a
-          file that has waited six hours goes anyway.</div>
+          2 · The order the systems take a file in — and why it is an order</b></div>
+        <div class="dim" style="font-size:11.5px;margin:0 0 8px;max-width:860px">
+          Eight systems feed the one queue. The wrong order is how a file gets
+          rewritten three times: the rewrite keeps and drops audio by its tags,
+          so a wrong tag gives a wrong plan; the OCR reads a track for a minute
+          and the rewrite drops it; the maker embeds into a file the rewrite is
+          about to replace. So a job of one kind is not queued while an earlier
+          kind still owes an answer on the file, one job per file at a time, and
+          the thing it waits for jumps to the front of its own queue. Nothing
+          starves: a paused pool is not owed, and six hours' wait goes anyway.</div>
         ${pipeSvg(_pipe.order, null, 'o', _PIPE_TIGHT)}`:''}
         <div class="lkindhead" style="margin:18px 0 6px"><b style="color:#6fb0ff">
           3 · Picture subtitles — the one branch with a measurement behind it</b></div>
         ${pipeSvg(_pipe.sub, r?r.sub_path:null, 'b')}
-        ${_pipe.checks?`
-        <div class="lkindhead" style="margin:18px 0 2px"><b style="color:#6fb0ff">
-          4 · A file already in the library — what puts it back on that line</b></div>
-        <div class="dim" style="font-size:11.5px;margin:0 0 8px;max-width:820px">
-          Picture 1 happens once. Everything after it is this: a committed file
-          is not finished, it is just correct <i>for now</i>. Six checks keep
-          looking — on their own clocks, over files committed weeks ago,
-          because a file can stop being what it claims to be long after nuarr
-          last touched it — and three of them are the same systems picture 2
-          orders, asked again months later. A rule you change and an upgrade
-          the arr lands need no check at all. Every road ends in the same
-          place: one remedy layer with one policy table and one hourly budget,
-          and then the file re-enters picture 1 at <b>Ready to plan</b> and is
-          planned from what it is now.</div>
-        ${pipeSvg(_pipe.checks, null, 'c')}`:''}
       </div>
     </div>`;
 }
-function pipeClear(){ _pipeRoute=null; _pipeQ=''; pipeDraw(); }
+function pipeDraw(){
+  const el=document.getElementById('processBody');
+  if(!el||!_pipe) return;
+  if(!_pipeShell){
+    el.innerHTML=`
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+      <input id="pipeQ" placeholder="trace a file — type part of a title"
+        oninput="pipeFind()" value="${esc(_pipeQ||'')}"
+        style="flex:1;min-width:220px;max-width:360px"/>
+      <button id="pipeTourBtn" onclick="pipeCycleToggle()" style="font-size:11px;padding:2px 9px"></button>
+      <span class="dim" style="font-size:11px">${esc(_pipe.engine||'')} ·
+        OCR on ${(_pipe.libraries||[]).length} librar${(_pipe.libraries||[]).length===1?'y':'ies'}</span>
+    </div>
+    <div id="pipeHits"></div>
+    <div id="pipeTraceBox" class="lkind" style="padding:9px 12px;margin-bottom:10px;
+         height:170px;box-sizing:border-box;overflow:hidden"></div>
+    <div id="pipeGraphs"></div>`;
+    _pipeShell=true;
+  }
+  pipeHeader();
+  pipeDrawGraphs();
+}
+function pipeClear(){ _pipeRoute=null; _pipeQ=''; const q=document.getElementById('pipeQ'); if(q) q.value=''; pipeHeader(); pipeDrawGraphs(); }
 let _pipeFindT=null;
 function pipeFind(){
   // Typing is an explicit ask; the tour steps aside for it.
@@ -38310,9 +38345,9 @@ function pipeFind(){
 async function pipeTrace(id){
   pipeCycleStop();
   try{
-    const d=await fetch('/api/pipeline?file_id='+id).then(r=>r.json());
-    _pipe=d; _pipeRoute=d.route||null;
-    pipeDraw();
+    const d=await fetch('/api/pipeline/route?file_id='+id).then(r=>r.json());
+    _pipeRoute=d.route||null;
+    pipeHeader(); pipeDrawGraphs();
     const box=document.getElementById('pipeHits'); if(box) box.innerHTML='';
   }catch(e){}
 }

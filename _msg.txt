@@ -1,9 +1,19 @@
-﻿Fresh band follows a file for 24 h - subs and all
+﻿How files flow: top-down two-lane chart, page loads in milliseconds
 
-- jobs._fresh_priority: eligible OR first_seen within FRESH_S (24 h), so
-  sub_ocr and subs jobs queued after the transcode flips the file to done
-  still take the fresh band; enqueue/enqueue_many/lift_fresh carry first_seen
-- jobs._claim: a fresh-band job sorts ahead of the disk-balance terms
-- subocr.sweep_pick: newest arrivals first
+- pipeline.graph(): picture 1 is top-down. Lane A "Imported or upgraded"
+  (an upgrade is a new arr file id, so a new file) rides the fresh band for
+  24 h; lane B "Already in the library" (six standing checks, a rule change,
+  the remedy verbs) re-enters behind it. Both meet at Ready to plan, then
+  the four facts, plan, gate, encode/passthrough, commit, Subtitle OCR /
+  Subtitle maker / Subtitle fixes, Watchable. Fresh-band counts added.
+- pipeline._slow(): the historical counts (1.5-2.5 s together) memoised
+  5 min; the live graph builds in ~0.2 s.
+- route(): lights the new node ids (fresh, elig, f_*, submake, subs, watch).
+- /api/pipeline/route serves one file's route alone (tour + trace).
+- the page shell is drawn once; the 15 s poll rewrites count texts in
+  place, so typing in the trace box is never lost and the animations never
+  restart. pipeSvg draws dir:'down' graphs with pill labels and side
+  detours for jumps over a row.
+- the order chain names the Subtitle maker.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

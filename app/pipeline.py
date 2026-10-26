@@ -161,24 +161,68 @@ def _busy_pool(kind: str, rn: dict, qn: dict) -> int:
     return int(rn.get(pool, 0)) + int(qn.get(pool, 0))
 
 
+
+FRESH_S = 24 * 3600.0
+_SLOW = {"at": 0.0, "v": {}}
+_SLOW_TTL = 300.0
+
+
+def _slow() -> dict:
+    """The historical counts, memoised five minutes.
+
+    Together these cost 1.5-2.5 s - the DISTINCT over every done job alone
+    is 1.2 s - and the page polled them every eight seconds, so the page was
+    never faster than the slowest of them. They count things that change on
+    the scale of hours; five minutes is nothing on that scale."""
+    now = time.time()
+    if now - _SLOW["at"] < _SLOW_TTL and _SLOW["v"]:
+        return _SLOW["v"]
+    with cursor() as cur:
+        v = dict(
+            probed=_n(cur, "SELECT COUNT(*) FROM file_probes p JOIN files f ON f.id=p.file_id "
+                           "WHERE f.state NOT IN ('deleted','duplicate')"),
+            bad_now=_n(cur, """
+                SELECT COUNT(*) FROM files f
+                WHERE f.state NOT IN ('deleted','duplicate')
+                  AND (SELECT j.state FROM jobs j WHERE j.file_id = f.id
+                        ORDER BY j.id DESC LIMIT 1) IN ('failed','blocked')"""),
+            bad_ever=_n(cur, "SELECT COUNT(*) FROM jobs WHERE state IN ('failed','blocked')"),
+            d_enc=_n(cur, "SELECT COUNT(*) FROM jobs WHERE state='done' AND pool='encode'"),
+            d_pass=_n(cur, "SELECT COUNT(*) FROM jobs WHERE state='done' AND pool='passthrough'"),
+            d_sub=_n(cur, "SELECT COUNT(*) FROM jobs WHERE state='done' AND pool='subocr'"),
+            d_subs=_n(cur, "SELECT COUNT(*) FROM jobs WHERE state='done' AND pool='subs'"),
+            d_make=_n(cur, "SELECT COUNT(*) FROM jobs WHERE state='done' AND pool='submake'"),
+            files_done=_n(cur, """
+                SELECT COUNT(DISTINCT j.file_id) FROM jobs j JOIN files f ON f.id = j.file_id
+                 WHERE j.state='done' AND f.state NOT IN ('deleted','duplicate')"""),
+            skipped=_n(cur, """
+                SELECT COUNT(*) FROM files f
+                 WHERE f.state NOT IN ('deleted','duplicate')
+                   AND (SELECT j.state FROM jobs j WHERE j.file_id = f.id
+                         ORDER BY j.id DESC LIMIT 1) = 'skipped'"""),
+            skipped_ever=_n(cur, "SELECT COUNT(*) FROM jobs WHERE state='skipped'"),
+            ck_read=_n(cur, "SELECT COUNT(*) FROM integrity"),
+            ck_burn_seen=_n(cur, "SELECT COUNT(*) FROM hardsub"),
+            ck_marked=_n(cur, "SELECT COUNT(*) FROM hardsub WHERE marked=1"),
+            ck_heard=_n(cur, "SELECT COUNT(*) FROM audio_lang"),
+            shaped=_n(cur, "SELECT COUNT(DISTINCT file_id) FROM sub_shape"),
+            typeset=_n(cur, "SELECT COUNT(DISTINCT file_id) FROM sub_shape WHERE typeset=1"),
+        )
+    _SLOW.update(at=now, v=v)
+    return v
+
+
 def graph() -> dict:
-    """Nodes, edges, counts and labels. One pass over the database."""
+    """Nodes, edges, counts and labels. The live counts every call, the
+    historical ones from _slow()."""
     lab = _settings_labels()
+    S = _slow()
+    now = time.time()
     with cursor() as cur:
         live = _n(cur, "SELECT COUNT(*) FROM files "
                        "WHERE state NOT IN ('deleted','duplicate')")
-        probed = _n(cur, "SELECT COUNT(*) FROM file_probes p JOIN files f "
-                         "ON f.id=p.file_id "
-                         "WHERE f.state NOT IN ('deleted','duplicate')")
+        probed = S["probed"]
         unprobed = max(0, live - probed)
-        # EVERY POOL, NOT THREE OF THEM.
-        #
-        # The queue had encode, passthrough and subocr when this was drawn. It
-        # has eight pools now, and four of them answer questions ABOUT a file
-        # that the plan is then built from - they run BEFORE the rewrite, not
-        # beside it. Counting three of eight made the gate read 0 while 216
-        # files were waiting in it, which is the one number on this page that
-        # has to be true.
         live_by_pool: dict = {"queued": {}, "running": {}}
         try:
             for r in cur.execute(
@@ -190,121 +234,45 @@ def graph() -> dict:
         qn, rn = live_by_pool["queued"], live_by_pool["running"]
 
         def _busy(*pools) -> int:
-            """Outstanding work in these pools - queued and running together.
-
-            A running count alone is what made three boxes read 0 on a machine
-            with a full queue: at any instant most pools have nothing IN a
-            worker, and "how much of this is there to do" is the question a
-            box on a flow diagram is being asked.
-            """
             return sum(qn.get(p, 0) + rn.get(p, 0) for p in pools)
 
         q_all = sum(qn.values())
-        r_enc = _busy("encode")
-        r_pass = _busy("passthrough")
-        r_sub = _busy("subocr")
-        r_subs = _busy("subs")
-        # OUTSTANDING, NOT HISTORICAL. Counting every row that ever failed
-        # answered a question nobody asked: of 33 such rows here, 4 were fixed
-        # by a later pass and 14 belong to files that have since been deleted
-        # or replaced. Reporting 33 as if 33 things were broken is the way a
-        # number stops being believed. A file counts when it is still in the
-        # library AND its most recent job failed or was blocked - i.e. nothing
-        # has put it right since.
-        bad_now = _n(cur, """
-            SELECT COUNT(*) FROM files f
-            WHERE f.state NOT IN ('deleted','duplicate')
-              AND (SELECT j.state FROM jobs j
-                    WHERE j.file_id = f.id
-                    ORDER BY j.id DESC LIMIT 1) IN ('failed','blocked')""")
-        bad_ever = _n(cur, "SELECT COUNT(*) FROM jobs "
-                           "WHERE state IN ('failed','blocked')")
-        # THESE COUNT FILES, NOT JOBS. A file rewritten three times is one
-        # file, and putting 48,530 commits beside a library of 39,581 invites
-        # the reader to compare two numbers that do not belong on the same
-        # scale. The job totals are throughput and are kept for the edges,
-        # where "how much has flowed down this path" is the right question.
-        d_enc = _n(cur, "SELECT COUNT(*) FROM jobs WHERE state='done' "
-                        "AND pool='encode'")
-        d_pass = _n(cur, "SELECT COUNT(*) FROM jobs WHERE state='done' "
-                         "AND pool='passthrough'")
-        d_sub = _n(cur, "SELECT COUNT(*) FROM jobs WHERE state='done' "
-                        "AND pool='subocr'")
-        d_subs = _n(cur, "SELECT COUNT(*) FROM jobs WHERE state='done' "
-                         "AND pool='subs'")
-        jobs_done = d_enc + d_pass + d_sub + d_subs
-        files_done = _n(cur, """
-            SELECT COUNT(DISTINCT j.file_id) FROM jobs j JOIN files f
-              ON f.id = j.file_id
-             WHERE j.state='done'
-               AND f.state NOT IN ('deleted','duplicate')""")
-        # "Nothing to do" is a population too: files sitting there correct,
-        # not the number of times we have concluded that.
-        skipped = _n(cur, """
-            SELECT COUNT(*) FROM files f
-             WHERE f.state NOT IN ('deleted','duplicate')
-               AND (SELECT j.state FROM jobs j WHERE j.file_id = f.id
-                     ORDER BY j.id DESC LIMIT 1) = 'skipped'""")
-        skipped_ever = _n(cur, "SELECT COUNT(*) FROM jobs "
-                               "WHERE state='skipped'")
-        # THE TWO POPULATIONS THIS PAGE IS ABOUT.
-        #
-        # A file nuarr has never seen walks the line once, left to right. A
-        # file already in the library is not on that line at all until
-        # something puts it back on it. The page drew one graph starting at
-        # "In the library", which is neither: 39,782 files is not a thing that
-        # happens to a file.
+        r_enc, r_pass = _busy("encode"), _busy("passthrough")
+        r_sub, r_subs, r_make = _busy("subocr"), _busy("subs"), _busy("submake")
         n_new = _n(cur, "SELECT COUNT(*) FROM files WHERE state='new'")
         n_elig = _n(cur, "SELECT COUNT(*) FROM files WHERE state='eligible'")
-        # Back on the line because a rule changed or somebody asked, rather
-        # than because it has just arrived.
         n_again = _n(cur, "SELECT COUNT(*) FROM files WHERE state='eligible' "
                           "  AND requeued_at IS NOT NULL")
         n_first = max(0, n_elig - n_again)
-        # The subtitle branch, which is the part with a measurement behind it.
-        shaped = _n(cur, "SELECT COUNT(DISTINCT file_id) FROM sub_shape")
-        typeset = _n(cur, "SELECT COUNT(DISTINCT file_id) FROM sub_shape "
-                          "WHERE typeset=1")
-        dialogue = max(0, shaped - typeset)
-
-        # ---- the standing checks ---------------------------------------
-        # WHY THESE ARE A THIRD GRAPH AND NOT MORE BOXES ON THE FIRST.
-        #
-        # The pipeline above answers "what is nuarr going to do to this file".
-        # These answer "is this file what it claims to be" - and they run on
-        # their own clocks, over files that have already been committed, long
-        # after the pipeline has finished with them. Drawing them as another
-        # column would say they happen once, in order, on the way past. They
-        # do not: a file committed in March is re-examined tonight.
-        #
-        # What they have in common is where they END. Each used to have its
-        # own idea of what to do about a finding; they now all hand it to one
-        # remedy layer with one policy table and one hourly budget, and that
-        # convergence is the thing this picture exists to show.
-        #
-        # THREE OF THEM APPEAR TWICE ON THIS PAGE NOW, and that is not a
-        # duplicate. The decode check, the listener and the subtitle reader
-        # are prerequisites in the flow above - a transcode waits for them -
-        # AND they keep running afterwards over files committed months ago,
-        # which is this graph. Same system, two jobs; the notes say which is
-        # which rather than the reader having to work it out.
-        ck_decode = _n(cur, "SELECT COUNT(*) FROM integrity "
-                            "WHERE verdict='corrupt'")
-        ck_read = _n(cur, "SELECT COUNT(*) FROM integrity")
+        # THE FRESH BAND. A file that landed in the last day - a new import or
+        # an upgrade, which is a new row - rides priority 20 on every job,
+        # newest first, ahead of the disk balance, until it is watchable.
+        n_fresh = _n(cur, "SELECT COUNT(*) FROM files WHERE state NOT IN "
+                          "('deleted','duplicate') AND COALESCE(first_seen,0) > ?",
+                     (now - FRESH_S,))
+        n_fresh_jobs = _n(cur, "SELECT COUNT(*) FROM jobs WHERE state IN "
+                               "('queued','running') AND priority <= 20")
+        n_watch = _n(cur, "SELECT COUNT(*) FROM files f WHERE f.state='done' "
+                          "  AND COALESCE(f.first_seen,0) > ? AND NOT EXISTS "
+                          "  (SELECT 1 FROM jobs j WHERE j.file_id=f.id "
+                          "    AND j.state IN ('queued','running','deferred'))",
+                     (now - FRESH_S,))
+        # raws the maker is for, and batons waiting to go in
+        n_raw = 0
+        try:
+            n_raw = _n(cur, "SELECT COUNT(DISTINCT file_id) FROM sub_need WHERE state='missing'")
+        except Exception:                                    # noqa: BLE001
+            pass
+        # the standing checks
+        ck_decode = _n(cur, "SELECT COUNT(*) FROM integrity WHERE verdict='corrupt'")
         ck_burn = _n(cur, "SELECT COUNT(*) FROM hardsub h "
                           "WHERE h.state NOT IN ('none','') AND h.marked=0 "
-                          "  AND h.file_id NOT IN "
-                          "      (SELECT file_id FROM hardsub_ignored)")
-        ck_burn_seen = _n(cur, "SELECT COUNT(*) FROM hardsub")
-        ck_marked = _n(cur, "SELECT COUNT(*) FROM hardsub WHERE marked=1")
-        ck_heard = _n(cur, "SELECT COUNT(*) FROM audio_lang")
+                          "  AND h.file_id NOT IN (SELECT file_id FROM hardsub_ignored)")
         ck_waiting = _n(cur, "SELECT COUNT(*) FROM audio_lang_queue")
         ck_rule = _n(cur, "SELECT COUNT(*) FROM audit_findings WHERE run_id="
                           "(SELECT MAX(run_id) FROM audit_findings)")
         ck_gap = _n(cur, "SELECT COUNT(*) FROM arrgap_seen")
-        # The four verbs, all-time and this hour. The hour is the one that
-        # matters for the caps, and the caps are the reason the layer exists.
-        hour_ago = time.time() - 3600.0
+        hour_ago = now - 3600.0
         acted = {r[0]: r[1] for r in cur.execute(
             "SELECT action, COUNT(*) FROM remedy_log WHERE ok=1 "
             "GROUP BY action")} if _has(cur, "remedy_log") else {}
@@ -312,15 +280,12 @@ def graph() -> dict:
             "SELECT action, COUNT(*) FROM remedy_log WHERE ok=1 AND at>=? "
             "GROUP BY action", (hour_ago,))} if _has(cur, "remedy_log") else {}
 
-    # WHO IS WAITING ON WHAT, from the same breakdown the dashboard's idle
-    # line reads - so the diagram and the panel cannot tell two stories. It is
-    # memoised inside precedence; this never computes it on its own.
+    shaped, typeset = S["shaped"], S["typeset"]
+    dialogue = max(0, shaped - typeset)
     held: dict = {}
-    order: tuple = ("decode", "listen", "audio", "subread")
     try:
         from . import precedence
         held = dict((precedence.eligible_breakdown() or {}).get("by") or {})
-        order = tuple(k for k in precedence.ORDER if k in _FACT_WORDS)
     except Exception:                                        # noqa: BLE001
         pass
 
@@ -328,367 +293,222 @@ def graph() -> dict:
     libs = lab.get("ocr_libraries") or []
     libtxt = (", ".join(libs) if 0 < len(libs) <= 3
               else (f"{len(libs)} libraries" if libs else "no libraries"))
+    sidecars = _sidecars_cached()
+    ck_lie = _mislabelled()
+    found_now = ck_decode + ck_lie + ck_burn + ck_rule + ck_gap
+    n_req, n_rep = acted.get("requeue", 0), acted.get("replace", 0)
+    n_fix, n_ask = acted.get("repair", 0), acted.get("reask", 0)
 
+    def fact(k, col):
+        lbl, note = _FACT_WORDS[k]
+        pool = {"decode": "decode", "listen": "listen", "audio": "audio", "subread": "subread"}[k]
+        return dict(id=f"f_{k}", col=col, row=5, label=lbl, kind="pool", pool=pool,
+                    count=_busy(pool),
+                    note=(note + (f" {held[k]:,} file(s) are held waiting for this "
+                                  f"right now." if held.get(k) else "")))
+
+    # ---- picture 1: top-down, two lanes ---------------------------------
     nodes = [
-        # ---- what a file nuarr has never seen actually does, in order ----
-        dict(id="found", col=0, row=1, label="It lands",
-             count=n_new, kind="source",
-             note=("an arr tells nuarr a file has been imported, or the scan "
-                   "finds it. The count is how many are in the settle hold "
-                   "right now: nuarr will not touch a file while it might "
-                   "still be being written, and the wait is the one setting "
-                   "in Holds and timing that every file pays.")),
-        dict(id="elig", col=1, row=1, label="Ready to plan",
-             count=n_elig, kind="stage",
-             note=(f"past the hold and waiting for the processing system. "
-                   f"{n_first:,} are here for the first time; {n_again:,} are "
-                   f"back because a rule changed or somebody asked - see the "
-                   f"second picture below. A file here outranks the backlog: "
-                   f"its jobs are queued ahead of work on files that have "
-                   f"already been through, newest arrival first.")),
-        dict(id="unprobed", col=1, row=2, label="Not read yet",
-             count=unprobed, kind="idle",
-             note=(f"ffprobe has read the streams of {probed:,} files and the "
-                   f"answer is cached, so a rescan does not re-probe. The rest "
-                   f"are read the first time something needs them.")),
-        dict(id="facts", col=2, row=1, label="The facts first",
-             count=sum(held.values()) or None, kind="gate",
-             note=("before the plan can be trusted: does it decode, what "
-                   "language is each audio track really, are its tags "
-                   "corrected, what are its subtitle tracks. A rewrite is not "
-                   "queued for a file while any of them still owes an answer, "
-                   "and the answer it is waiting for jumps the queue. The "
-                   "count is how many files are waiting on one right now; the "
-                   "order is the picture directly below.")),
-        dict(id="plan", col=3, row=1, label="Planned",
-             count=None, kind="stage",
-             note="the rules turn the probe and the facts into a plan: which "
-                  "video, which audio, which subtitles, and therefore which "
-                  "worker"),
-        dict(id="nothing", col=3, row=2, label="Nothing to do",
-             count=skipped, kind="idle",
-             note=("the commonest outcome, and not a failure: the file already "
-                   "matches the policy, so it is marked done without being "
-                   "touched. "
-                   f"{skipped_ever:,} such conclusions have been reached in "
-                   "total, since a file is re-examined whenever the rules or "
-                   "the file change.")),
-        dict(id="gate", col=4, row=1, label="Job gate",
-             count=q_all, kind="gate",
-             note=("everything queued, in every pool. The gate holds work "
-                   "while someone is watching, while a disk is busy, or while "
-                   "you have paused a pool - and a file also waits here until "
-                   "the facts its plan is built from are known, which is the "
-                   "order drawn below"
-                   + (f". {sum(held.values()):,} file(s) are waiting on a "
-                      f"fact right now" if sum(held.values()) else ""))),
-        dict(id="encode", col=5, row=0, label="Encode",
-             count=r_enc, kind="pool", pool="encode",
+        dict(id="lane_a", col=0, row=0, label="Imported or upgraded", kind="lane",
+             count=None, note="a file the arrs have just landed. An upgrade is "
+                              "a new arr file id, so it is a new file to nuarr and "
+                              "starts here, not in the right-hand lane."),
+        dict(id="lane_b", col=2, row=0, label="Already in the library", kind="lane",
+             count=None, note="a committed file is not finished, only correct for "
+                              "now. These are the things that put it back on the "
+                              "line - at the backlog's priority, behind anything "
+                              "that landed today."),
+        dict(id="found", col=0, row=1, label="It lands", count=n_new, kind="source",
+             note=("an arr tells nuarr a file was imported, or the scan finds it. "
+                   "The count is the settle hold: nuarr does not touch a file "
+                   "while it might still be being written.")),
+        dict(id="fresh", col=0, row=2, label="Fresh for 24 h", count=n_fresh, kind="source",
+             note=(f"every job on a file that landed in the last day rides the fresh "
+                   f"band: priority 20, below every feeder, newest arrival first, "
+                   f"taken before the disk balance - through the facts, the rewrite, "
+                   f"the OCR, the maker and the fixes, not just until the rewrite. "
+                   f"{n_fresh_jobs:,} job(s) are riding it right now.")),
+        dict(id="checks", col=2, row=1, label="Six standing checks", count=found_now,
+             kind="warn" if found_now else "stage",
+             note=(f"on their own clocks, over files committed weeks ago. Will not "
+                   f"decode: {ck_decode:,} (of {S['ck_read']:,} checked). Audio tag is a "
+                   f"lie: {ck_lie:,} (of {S['ck_heard']:,} tracks heard; {ck_waiting:,} "
+                   f"waiting). Words in the frame: {ck_burn:,} (of {S['ck_burn_seen']:,} "
+                   f"sampled, {S['ck_marked']:,} marked). Sidecars outside: "
+                   f"{sidecars if sidecars is not None else 'not counted yet'}. Breaks a "
+                   f"rule today: {ck_rule:,}. Missing from the arrs: {ck_gap:,}. All of "
+                   f"them hand what they find to one remedy layer with one budget.")),
+        dict(id="rule", col=3, row=3, label="A rule changed", count=n_again, kind="source",
+             note=("change a codec, a language, a subtitle policy, and every file it "
+                   "now judges differently goes straight back to Ready to plan. No "
+                   "check, no remedy; the rule is the finding.")),
+        dict(id="req", col=2, row=2, label="Plan it again", count=n_req, kind="pool", pool="passthrough",
+             note=(f"the default remedy: back through the rules, queued if there is "
+                   f"work. {acted_h.get('requeue', 0)} in the last hour of {REQ_CAP} "
+                   f"allowed automatically.")),
+        dict(id="fix", col=3, row=2, label="Fix in place", count=n_fix, kind="pool", pool="subocr",
+             note=("the record was wrong, not the file: a title rewritten, a stale "
+                   "Plex analysis re-read, something the arr already tracks indexed. "
+                   "Nothing re-encoded.")),
+        dict(id="rep", col=2, row=3, label="Blocklist and replace", count=n_rep, kind="bad",
+             note=(f"the only irreversible verb: delete, blocklist, search again. "
+                   f"Refused for anything a rebuild could fix. The replacement lands "
+                   f"as a new file in the left lane. {acted_h.get('replace', 0)} in the "
+                   f"last hour of {REP_CAP} allowed.")),
+        dict(id="ask", col=3, row=1, label="Ask again", count=n_ask, kind="stage",
+             note=("already blocklisted and still not replaced: one more indexer "
+                   "search, six hours between asks about the same file.")),
+        dict(id="elig", col=1, row=4, label="Ready to plan", count=n_elig, kind="stage",
+             note=(f"both lanes meet here. {n_first:,} are here for the first time, "
+                   f"{n_again:,} are back because a rule changed or somebody asked. "
+                   f"A fresh file's jobs go in ahead of the backlog; a returning "
+                   f"file's go in behind it.")),
+        fact("decode", 0), fact("listen", 1), fact("audio", 2), fact("subread", 3),
+        dict(id="plan", col=1, row=6, label="Planned", count=None, kind="stage",
+             note=("the rules turn the probe and the four facts into a plan: which "
+                   "video, which audio, which subtitles, and so which worker. "
+                   f"{unprobed:,} files have not been probed yet; they are read the "
+                   f"first time something needs them.")),
+        dict(id="nothing", col=2, row=6, label="Nothing to do", count=S["skipped"], kind="idle",
+             note=(f"the commonest outcome and not a failure: the file already matches "
+                   f"the policy. {S['skipped_ever']:,} such conclusions in total. A fresh "
+                   f"file that needs no rewrite still gets its subtitle question asked "
+                   f"the same second.")),
+        dict(id="gate", col=1, row=7, label="Job gate", count=q_all, kind="gate",
+             note=("everything queued, in every pool. Held while someone is watching, "
+                   "a disk is busy or a pool is paused; a fresh-band job is taken "
+                   "first whichever disk it is on"
+                   + (f". {sum(held.values()):,} file(s) are waiting on a fact" if sum(held.values()) else ""))),
+        dict(id="encode", col=0, row=8, label="Encode", count=r_enc, kind="pool", pool="encode",
              note="the picture is rebuilt on the graphics card"),
-        dict(id="passthrough", col=5, row=1, label="Passthrough",
-             count=r_pass, kind="pool", pool="passthrough",
-             note="tracks and flags change, the picture is copied untouched"),
-        dict(id="subocr", col=5, row=2, label="Subtitle OCR",
-             count=r_sub, kind="pool", pool="subocr",
-             note=f"picture subtitles read into text with {eng}, "
-                  f"for {libtxt}. After the rewrite, never before it: a track "
-                  f"the transcode is about to drop is a minute of OCR nobody "
-                  f"needed"),
-        dict(id="subs", col=5, row=3, label="Subtitle fixes",
-             count=r_subs, kind="pool", pool="subs",
-             note="sidecars taken inside, duplicate tracks dropped, titles "
-                  "corrected - planned against the container the transcode "
-                  "leaves behind, so a rewrite cannot invalidate the "
-                  "instruction while it waits"),
-        dict(id="commit", col=6, row=1, label="Committed",
-             count=files_done, kind="stage",
-             note=("files that have been rewritten at least once and written "
-                   "back over the original, paced so a viewer never feels it. "
-                   f"{jobs_done:,} commits in total - a file is rewritten "
-                   "again whenever the policy changes under it.")),
-        dict(id="failed", col=6, row=2, label="Still not landed",
-             count=bad_now, kind="bad",
-             note=("files whose most recent attempt failed or was blocked, "
-                   "and which nothing has put right since. Retried on a "
-                   "backoff; blocked usually means the file could not be "
-                   "opened exclusively, or its path is too long. "
-                   f"{bad_ever} failures have been recorded in total - the "
-                   "rest were fixed by a later pass or belong to files since "
-                   "deleted or replaced.")),
+        dict(id="passthrough", col=1, row=8, label="Passthrough", count=r_pass, kind="pool", pool="passthrough",
+             note=("tracks and flags change, the picture is copied untouched. A copy "
+                   "keeps its decode verdict, so the file is not decoded again.")),
+        dict(id="failed", col=2, row=8, label="Still not landed", count=S["bad_now"], kind="bad",
+             note=(f"most recent attempt failed or was blocked and nothing has put it "
+                   f"right since. Retried on a backoff. {S['bad_ever']:,} failures ever; "
+                   f"the rest were fixed later or belong to files since replaced.")),
+        dict(id="commit", col=1, row=9, label="Committed", count=S["files_done"], kind="stage",
+             note=(f"written back over the original, paced so a viewer never feels it. "
+                   f"{S['d_enc'] + S['d_pass'] + S['d_sub'] + S['d_subs'] + S['d_make']:,} "
+                   f"commits in total. The moment a fresh file's rewrite lands, the "
+                   f"subtitle question is asked for it - no waiting for a sweep.")),
+        dict(id="subocr", col=0, row=10, label="Subtitle OCR", count=r_sub, kind="pool", pool="subocr",
+             note=(f"picture subtitles that survived the rewrite are read into text "
+                   f"with {eng}, for {libtxt}. The text goes to the file through the "
+                   f"subs-pending baton and is retried if the file is busy.")),
+        dict(id="submake", col=1, row=10, label="Subtitle maker", count=r_make, kind="pool", pool="submake",
+             note=(f"a raw - no English anywhere, judged by the raws check and the "
+                   f"second opinion - gets English made from the audio and embedded "
+                   f"as 'English (nuarr)'. Runs as a queue job, one job per file, "
+                   f"never on a file something else is rewriting; the made text waits "
+                   f"in the same baton as the OCR's and is retried. {n_raw:,} raw(s) "
+                   f"known right now.")),
+        dict(id="subs", col=2, row=10, label="Subtitle fixes", count=r_subs, kind="pool", pool="subs",
+             note=("sidecars taken inside, duplicate tracks dropped, titles corrected, "
+                   "on the final container. A subtitle-only rewrite re-keys the "
+                   "verdicts, so nothing is listened to or decoded again.")),
+        dict(id="watch", col=1, row=11, label="Watchable", count=n_watch, kind="stage",
+             note=(f"fresh files with nothing left owed: rewritten, subtitled, done. "
+                   f"The count is how many of today's arrivals are there now.")),
     ]
     edges = [
-        dict(a="found", b="elig", label="the hold passes", n=n_elig),
-        dict(a="elig", b="unprobed", label="", n=unprobed, muted=True),
-        dict(a="elig", b="facts", label="four things to know", n=n_elig),
-        dict(a="facts", b="plan", label="all four answered", n=probed),
-        dict(a="plan", b="nothing", label="already correct", n=skipped,
-             muted=True),
+        dict(a="found", b="fresh", label="the hold passes", n=n_new),
+        dict(a="fresh", b="elig", label="ahead of everything, newest first", n=n_fresh),
+        dict(a="checks", b="req", label="a rebuild would fix it", n=n_req),
+        dict(a="checks", b="fix", label="the record is wrong", n=n_fix),
+        dict(a="checks", b="rep", label="only a new release", n=n_rep),
+        dict(a="checks", b="ask", label="", n=n_ask),
+        dict(a="rule", b="elig", label="straight back on the line", n=n_again),
+        dict(a="req", b="elig", label="behind fresh", n=n_req),
+        dict(a="rep", b="found", label="the replacement lands", n=n_rep),
+        dict(a="elig", b="f_decode", label="the facts first", n=n_elig),
+        dict(a="f_decode", b="f_listen", label="", n=_busy("listen")),
+        dict(a="f_listen", b="f_audio", label="", n=_busy("audio")),
+        dict(a="f_audio", b="f_subread", label="", n=_busy("subread")),
+        dict(a="f_listen", b="plan", label="all four answered", n=probed),
+        dict(a="plan", b="nothing", label="already correct", n=S["skipped"], muted=True),
         dict(a="plan", b="gate", label="a change is needed", n=q_all),
         dict(a="gate", b="encode", label="picture must be rebuilt", n=r_enc),
-        dict(a="gate", b="passthrough", label="picture can be copied",
-             n=r_pass),
-        dict(a="gate", b="subocr", label="picture subtitles to read",
-             n=r_sub),
-        dict(a="gate", b="subs", label="subtitles to settle", n=r_subs),
-        dict(a="encode", b="commit", label="", n=d_enc),
-        dict(a="passthrough", b="commit", label="", n=d_pass),
-        dict(a="subocr", b="commit", label="", n=d_sub),
-        dict(a="subs", b="commit", label="", n=d_subs),
-        dict(a="encode", b="failed", label="", n=bad_now, muted=True),
+        dict(a="gate", b="passthrough", label="picture can be copied", n=r_pass),
+        dict(a="encode", b="commit", label="", n=S["d_enc"]),
+        dict(a="passthrough", b="commit", label="", n=S["d_pass"]),
+        dict(a="passthrough", b="failed", label="", n=S["bad_now"], muted=True),
+        dict(a="commit", b="subocr", label="picture subs survived", n=S["d_sub"]),
+        dict(a="commit", b="submake", label="a raw: no English anywhere", n=S["d_make"]),
+        dict(a="commit", b="subs", label="titles, duplicates, sidecars", n=S["d_subs"]),
+        dict(a="subocr", b="watch", label="", n=S["d_sub"]),
+        dict(a="submake", b="watch", label="", n=S["d_make"]),
+        dict(a="subs", b="watch", label="", n=S["d_subs"]),
     ]
-    # The subtitle decision, drawn as its own small graph under the main one -
-    # it is the one branch with a measurement rather than a setting behind it.
+    # ---- picture 3: the subtitle decision ---------------------------------
     sub_nodes = [
-        dict(id="s_img", col=0, row=0, label="Picture subtitles found",
-             count=shaped, kind="source",
-             note="PGS or VobSub tracks in a file the OCR sweep is about to "
-                  "act on"),
-        dict(id="s_meas", col=1, row=0, label="Bitmaps measured",
-             count=shaped, kind="stage",
-             note="heights read straight from the PGS headers - no OCR, no "
-                  "decode"),
-        dict(id="s_type", col=2, row=0, label="Typeset signs",
-             count=typeset, kind="pool", pool="encode",
+        dict(id="s_img", col=0, row=0, label="Picture subtitles found", count=shaped, kind="source",
+             note="PGS or VobSub tracks in a file the OCR sweep is about to act on"),
+        dict(id="s_meas", col=1, row=0, label="Bitmaps measured", count=shaped, kind="stage",
+             note="heights read straight from the PGS headers - no OCR, no decode"),
+        dict(id="s_type", col=2, row=0, label="Typeset signs", count=typeset, kind="pool", pool="encode",
              note=lab.get("typeset", "")),
-        dict(id="s_dial", col=2, row=1, label="Dialogue",
-             count=dialogue, kind="pool", pool="subocr",
+        dict(id="s_dial", col=2, row=1, label="Dialogue", count=dialogue, kind="pool", pool="subocr",
              note="ordinary lines at the bottom of the frame"),
-        dict(id="s_burn", col=3, row=0, label="Burned into the picture",
-             count=typeset, kind="stage",
-             note="an encode; the separate track is dropped because it is "
-                  "part of the picture now"),
-        dict(id="s_ocr", col=3, row=1, label="Read into text",
-             count=dialogue, kind="stage",
-             note=f"{eng} writes an SRT, replacing any earlier OCR track "
-                  f"rather than stacking a second one"),
+        dict(id="s_burn", col=3, row=0, label="Burned into the picture", count=typeset, kind="stage",
+             note="an encode; the separate track is dropped because it is part of the picture now"),
+        dict(id="s_ocr", col=3, row=1, label="Read into text", count=dialogue, kind="stage",
+             note=f"{eng} writes an SRT, replacing any earlier OCR track rather than stacking a second one"),
     ]
     sub_edges = [
-        dict(a="s_img", b="s_meas", label="before anything is queued",
-             n=shaped),
+        dict(a="s_img", b="s_meas", label="before anything is queued", n=shaped),
         dict(a="s_meas", b="s_type", label=lab.get("typeset", ""), n=typeset),
         dict(a="s_meas", b="s_dial", label="anything else", n=dialogue),
         dict(a="s_type", b="s_burn", label="", n=typeset),
         dict(a="s_dial", b="s_ocr", label="", n=dialogue),
     ]
-    # ---- the order the systems take a file in --------------------------
-    #
-    # Its own small graph, like the subtitle branch: it is a chain rather than
-    # a fan, and it is the part of the page that has to be explained rather
-    # than pointed at. Built from precedence.ORDER and PREREQS so it cannot
-    # describe an order the dispatcher does not keep.
+    # ---- picture 2: the order the systems take a file in -----------------
     ord_nodes, ord_edges = [], []
     try:
         from . import precedence as _prec
         _chain = list(_prec.ORDER)
         _pool_of = dict(_prec.POOL_OF_KIND)
     except Exception:                                        # noqa: BLE001
-        _chain = ["decode", "listen", "audio", "subread", "transcode",
-                  "sub_ocr", "subs"]
-        _pool_of = {"decode": "decode", "listen": "listen", "audio": "audio",
-                    "subread": "subread", "transcode": "encode",
-                    "sub_ocr": "subocr", "subs": "subs"}
-    # THE CHAIN'S OWN SHORT NAMES. Seven boxes across is a narrower box, and
-    # a label that does not fit is a label nobody reads; what each one means
-    # is in its note, where there is room for it.
+        _chain = ["decode", "listen", "audio", "subread", "transcode", "sub_ocr", "submake", "subs"]
+        _pool_of = {"decode": "decode", "listen": "listen", "audio": "audio", "subread": "subread",
+                    "transcode": "encode", "sub_ocr": "subocr", "submake": "submake", "subs": "subs"}
     _SHORT = {"decode": "Does it decode?", "listen": "What language?",
               "audio": "Tags corrected", "subread": "What the subs are",
               "transcode": "The rewrite", "sub_ocr": "Subtitle OCR",
-              "subs": "Subtitle fixes"}
+              "submake": "Subtitle maker", "subs": "Subtitle fixes"}
     _REST = {
         "transcode": ("The rewrite",
-                      "the standardising pass: unwanted tracks dropped, audio "
-                      "converted, Dolby Vision stripped. Everything above it "
-                      "exists so this runs once on a file rather than three "
-                      "times."),
+                      "the standardising pass: unwanted tracks dropped, audio converted, "
+                      "Dolby Vision stripped. Everything above it exists so this runs once."),
         "sub_ocr": ("Subtitle OCR",
-                    "the picture subtitles that SURVIVED the rewrite are read "
-                    "into text - fewer of them, and never one that was about "
-                    "to be dropped as a language nobody here reads."),
+                    "the picture subtitles that SURVIVED the rewrite are read into text - "
+                    "never one that was about to be dropped."),
+        "submake": ("Subtitle maker",
+                    "English made from the audio for a raw, embedded as its own track - "
+                    "only once the facts say there is nothing to read and the rewrite is done."),
         "subs": ("Subtitle fixes",
-                 "sidecars in, duplicates out, titles corrected - on the "
-                 "final container, so a rewrite that comes later cannot "
-                 "invalidate the instruction while it waits."),
+                 "sidecars in, duplicates out, titles corrected - on the final container."),
     }
     for i, k in enumerate(_chain):
-        lbl, note = (_FACT_WORDS.get(k) or _REST.get(k)
-                     or (k.replace("_", " "), ""))
+        lbl, note = (_FACT_WORDS.get(k) or _REST.get(k) or (k.replace("_", " "), ""))
         n_now = _busy_pool(_pool_of.get(k, k), rn, qn)
         ord_nodes.append(dict(
             id=f"o_{k}", col=i, row=0, label=_SHORT.get(k, lbl),
             count=n_now, kind="pool", pool=_pool_of.get(k, ""),
             note=(f"{i + 1} of {len(_chain)}. " + note
-                  + (f" {held[k]:,} file(s) are held waiting for this right "
-                     f"now." if held.get(k) else ""))))
+                  + (f" {held[k]:,} file(s) are held waiting for this right now." if held.get(k) else ""))))
         if i:
             prev = _chain[i - 1]
             ord_edges.append(dict(
                 a=f"o_{prev}", b=f"o_{k}",
-                # Short: the chain's gap is 74px, which is fourteen characters
-                # before the label is clipped - see _PIPE_TIGHT.
-                label=("facts first" if k == "transcode"
-                       else "after it" if prev == "transcode" else ""),
+                label=("facts first" if k == "transcode" else "after it" if prev == "transcode" else ""),
                 n=n_now))
-
-    # ---- the standing checks, and the one place they all end up --------
-    sidecars = _sidecars_cached()
-    ck_lie = _mislabelled()
-    found_now = ck_decode + ck_lie + ck_burn + ck_rule + ck_gap
-    n_req = acted.get("requeue", 0)
-    n_rep = acted.get("replace", 0)
-    n_fix = acted.get("repair", 0)
-    n_ask = acted.get("reask", 0)
-
-    ck_nodes = [
-        dict(id="c_dec", col=0, row=0, label="Does it decode?",
-             count=ck_decode, kind="bad" if ck_decode else "stage",
-             note=(f"{ck_read:,} files have had five windows - head, three "
-                   "through the middle, tail - actually decoded, not merely "
-                   "probed, and a window that decodes nothing counts as "
-                   "truncation rather than health. A truncated "
-                   "download passes ffprobe and fails halfway through the "
-                   "episode, which is where a viewer finds it. The number "
-                   "shown is how many will not decode. The same check runs "
-                   "ahead of a rewrite in the flow above - there is no point "
-                   "spending an hour on a file that is broken.")),
-        dict(id="c_lang", col=0, row=1, label="Is the audio what it says?",
-             count=ck_lie, kind="warn" if ck_lie else "stage",
-             note=(f"{ck_heard:,} tracks have been listened to with Whisper - "
-                   "five 30-second windows spread across the file, and the "
-                   "confident windows have to agree. A blank tag is filled "
-                   "automatically; a tag that is demonstrably wrong is never "
-                   "overwritten without a person, because that restraint is "
-                   "all that stops it re-labelling every English dub. "
-                   f"{ck_waiting:,} files are waiting their turn ahead of the "
-                   "backlog - freshly imported ones, and any the processing "
-                   "system is standing still behind, which jump to the front. "
-                   "The number shown is how many tracks are tagged a language "
-                   "they demonstrably are not.")),
-        dict(id="c_burn", col=0, row=2, label="Subtitles in the picture",
-             count=ck_burn, kind="warn" if ck_burn else "stage",
-             note=(f"{ck_burn_seen:,} files that report NO subtitle track have "
-                   "been sampled for words burned into the frame - bright "
-                   "pixels counted first, then the best few shown to the OCR. "
-                   f"{ck_marked:,} carry a blank marker track, which exists so "
-                   "Plex and Bazarr stop fetching subtitles for a file that "
-                   "already has them painted on. This reading also runs ahead "
-                   "of a rewrite, so the plan flags and keeps the right "
-                   "tracks rather than guessing from their titles.")),
-        dict(id="c_side", col=0, row=3, label="Sidecars sitting outside",
-             count=sidecars, kind="stage",
-             note=("subtitle files sitting next to the video rather than "
-                   "inside it. One arr rename away from being orphaned, they "
-                   "beat the embedded track in Plex's picker, and an external "
-                   "ASS forces the whole video to be re-encoded to carry it. "
-                   "Off unless a library turns it on. Counted only when the "
-                   "folder walk has already run - this diagram will not start "
-                   "one.")),
-        dict(id="c_rule", col=0, row=4, label="Rule check",
-             count=ck_rule, kind="warn" if ck_rule else "stage",
-             note=("a sample of committed files re-examined against the rules "
-                   "as they are TODAY. This is the check that inspects files "
-                   "nuarr has; the one below finds files it does not.")),
-        dict(id="c_gap", col=0, row=5, label="Missing from the arrs",
-             count=ck_gap, kind="warn" if ck_gap else "stage",
-             note=("files Sonarr and Radarr track that nuarr has never taken "
-                   "in - not walked yet, written off, or rejected and waiting "
-                   "for a replacement. The opposite question to every other "
-                   "box on this page, which is why it is not folded into the "
-                   "rule check.")),
-
-        dict(id="c_found", col=1, row=2, label="Something to put right",
-             count=found_now, kind="gate",
-             note=("every check hands its findings to one remedy layer. Before "
-                   "it existed each check had its own answer and its own "
-                   "polite cap of three an hour - seven checks, twenty-one "
-                   "deletions an hour, and no cap ever exceeded. One table now "
-                   "decides what may be done to each kind of finding, and one "
-                   "budget is shared across all of them.")),
-
-        dict(id="c_req", col=2, row=1, label="Plan it again",
-             count=n_req, kind="pool", pool="passthrough",
-             note=(f"the file is put back through the rules and queued if "
-                   f"there is work. Reversible, cheap, and the default. "
-                   f"{acted_h.get('requeue', 0)} in the last hour, of "
-                   f"{REQ_CAP} allowed automatically.")),
-        dict(id="c_fix", col=2, row=2, label="Fix in place",
-             count=n_fix, kind="pool", pool="subocr",
-             note=("where the record is what is wrong rather than the file - "
-                   "indexing something the arr already tracks, rewriting a "
-                   "track title, re-reading a stale Plex analysis. Nothing is "
-                   "re-encoded.")),
-        dict(id="c_ask", col=2, row=3, label="Ask again",
-             count=n_ask, kind="stage",
-             note=("for a release already blocklisted and still not replaced: "
-                   "one more indexer search. Nothing is deleted, because the "
-                   "deleting was done the first time. Six hours between asks "
-                   "about the same file.")),
-        # The two re-entries that are not findings at all. A rule change or
-        # an arr upgrade puts a file back on the line directly - no check, no
-        # remedy, no budget - and the page never showed either.
-        dict(id="c_rule2", col=0, row=6, label="A rule changed",
-             count=n_again, kind="source",
-             note=("change a rule - a codec, a language, a subtitle policy - "
-                   "and every file it now judges differently is put back to "
-                   "'ready to plan'. No check finds this and no remedy is "
-                   "involved; the rule IS the finding. The count is how many "
-                   "are waiting on that account right now.")),
-        dict(id="c_upg", col=0, row=7, label="The arr replaced it",
-             count=None, kind="source",
-             note=("an upgrade lands at the same path with different bytes. "
-                   "nuarr notices the size change, throws away everything it "
-                   "knew about the old release - the probe, the verdicts, the "
-                   "plan - and the file starts again as if it were new, "
-                   "because it is.")),
-        dict(id="c_back", col=3, row=3, label="Back to Ready to plan",
-             count=n_elig, kind="source",
-             note=("and round again: whatever the remedy did, the file "
-                   "re-enters the first picture at 'Ready to plan' and is "
-                   "planned from what it is NOW. This is the only way a file "
-                   "that is already committed gets touched again, which is "
-                   "why nothing on this page runs on a schedule of its own "
-                   "any more.")),
-        dict(id="c_rep", col=2, row=4, label="Blocklist and replace",
-             count=n_rep, kind="bad",
-             note=(f"the file is deleted, the release blocklisted, and the arr "
-                   f"searches again - in that order, because the arr scores "
-                   f"candidates against whatever is still on disk. The only "
-                   f"irreversible verb, and the policy table refuses it for "
-                   f"any finding a rebuild could fix. "
-                   f"{acted_h.get('replace', 0)} in the last hour, of "
-                   f"{REP_CAP} allowed automatically.")),
-    ]
-    ck_edges = [
-        dict(a="c_dec", b="c_found", label="will not decode", n=ck_decode,
-             muted=not ck_decode),
-        dict(a="c_lang", b="c_found", label="tag is a lie", n=ck_lie,
-             muted=not ck_lie),
-        dict(a="c_burn", b="c_found", label="words in the frame", n=ck_burn,
-             muted=not ck_burn),
-        dict(a="c_side", b="c_found", label="take it inside",
-             n=sidecars or 0, muted=not sidecars),
-        dict(a="c_rule", b="c_found", label="breaks a rule today", n=ck_rule,
-             muted=not ck_rule),
-        dict(a="c_gap", b="c_found", label="never taken in", n=ck_gap,
-             muted=not ck_gap),
-        dict(a="c_found", b="c_req", label="a rebuild would fix it", n=n_req),
-        dict(a="c_found", b="c_fix", label="the record is wrong", n=n_fix),
-        dict(a="c_found", b="c_ask", label="already blocklisted", n=n_ask),
-        dict(a="c_found", b="c_rep", label="only another release can",
-             n=n_rep),
-        # ...and every road leads back to the start.
-        dict(a="c_req", b="c_back", label="", n=n_req),
-        dict(a="c_fix", b="c_back", label="", n=n_fix),
-        dict(a="c_rep", b="c_back", label="the new one arrives", n=n_rep),
-        dict(a="c_rule2", b="c_back", label="straight back on the line",
-             n=n_again),
-        dict(a="c_upg", b="c_back", label="as if it were new", n=n_again),
-    ]
 
     return {"cols": _COLS, "nodes": nodes, "edges": edges,
             "order": {"nodes": ord_nodes, "edges": ord_edges},
             "sub": {"nodes": sub_nodes, "edges": sub_edges},
-            "checks": {"nodes": ck_nodes, "edges": ck_edges},
-            "engine": eng, "libraries": libs, "at": time.time()}
+            "engine": eng, "libraries": libs, "at": now}
 
 
 # What nuarr can actually do about each kind of failure. The point of naming
@@ -846,7 +666,7 @@ def route(file_id: int) -> dict:
            "steps": [], "found": False}
     with cursor() as cur:
         f = cur.execute(
-            "SELECT id, title, season, episode, state, library, path "
+            "SELECT id, title, season, episode, state, library, path, first_seen "
             "FROM files WHERE id=?", (int(file_id),)).fetchone()
         if not f:
             return out
@@ -878,6 +698,18 @@ def route(file_id: int) -> dict:
 
     path = ["found"]
     steps = [("found", "the arrs told nuarr about this file")]
+    fresh = float(f.get("first_seen") or 0) > time.time() - FRESH_S
+    if fresh:
+        path.append("fresh")
+        steps.append(("fresh", "landed in the last day - every job on it rides the fresh band"))
+    path.append("elig")
+    done_kinds = {j["kind"] for j in jobs if j["state"] == "done"}
+    for k in ("decode", "listen", "audio", "subread"):
+        if k in done_kinds:
+            path.append(f"f_{k}")
+    if done_kinds & {"decode", "listen", "audio", "subread"}:
+        steps.append(("facts", ", ".join(k for k in ("decode", "listen", "audio", "subread")
+                                         if k in done_kinds) + " answered"))
 
     def finish():
         # The subtitle notes belong AFTER the journey, not spliced into the
@@ -887,10 +719,8 @@ def route(file_id: int) -> dict:
         out["steps"] = [list(s) for s in steps + sub_steps]
         return out
     if probed:
-        path.append("probe")
         steps.append(("probe", "ffprobe read its streams"))
     else:
-        path.append("unprobed")
         steps.append(("unprobed", "not probed yet"))
         return finish()
 
@@ -917,7 +747,7 @@ def route(file_id: int) -> dict:
     seen, counts = [], {}
     for j in jobs:
         p = j["pool"]
-        if p not in ("encode", "passthrough", "subocr"):
+        if p not in ("encode", "passthrough"):
             continue
         counts[p] = counts.get(p, 0) + 1
         if p not in seen:
@@ -932,6 +762,17 @@ def route(file_id: int) -> dict:
     if any(j["state"] in ("failed", "blocked") for j in jobs):
         path.append("failed")
         steps.append(("failed", last.get("error") or "did not land"))
+    _AFTER = {"subocr": ("subocr", "picture subtitles read into text"),
+              "submake": ("submake", "English made from the audio and embedded"),
+              "subs": ("subs", "subtitle tracks settled")}
+    for p, (nid, txt) in _AFTER.items():
+        n = sum(1 for j in jobs if j["pool"] == p and j["state"] == "done")
+        if n:
+            path.append(nid)
+            steps.append((nid, f"{txt} ({n} job{'s' if n != 1 else ''})"))
+    if fresh and (f.get("state") == "done") and jobs[-1]["state"] in ("done", "skipped"):
+        path.append("watch")
+        steps.append(("watch", "watchable - nothing left owed"))
 
     return finish()
 
