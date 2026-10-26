@@ -33138,7 +33138,7 @@ function pxTick(){
     // and a layout; this ticks four times a second per card and the clock
     // text changes once a second, the percentage far less.
     const _w=(el,k,v)=>{ if(el && el[k]!==v) el[k]=v; };
-    if(bar){ const w=n.pct.toFixed(2)+'%'; if(bar.style.width!==w) bar.style.width=w; }
+    if(bar){ const w=n.pct.toFixed(1)+'%'; if(bar.style.width!==w) bar.style.width=w; }   // a tenth of a percent is a pixel on a 1000 px bar
     _w(pct,'textContent', n.pct.toFixed(0)+'%');
     _w(clk,'textContent', n.dur ? pxTime(n.off)+' / '+pxTime(n.dur) : '');
     // THE LEAD DRAINS IN REAL TIME between polls. The server's figure is a
