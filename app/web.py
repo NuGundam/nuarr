@@ -7144,7 +7144,7 @@ def api_pipeline_random():
                     pool = [r[0] for r in cur.execute(
                         "SELECT j.file_id FROM jobs j JOIN files f ON f.id=j.file_id "
                         "WHERE j.id >= ? AND f.state NOT IN ('deleted','duplicate') "
-                        "  AND j.state IN ('done','failed','blocked') "
+                        "  AND +j.state IN ('done','failed','blocked') "
                         "ORDER BY j.id LIMIT 1", (random.randint(1, max(1, top)),))]
                     if pool:
                         break

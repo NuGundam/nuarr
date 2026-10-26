@@ -1,15 +1,3 @@
-﻿Settings page: 55 requests at open -> the ones it shows; random pick by id; cached CUDA answer
-
-Measured in headless Edge over DevTools: the page itself was quick (95 KB
-gz HTML, DOMContentLoaded 144 ms). What made it slow:
-- the shared script fired every dashboard loader once at top level, 55 API
-  requests for a page showing none of them, then ~4 requests/s from the
-  ungated host poll. First calls now go through the same visibility gate as
-  the polls; the 1 s host poll is gated on its bar.
-- /api/pipeline/random sorted 160k jobs JOIN files with ORDER BY RANDOM()
-  (0.5-18 s) and the tour's first file waited on it: now a random id and
-  the next qualifying row.
-- system.snapshot() -> audiolang.info() spawned nvidia-smi on every jobs
-  poll: the CUDA answer is cached ten minutes.
+﻿pipeline/random: +j.state so the planner walks ids, not the state index (300 ms -> 0.2 ms)
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
