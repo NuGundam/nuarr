@@ -24242,7 +24242,13 @@ function sysRunningHtml(){
       ${bar}</a>`;
   }).join('') + '</div>';
 }
-const _sysTick = gated(loadSystems);
+let _sysSkip=false;
+// every other tick when nothing is running - the same rule poll() applies
+const _sysTick = gated(()=>{
+  let idle=false; try{ idle = runningJobs.size === 0; }catch(_){ }
+  if(idle && (_sysSkip=!_sysSkip)) return;
+  loadSystems();
+});
 _gatedOnShow.push(_sysTick);
 function sysStart(){
   clearInterval(_sysTimer);

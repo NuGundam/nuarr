@@ -1,7 +1,3 @@
-﻿poll(): idle test inside the callback - runningJobs is a let declared later, and reading it at load threw
-
-The previous commit's typeof check hit the temporal dead zone at the first
-poll() call and stopped every loader after it from registering (dashboard
-measured at 1 request/s with no jobs, queue or host polls at all).
+﻿Systems poll: every other tick when nothing is running (same rule as poll())
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
