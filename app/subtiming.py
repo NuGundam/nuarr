@@ -117,19 +117,30 @@ def _label(path: str) -> str:
 
 
 # ------------------------------------------------------------------ queue ----
-def candidates(limit: int = 20) -> list:
+# NOT "LEFT JOIN subtiming ... (t.file_id IS NULL OR ABS(...) > 2)": for that
+# shape the planner nested a full scan of subtiming inside the files loop -
+# minutes a tick, every two minutes, so the checker managed 35 an hour
+# against a cap of 200. NOT EXISTS is a key lookup per file: 3.4 s.
+_UNCHECKED = "NOT EXISTS (SELECT 1 FROM subtiming t WHERE t.file_id=f.id AND ABS(t.mtime - f.mtime) <= 2)"
+
+
+def candidates(limit: int = 20, skip_disks: set | None = None) -> list:
     """Files with a text subtitle track, not yet checked as they are now -
-    newest first, so what was just imported is looked at within minutes."""
+    newest first, so what was just imported is looked at within minutes.
+    skip_disks: hot disks left out in the query itself - the newest files
+    mostly land on one disk, and slicing after the fact left one or two."""
     init()
     like = " OR ".join(["p.json LIKE ?"] * len(TEXT_LIKE))
+    skip = sorted(d for d in (skip_disks or set()) if d)
+    skip_sql = f"AND COALESCE(f.pool_disk,'') NOT IN ({','.join('?' * len(skip))}) " if skip else ""
     with cursor() as cur:
         rows = cur.execute(
             f"SELECT f.id, f.path, f.mtime, f.pool_disk, f.duration FROM files f JOIN file_probes p ON p.file_id=f.id "
-            f"LEFT JOIN subtiming t ON t.file_id=f.id "
-            f"WHERE f.state NOT IN ('deleted','duplicate') AND f.duration > 300 AND ({like}) "
-            f"AND (t.file_id IS NULL OR ABS(t.mtime - f.mtime) > 2) "
+            f"WHERE f.state NOT IN ('deleted','duplicate') AND f.duration > 300 {skip_sql}"
+            f"AND {_UNCHECKED} "
             f"AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.file_id=f.id AND j.state IN ('queued','running','pending')) "
-            f"ORDER BY COALESCE(f.first_seen, 0) DESC LIMIT ?", (*TEXT_LIKE, int(limit))).fetchall()
+            f"AND ({like}) "
+            f"ORDER BY COALESCE(f.first_seen, 0) DESC LIMIT ?", (*skip, *TEXT_LIKE, int(limit))).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -141,9 +152,9 @@ def waiting() -> int:
     like = " OR ".join(["p.json LIKE ?"] * len(TEXT_LIKE))
     with cursor() as cur:
         n = cur.execute(
-            f"SELECT COUNT(*) n FROM files f JOIN file_probes p ON p.file_id=f.id LEFT JOIN subtiming t ON t.file_id=f.id "
-            f"WHERE f.state NOT IN ('deleted','duplicate') AND f.duration > 300 AND ({like}) "
-            f"AND (t.file_id IS NULL OR ABS(t.mtime - f.mtime) > 2)", TEXT_LIKE).fetchone()["n"]
+            f"SELECT COUNT(*) n FROM files f JOIN file_probes p ON p.file_id=f.id "
+            f"WHERE f.state NOT IN ('deleted','duplicate') AND f.duration > 300 AND {_UNCHECKED} "
+            f"AND ({like})", TEXT_LIKE).fetchone()["n"]
     _WAIT.update(at=time.time(), n=int(n))
     return _WAIT["n"]
 
@@ -282,9 +293,24 @@ def check_one(row: dict, act: bool | None = None) -> dict:
     STATE.update(running=True, file_id=fid, label=_label(path), stage="listening for speech", pct=2.0, started=t0)
     try:
         if not os.path.exists(path):
-            res = {"ok": False, "why": "the file is not on disk"}
-        else:
-            res = _measure(path)
+            # RENAMED SINCE THE BATCH WAS PICKED - an encode committing, the
+            # Subtitle maker embedding. Ask by id; the files row follows renames.
+            with cursor() as cur:
+                r = cur.execute("SELECT path, mtime FROM files WHERE id=? AND state NOT IN ('deleted','duplicate')",
+                                (fid,)).fetchone()
+            if r and r["path"] != path and os.path.exists(r["path"]):
+                path = r["path"]
+                row["mtime"] = r["mtime"]
+                STATE["label"] = _label(path)
+        if not os.path.exists(path):
+            # NOT RECORDED: a "failed" row with the file's mtime would never be
+            # offered again, and eleven of the first twelve such files were
+            # back under a new name within the hour. The scan marks a file that
+            # is really gone as deleted, and candidates() leaves those out.
+            joblog.log(f"subtitle timing: {_label(path)} - not on disk, left for the next scan", "info")
+            STATE.update(last_run=time.time(), last_result=f"{_label(path)}: not on disk - left for the next scan")
+            return {"file_id": fid, "verdict": "skipped", "action": "not on disk", "note": "", "secs": 0}
+        res = _measure(path)
         tracks = res.get("tracks") or []
         verdict, action, note = "", "", ""
         if not res.get("ok"):
@@ -346,8 +372,7 @@ def run_batch(n: int, file_id: int = 0) -> dict:
                 r = cur.execute("SELECT id, path, mtime, pool_disk FROM files WHERE id=?", (int(file_id),)).fetchone()
             rows = [dict(r)] if r else []
         else:
-            hot = busy_disks()
-            rows = [r for r in candidates(n * 4) if not r.get("pool_disk") or r["pool_disk"] not in hot][:n]
+            rows = candidates(n, busy_disks())
         done = []
         for r in rows:
             if _STOP["flag"]:
