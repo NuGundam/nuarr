@@ -48768,12 +48768,6 @@ async function loadArrsTab(refresh){
         +'arr goes looking for a real release instead. And a finished download the arr cannot place - "Unable to parse release", an unknown series or film - has its name read by Qwen, and is imported when that reading matches exactly one film or episode here and the arr offers the file for it; anything else stays for you.',
         d.toggles.queue_janitor, qjst,
         {label:'', kind:'queue_janitor', names:{}, empty:'', adder:qjList(qj)})
-    + `<div class="dim" style="font-size:11px;margin:0 4px 10px">TVDB re-ID repair (series TheTVDB deleted and
-         re-added) is on the <a href="#meta">Metadata page</a>.</div>`
-    + `<div class="dim" style="font-size:11px;margin-top:10px;padding:0 4px">Where the arrs'
-         imports land - the disk nuarr picks for them, and the last few placed - is on the
-         <a href="#drivepool">DrivePool page</a>,
-         next to the same choice nuarr makes for its own files.</div>`
     + `<div id="bcBox" style="margin-top:12px"></div>`;
   loadHookState();
   _bcKey='';                 // the box is new and empty - paint it whatever the data says
@@ -48877,7 +48871,7 @@ function bcRowHtml(r){
       :r.state==='grabbed'?'<span style="color:#79c0ff">on its way</span>'
       :r.state==='kept'?'<span class="dim">kept</span>'
       :w.rec==='keep'?'<span style="color:var(--ok)" title="the upgrade brought English audio">keep</span>'
-      :w.rec==='fetch'?'<span style="color:var(--bad)">fetch</span>':'<span style="color:#e8a33d">your call</span>'}</td>
+      :w.rec==='fetch'?'<span style="color:var(--bad)">fetch</span>':'<span style="color:#e8a33d" title="borderline - still watchable, but a fuller copy is better; auto fetches it too">fetch</span>'}</td>
     <td class="l" style="font-size:10.5px">${_bcBusy.has(k)?bcProgHtml(k,'working')
       :`<span style="color:${BC_COL[r.state]||'var(--dim)'}">${esc(BC_WORD[r.state]||r.state||'')}</span>${
         r.note&&r.state!=='open'?`<div class="dim" style="font-size:10px;white-space:normal" title="${esc(r.note)}">${esc(r.note)}</div>`:''}`}</td>
@@ -48918,7 +48912,7 @@ function bcPaint(){
       <b style="color:#e8a33d">Upgrades that cut the bitrate</b>
       <span style="font-size:11px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <span class="dim">${fmt(_bc.open||0)} open${fetchN&&_bc.mode!=='auto'?` · <a href="#" onclick="bcPickRec();return false">select the ${fetchN} worth fetching</a>`:''}</span>
-        <span class="dim" title="Manual lists the cuts and waits for you. Auto runs Find a fuller copy by itself on every row advised fetch - once per row; your-call rows, keep rows and rows where nothing fuller was found stay yours.">for the ones advised fetch</span>
+        <span class="dim" title="Manual lists the cuts and waits for you. Auto fetches a fuller copy for every row but the keep ones; when there is none it brings the old file back from the arr's recycle bin, else looks again daily for two weeks and then grabs the old release again. A download lost twice stays yours.">for every row but keep</span>
         <span class="pill ${_bc.mode==='manual'?'p-acc':'p-dim'}" style="cursor:pointer" onclick="bcMode('manual')">manual</span>
         <span class="pill ${_bc.mode==='auto'?'p-ok':'p-dim'}" style="cursor:pointer" onclick="bcMode('auto')">auto</span></span></div>
     ${(()=>{ const A=_bc.auto||{}, auto=_bc.mode==='auto';
@@ -48933,16 +48927,14 @@ function bcPaint(){
           :A.next_at?`${(d=>d<=5?'due now':'in '+(d<90?Math.round(d)+'s':d<5400?Math.round(d/60)+'m':(d/3600).toFixed(1)+'h'))(A.next_at-Date.now()/1000)} <span class="dim">(${new Date(A.next_at*1000).toLocaleTimeString()})</span>`:'<span class="dim">—</span>'}</span>
         <span><span class="dim">every</span> <input type="number" min="0.25" max="168" step="0.25" value="${A.every_h||1}" style="width:52px;font-size:11px"
           title="Hours between sweeps in auto" onchange="bcEvery(this.value)"> <span class="dim">h</span></span>
-        <button class="rmb" ${A.running?'disabled':''} onclick="bcRunNow(this)" title="One sweep now, in either mode: Find a fuller copy for every open row advised fetch">Run now</button>
+        <button class="rmb" ${A.running?'disabled':''} onclick="bcRunNow(this)" title="One sweep now, in either mode: what auto would do for every row it owes something">Run now</button>
         <span class="dim">${A.running?'':(A.due?`${fmt(A.due)} to fetch`:'nothing to fetch')} · ${fmt(A.fetched||0)} fetched, ${fmt(A.none||0)} with nothing fuller, since start</span>
       </div>${(A.log||[]).length?`<div class="dim" style="font-size:10.5px;margin-top:2px">${A.log.slice(0,4).map(l=>`${esc(l.label||'')}: ${l.ok?'<span style="color:var(--ok)">grabbed</span> ':'<span style="color:#e8a33d">nothing fuller</span> - '}${esc(String(l.what||'').slice(0,70))}`).join(' · ')}</div>`:''}`; })()}
-    <div class="dim" style="font-size:11px;margin:3px 0 7px">An arr ranks releases by custom-format score, which knows nothing
-      about how many bits went into the picture - Lioness S03E03 went from 7.42 GB to 2.66 GB of 2160p as an "upgrade".
-      Listed: same resolution, the new file keeping under half the old one's picture (HEVC counted as needing 65% of H.264's
-      bits), a Remux source left out, and a new file that still has enough left out. Open a row for the numbers and a
-      recommendation. <b>Find a fuller copy</b> grabs the best-scored release of the same resolution (and HDR, where the file
-      has it) with at least four fifths of the old picture that nothing bans; the arr will call it "not an upgrade", so the
-      queue janitor imports it by hand instead of clearing it. <b>Keep</b> drops the row.</div>
+    <div class="dim" style="font-size:11px;margin:3px 0 7px">Lists an arr "upgrade" that kept under half of the old file's
+      picture at the same resolution. <b>Find a fuller copy</b> grabs the best release with at least four fifths of it
+      (same resolution, HDR and audio languages kept) and the queue janitor imports it; <b>Get the old one back</b> restores
+      the replaced file from the recycle bin or grabs its release again; <b>Keep</b> drops the row. Auto does all of that
+      by itself, except for the rows advised keep.</div>
     ${rows.length?`${bcSelBar()}<div class="rowbox scrollbox" style="max-height:380px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
       <colgroup><col style="width:24px"><col style="width:auto"><col style="width:200px"><col style="width:200px"><col style="width:66px"><col style="width:74px"><col style="width:240px"><col style="width:170px"></colgroup>
       <thead><tr class="dim" style="font-size:10.5px"><th class="c"><input type="checkbox" ${allOn?'checked':''} title="Select every row" onclick="bcSelAll(this.checked)"></th>
@@ -48980,7 +48972,7 @@ function bcSelAll(on){
   _bcLast=null; bcPaint();
 }
 function bcPickRec(){
-  _bcSel.clear(); bcRows().filter(r=>(r.state==='open'||r.state==='none')&&(r.why||{}).rec==='fetch').forEach(r=>_bcSel.add(r.file_id));
+  _bcSel.clear(); bcRows().filter(r=>(r.state==='open'||r.state==='none')&&(r.why||{}).rec!=='keep').forEach(r=>_bcSel.add(r.file_id));
   bcPaint();
 }
 function bcOpenRow(k){ if(_bcOpen.has(k)) _bcOpen.delete(k); else _bcOpen.add(k); bcPaint(); }

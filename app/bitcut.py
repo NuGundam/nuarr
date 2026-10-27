@@ -584,17 +584,19 @@ def _in_recycle(a, deleted: str) -> str:
     return ""
 
 
-def restore(file_id: int) -> dict:
+def restore(file_id: int, recycle_only: bool = False) -> dict:
     """Bring the file the upgrade replaced back: from the recycle bin, or by
-    grabbing its release again. The janitor imports a grab as for a fuller copy."""
+    grabbing its release again. The janitor imports a grab as for a fuller copy.
+    recycle_only stops after the bin - auto's first move, while the bin still
+    has the file (the arrs empty it after a week)."""
     _step(file_id, "reading the arr's history for the file the upgrade replaced", "getting the old one back")
     try:
-        return _restore(file_id)
+        return _restore(file_id, recycle_only)
     finally:
         _done(file_id)
 
 
-def _restore(file_id: int) -> dict:
+def _restore(file_id: int, recycle_only: bool = False) -> dict:
     import os
     from .arrqueue import _call
     from . import joblog
@@ -604,7 +606,8 @@ def _restore(file_id: int) -> dict:
     x, f, a, ids = got
     old = old_release(file_id)
     if not old.get("title"):
-        set_state(file_id, "none", old.get("why") or "the old release is not known")
+        if not recycle_only:
+            set_state(file_id, "none", old.get("why") or "the old release is not known")
         return {"ok": False, "why": old.get("why")}
     # 1. the recycle bin
     _step(file_id, f"looking in {a.name}'s recycle bin for {old['title'][:60]}")
@@ -631,6 +634,8 @@ def _restore(file_id: int) -> dict:
         _safe_ban(file_id)
         joblog.log(f"bitrate cut: {x['label']} - the old file restored from the recycle bin", "ok")
         return {"ok": True, "how": "recycle bin", "file": os.path.basename(dst)}
+    if recycle_only:
+        return {"ok": False, "why": "not in the recycle bin"}
     # 2. the same release, again
     _step(file_id, "not in the recycle bin - looking for the same release on the indexers")
     rel = _releases(a, ids, file_id)
@@ -880,11 +885,19 @@ def _preview(file_id: int) -> dict:
 
 # ------------------------------------------------------------- auto mode --
 # MANUAL OR AUTO, like Subtitle User Input. Manual lists the cuts and waits.
-# Auto runs Find a fuller copy by itself on every open row the advice says
-# "fetch" for - the clear losses - and leaves the "your call" ones, the "keep"
-# ones (an upgrade that brought English audio) and anything where nothing
-# fuller was found for a person. Each row gets one automatic try; after that
-# it is yours. A sweep runs a minute after a new cut lands and every hour.
+# Auto runs Find a fuller copy by itself on every open row unless the advice
+# is "keep" (an upgrade that brought English audio). The borderline band
+# used to be left for a person: of the first twelve such rows eleven were
+# fetched by hand and the twelfth was a keep case, so it is fetched too.
+# When nothing fuller exists: the old file comes back from the arr's recycle
+# bin at once, while the bin still has it; otherwise the row is rechecked
+# once a day for RETRY_D days - repacks and disc rips arrive late - and then
+# the old release is grabbed again. Only a row whose old release is gone as
+# well closes by itself, as kept, with the reason. A grab that is lost twice
+# (reconcile) is still a person's. A sweep runs a minute after a new cut
+# lands and every hour.
+RETRY_D = 14
+RETRY_S = 86400
 KV_MODE = "bitcut.mode"
 KV_AUTO_LOG = "bitcut.auto_log"
 KV_EVERY_H = "bitcut.sweep_h"
@@ -958,17 +971,40 @@ def _auto_note(row: dict) -> None:
     kv_set(KV_AUTO_LOG, json.dumps(([row] + _auto_log())[:40]))
 
 
+def _due_kind(x: dict, rec: str, now: float | None = None) -> str:
+    """What auto owes this row: fetch, retry (a daily look for a fuller
+    copy), restore (the retries are spent), or nothing."""
+    now = now or time.time()
+    st = x.get("state")
+    if rec == "keep":
+        return ""
+    if st == "open":
+        return "" if x.get("auto_tried") else "fetch"
+    if st == "none":
+        if x.get("auto_gave_up"):
+            return ""
+        if now - float(x.get("state_at") or 0) < RETRY_S:
+            return ""
+        if now - float(x.get("at") or 0) < RETRY_D * 86400:
+            return "retry"
+        return "restore"
+    return ""
+
+
 def auto_due() -> list:
-    """Open rows the advice says fetch for, not yet tried by auto."""
+    """Rows auto has something to do for, with the thing to do on each."""
     out = []
+    now = time.time()
     for x in _load():
-        if x.get("state") != "open" or x.get("auto_tried"):
+        if x.get("state") not in ("open", "none"):
             continue
         try:
-            if explain(x).get("rec") == "fetch":
-                out.append(x)
+            k = _due_kind(x, explain(x).get("rec") or "", now)
         except Exception:                                        # noqa: BLE001
             continue
+        if k:
+            x["_do"] = k
+            out.append(x)
     return out
 
 
@@ -979,17 +1015,31 @@ def auto_sweep() -> dict:
     fetched = none = 0
     try:
         for x in auto_due():
+            do = x.get("_do") or "fetch"
+            fid = int(x["file_id"])
             rows = _load()
             for r in rows:
-                if r["file_id"] == x["file_id"]:
+                if r["file_id"] == fid:
                     r["auto_tried"] = time.time()
             _save(rows)
             try:
-                res = fetch(int(x["file_id"]))
+                if do == "restore":
+                    res = restore(fid)
+                    if not res.get("ok"):
+                        set_state(fid, "kept", f"closed by auto: nothing fuller in {RETRY_D} days and the old "
+                                               f"release is gone - {res.get('why') or ''}"[:300], auto_gave_up=True)
+                else:
+                    res = fetch(fid)
+                    if not res.get("ok"):
+                        # the bin still has the old file? then it is back now
+                        rb = restore(fid, recycle_only=True)
+                        if rb.get("ok"):
+                            res = {"ok": True, "release": f"the old file, back from the recycle bin ({rb.get('file')})"}
             except Exception as e:                               # noqa: BLE001
                 res = {"ok": False, "why": f"{type(e).__name__}: {e}"[:160]}
+            word = {"fetch": "", "retry": "retry: ", "restore": "old release again: "}[do]
             _auto_note({"at": time.time(), "label": x.get("label"), "ok": bool(res.get("ok")),
-                        "what": res.get("release") or res.get("why") or ""})
+                        "what": word + str(res.get("release") or res.get("why") or "")})
             fetched += int(bool(res.get("ok")))
             none += int(not res.get("ok"))
         if fetched or none:
@@ -1042,7 +1092,5 @@ def snapshot() -> dict:
             x["why"] = {}
     return {"rows": rows, "open": sum(1 for x in rows if x.get("state") == "open"),
             "rule": {"ratio": RATIO, "refetch_at": REFETCH_AT},
-            "mode": mode(), "auto": {**AUTO, "log": _auto_log()[:12], "every_h": every_h(),
-                                     "due": len([x for x in rows if x.get("state") == "open"
-                                                 and not x.get("auto_tried")
-                                                 and (x.get("why") or {}).get("rec") == "fetch"])}}
+            "mode": mode(), "auto": {**AUTO, "log": _auto_log()[:12], "every_h": every_h(), "retry_d": RETRY_D,
+                                     "due": len([x for x in rows if _due_kind(x, (x.get("why") or {}).get("rec") or "")])}}
