@@ -1073,6 +1073,10 @@ async def _startup() -> None:
     asyncio.create_task(arrguard.watch())
     from . import arrqueue as _arrqueue
     asyncio.create_task(_arrqueue.watch())
+    # Import loops: a release the arr takes, nuarr rewrites, the arr takes
+    # again (Bleach S17E50, fifteen laps in a night). Reads the arr's history.
+    from . import arrloop as _arrloop
+    asyncio.create_task(_arrloop.watch())
     from . import tvdbfix as _tvdbfix
     asyncio.create_task(_tvdbfix.watch())
     from . import submake as _submake
