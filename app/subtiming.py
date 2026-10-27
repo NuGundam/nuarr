@@ -450,9 +450,13 @@ def as_running() -> list:
 def snapshot() -> dict:
     init()
     with cursor() as cur:
+        # THE LIVE PATH: the files row follows renames; the logged path stays
+        # only when the file is gone (same as the second opinion's rows).
         rows = [dict(r) for r in cur.execute(
-            "SELECT * FROM subtiming WHERE verdict NOT IN ('ok','skipped','unsure') OR action LIKE 'fixed%' "
-            "ORDER BY at DESC LIMIT 60")]
+            "SELECT s.*, f.path live_path FROM subtiming s "
+            "LEFT JOIN files f ON f.id=s.file_id AND f.state NOT IN ('deleted','duplicate') "
+            "WHERE s.verdict NOT IN ('ok','skipped','unsure') OR s.action LIKE 'fixed%' "
+            "ORDER BY s.at DESC LIMIT 60")]
         recent = [dict(r) for r in cur.execute("SELECT file_id, at, label, verdict, action, secs FROM subtiming "
                                                 "ORDER BY at DESC LIMIT 15")]
         tot = {r["verdict"]: r["n"] for r in cur.execute("SELECT verdict, COUNT(*) n FROM subtiming GROUP BY verdict")}
@@ -460,6 +464,10 @@ def snapshot() -> dict:
         last = [float(r["secs"] or 0) for r in cur.execute("SELECT secs FROM subtiming WHERE secs>0 ORDER BY at DESC LIMIT 20")]
         hour_n = cur.execute("SELECT COUNT(*) n FROM subtiming WHERE at > ?", (time.time() - 3600,)).fetchone()["n"]
     for r in rows:
+        live = r.pop("live_path", None)
+        if live and live != r["path"]:
+            r["path"] = live
+            r["label"] = _label(live)
         try:
             r["tracks"] = json.loads(r["tracks"] or "[]")
         except Exception:                                        # noqa: BLE001

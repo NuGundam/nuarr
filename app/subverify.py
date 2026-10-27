@@ -693,10 +693,20 @@ def as_running() -> list:
 def snapshot() -> dict:
     init()
     with cursor() as cur:
-        rows = [dict(r) for r in cur.execute("SELECT * FROM verify_log ORDER BY id DESC LIMIT 40")]
+        # THE LIVE PATH: a file renamed since the check (the arr's language
+        # tag, an encode) kept showing its old name here. The files row
+        # follows renames; the logged path stays only when the file is gone.
+        rows = [dict(r) for r in cur.execute(
+            "SELECT v.*, f.path live_path FROM verify_log v "
+            "LEFT JOIN files f ON f.id=v.file_id AND f.state NOT IN ('deleted','duplicate') "
+            "ORDER BY v.id DESC LIMIT 40")]
         tot = cur.execute("SELECT COUNT(*) n, SUM(CASE WHEN action LIKE 'answered%' THEN 1 ELSE 0 END) a, "
                           "SUM(CASE WHEN action LIKE 'left%' THEN 1 ELSE 0 END) l FROM verify_log").fetchone()
     for r in rows:
+        live = r.pop("live_path", None)
+        if live and live != r["path"]:
+            r["path"] = live
+            r["label"] = _label(r["file_id"], "", live)
         if (r.get("label") or "").startswith("(untitled)") or not r.get("label"):
             r["label"] = _label(r["file_id"], "", r["path"])
         try:
