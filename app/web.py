@@ -20517,9 +20517,10 @@ function attnPaint(){
 // and the full one land there, so the tile keeps up at 750ms without adding
 // a request of its own.
 let _runN=null, _runSub='', _runJobs=[];
+let _runPaintAt=0;
 function runTileFeed(live){
   const rows=(live&&live.running)||[];
-  _runJobs=rows;
+  _runJobs=rows; _runPaintAt=Date.now();
   _runN=rows.length;
   if(!rows.length){ _runSub='nothing running'; runTilePaint(); return; }
   // Name the furthest along, since that is the one about to change.
@@ -20590,6 +20591,7 @@ async function drill(q){
     if(p && p.style.display!=='none'){ p.style.display='none'; return; }
     if(p) p.style.display='';
     runPanelPaint();
+    try{ loadLive(); }catch(_){ }          // now, not at the next tick
     return;
   }
   if(q && q.attn){
@@ -50827,6 +50829,12 @@ async function loadLive(){
   finally{ _liveBusy=false; }
 }
 poll(loadLive, 750, 'jobCap');
+// THE OPEN PANEL IS ITS OWN GATE. Its rows ride the jobs polls above, which
+// are gated on the capacity bar; if those stop for any reason while the panel
+// is open (2026-10-26: a load-order error in one build did exactly that), the
+// panel froze on whatever it last showed. While it is open, nothing painted
+// for five seconds means fetch again - whatever the other gates say.
+poll(()=>{ if(Date.now()-_runPaintAt>5000) loadJobs(); }, 5000, 'runPanel');
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) loadLive(); });
 // 700 ms was only ever to drive the auto-scroll smoothly. With that gone the
 // list just needs to stay current, and a 300-row query every 0.7 s is wasted
