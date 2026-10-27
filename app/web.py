@@ -38898,12 +38898,9 @@ function stmPaint(){
       <div class="vfybar"><div class="vfyfill" style="background:#6ee7f7;width:${Math.max(2,Math.min(100,Math.round(v.pct||0)))}%"></div><div class="vfyrun"></div></div>
       <span class="dim" style="white-space:nowrap">${esc(v.stage||'')} · ${v.elapsed_s||0}s</span></div>`:
       `<div class="dim" style="font-size:11px;margin:0 0 4px">${v.mode==='off'?'switched off - nothing runs':v.paused?'paused on the Concurrency page':v.waiting>0?`idle - next pass ${v.next_run&&v.next_run>Date.now()/1000?'in '+Math.max(1,Math.round((v.next_run-Date.now()/1000)/60))+' min':'within 2 minutes'}`:'idle - every file has been checked'}${v.last_result?' · last: '+esc(v.last_result):''}</div>`}
-    <div class="dim" style="font-size:11px;margin:4px 0 2px">Every file with a text subtitle is checked once (again if it changes), newest first: the voice detector marks where somebody
-      speaks, and each track's spoken lines are lined up with it - over the whole file and then five minutes at a time. A track that is <b>late or early by the same amount</b>
-      throughout, or that <b>drifts</b> further each minute because it was timed for another frame rate (24 vs 23.976 fps, 25 PAL), is corrected in place with
-      mkvmerge - the track is not converted, only its timestamps move - and the rebuilt file is measured again before it replaces the original.
-      A track that is out of step in a way one correction cannot fix (another cut, a missing scene) is listed and left alone. Picture tracks are not measured,
-      and files on a disk somebody is watching from wait. The numbers per row are how late the lines are, slice by slice (+ late, − early).</div>
+    <div class="dim" style="font-size:11px;margin:4px 0 2px">Checks every text subtitle once against where the audio has speech, newest files first. A track that is <b>late or early by a fixed amount</b>,
+      or that <b>drifts</b> because it was timed for another frame rate, is shifted in place with mkvmerge and measured again before the file is replaced.
+      A track off in any other way is listed and left alone. The numbers per row are seconds late (+) or early (−), five minutes at a time.</div>
     <div style="display:flex;gap:6px;align-items:center;margin:6px 0;font-size:11px">check one file:
       <input id="stmPath" placeholder="full path of a file in the library" style="font-size:11px;flex:1;max-width:520px">
       <button class="rmb" onclick="stmOne(this)">Check</button></div>
