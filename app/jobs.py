@@ -1018,6 +1018,16 @@ class Worker:
             return ("Listening to this file's audio through Whisper to learn "
                     "what language each track is. GPU work in its own pool, "
                     "so it neither takes an encode slot nor waits behind one.")
+        if self.pool == "verify":
+            return ("The second opinion on a subtitle row the board is unsure "
+                    "about: Whisper listens where the lines are, Qwen reads them, "
+                    "the screen reader weighs in, and the votes settle it. GPU "
+                    "work on the heavy lane, one at a time, fed at the pace set "
+                    "on the Subtitle AI page.")
+        if self.pool == "qwen":
+            return ("The Qwen judge over the burned-in subtitle check's pictures "
+                    "and the doubtful track titles: one batch a job, the model "
+                    "loaded once for all of them. GPU work on the heavy lane.")
         if self.pool == "subtiming":
             return ("Lining up this file's text subtitles with the speech in "
                     "its audio: a track that is late, early or drifting is "
@@ -1721,6 +1731,10 @@ def _capacity(pool: str) -> int:
         return max(0, int(getattr(w, "submake_workers", 1)))
     if pool == "subtiming":
         return max(0, int(getattr(w, "subtiming_workers", 3)))
+    if pool == "verify":
+        return max(0, int(getattr(w, "verify_workers", 1)))
+    if pool == "qwen":
+        return max(0, int(getattr(w, "qwen_workers", 1)))
     if pool == "audio":
         return max(0, int(getattr(w, "audio_workers", 4)))
     if pool == "subs":
@@ -1752,8 +1766,8 @@ def enqueue_many(rows: list, kind: str, priority: int = 50,
     from .db import display_label
     pool = {"subs": "subs", "audio": "audio", "decode": "decode",
             "listen": "listen", "subread": "subread", "submake": "submake",
-            "subtiming": "subtiming"}.get(kind, "handler")
-    if kind not in ("transcode", "decode", "listen", "subread", "submake", "subtiming"):
+            "subtiming": "subtiming", "verify": "verify", "qwen": "qwen"}.get(kind, "handler")
+    if kind not in ("transcode", "decode", "listen", "subread", "submake", "subtiming", "verify", "qwen"):
         priority = min(priority, 50)
     want = [r for r in rows if r.get("file_id") and r.get("path")
             and not _sc.is_excluded(r["path"])]
@@ -2079,8 +2093,10 @@ async def enqueue(file_id: int, path: str, title: str = "",
             else "listen" if kind == "listen"
             else "subread" if kind == "subread"
             else "submake" if kind == "submake"
-            else "subtiming" if kind == "subtiming" else "handler")
-    if kind not in ("transcode", "decode", "listen", "subread", "submake", "subtiming"):
+            else "subtiming" if kind == "subtiming"
+            else "verify" if kind == "verify"
+            else "qwen" if kind == "qwen" else "handler")
+    if kind not in ("transcode", "decode", "listen", "subread", "submake", "subtiming", "verify", "qwen"):
         priority = min(priority, 50)
     # ...EXCEPT subtitle OCR, which is explicitly background work. The clamp
     # above exists because repairs and pool maps are quick and want to jump the
@@ -2299,7 +2315,7 @@ def _heavy(pool_name: str, plan_obj=None) -> bool:
 # encode already on a disk never kept a copy off it, and making it do so now
 # would be a tightening nobody asked for.
 SPINDLE_WEIGHT = {"passthrough": 3, "subocr": 3, "subs": 3,
-                  "subread": 2, "decode": 2, "submake": 2, "subtiming": 2,
+                  "subread": 2, "decode": 2, "submake": 2, "subtiming": 2, "verify": 1, "qwen": 0,
                   "encode": 1, "listen": 1,
                   "audio": 0, "probe": 0, "handler": 0}
 SPINDLE_BUDGET = 4
@@ -2370,7 +2386,7 @@ CPU_FREE_UNDER = 0.5
 # are not held back by it.
 START_GAP_S = 6.0
 HEAVY_POOLS = frozenset({"encode", "passthrough", "subocr", "decode", "subread", "listen", "submake",
-                         "subtiming"})
+                         "subtiming", "verify", "qwen"})
 _LAST_START = {"heavy": 0.0}
 # AND THE WORK YOU CAN SEE KEEPS A CORNER OF THE BUDGET. The measurements
 # that prompted this are all background work - checking files decode, reading
@@ -2381,7 +2397,7 @@ _LAST_START = {"heavy": 0.0}
 # check. Two cores held back is one repack's audio conversion plus the
 # encoder's feeder: enough that the visible half of nuarr never queues behind
 # the invisible half.
-BACKGROUND_POOLS = frozenset({"decode", "subread", "probe", "listen", "submake", "subtiming"})
+BACKGROUND_POOLS = frozenset({"decode", "subread", "probe", "listen", "submake", "subtiming", "verify", "qwen"})
 VIDEO_RESERVE = 2.0
 
 
@@ -3338,7 +3354,7 @@ async def pump() -> None:
                 if any(st.open_for(p) for p in
                        ("handler", "encode", "passthrough", "subocr",
                         "subs", "audio", "decode", "listen", "subread",
-                        "submake", "subtiming")):
+                        "submake", "subtiming", "verify", "qwen")):
                     async with _lock:
                         # HANDLERS FIRST. OCR, repairs and flag fixes must finish
                         # before a transcode touches the same library, otherwise
@@ -3364,10 +3380,12 @@ async def pump() -> None:
                         # for the next top-up.
                         for pool in ("handler", "subs", "audio", "encode",
                                      "passthrough", "subocr", "decode",
-                                     "listen", "subread", "submake", "subtiming"):
+                                     "listen", "subread", "submake", "subtiming",
+                                     "verify", "qwen"):
                             if pool not in ("handler", "subs", "audio",
                                             "subocr", "decode", "listen",
-                                            "subread", "submake", "subtiming") and blocked:
+                                            "subread", "submake", "subtiming",
+                                            "verify", "qwen") and blocked:
                                 continue
                             if not st.open_for(pool):
                                 continue
@@ -4452,6 +4470,14 @@ async def _run(job: Job, pool: str) -> None:
             await _subtiming_job(w)
             return
 
+        if job.kind == "verify":
+            await _verify_job(w)
+            return
+
+        if job.kind == "qwen":
+            await _qwen_job(w)
+            return
+
         if job.kind == "sub_ocr":
             data = await probe(job.path)
             if not data:
@@ -4621,6 +4647,14 @@ async def _run(job: Job, pool: str) -> None:
 
         if job.kind == "subtiming":
             await _subtiming_job(w)
+            return
+
+        if job.kind == "verify":
+            await _verify_job(w)
+            return
+
+        if job.kind == "qwen":
+            await _qwen_job(w)
             return
 
         if job.kind == "sub_ocr":
@@ -5426,6 +5460,90 @@ async def _submake_job(w: Worker) -> None:
         _finish(job, "skipped", before, after, note=why)
     else:
         _finish(job, "failed", before, after, why or "the Subtitle maker failed")
+
+
+async def _verify_job(w: Worker) -> None:
+    r"""The second opinion on one unsure board row, inside a job.
+
+    It ran beside the queue on its own tick; as a pool it is fed at the
+    Subtitle AI page's pace, newest files first, one at a time on the heavy
+    lane, and the fresh-file follow-up puts a just-landed file's row at the
+    front instead of running it inline. The row is read from the board as
+    it is now; a row no longer unsure is a skip, not a failure."""
+    from . import subverify, heavy
+    from . import gpubudget as _gb
+    job = w.job
+    if subverify.paused():
+        _defer(job, "the second opinion is paused")
+        return
+    if subverify.mode() == "off":
+        _finish(job, "skipped", 0, 0, note="the second opinion is switched off")
+        return
+    try:
+        with cursor() as cur:
+            r = cur.execute("SELECT plan_json FROM jobs WHERE job_id=?", (job.id,)).fetchone()
+        plan = json.loads((r["plan_json"] if r else "") or "{}")
+    except Exception:                                        # noqa: BLE001
+        plan = {}
+    got, holder = heavy.claim(subverify.LANE, ttl=1800)
+    if not got:
+        _defer(job, f"{holder} has the GPU lane")
+        return
+    res: dict = {}
+    try:
+        ok, why = await asyncio.to_thread(_gb.make_room, _gb.COST_GB.get("whisper_small", 1.2), "verify", 300)
+        if not ok:
+            _defer(job, f"GPU memory - {why}")
+            return
+        w.sub_summary = "the second opinion: Whisper, Qwen and the screen reader vote"
+        w.set_stage("starting")
+        try:
+            res = await asyncio.to_thread(subverify.verify_job, w, int(job.file_id),
+                                          str(plan.get("source") or ""))
+        except Exception as e:                               # noqa: BLE001
+            _finish(job, "failed", 0, 0, f"{type(e).__name__}: {e}"[:200])
+            return
+    finally:
+        heavy.release(subverify.LANE)
+    if res.get("none"):
+        _finish(job, "skipped", 0, 0, note="the board is no longer unsure about it")
+    else:
+        _finish(job, "done", 0, 0,
+                note=f"{res.get('kind') or res.get('verdict') or 'undecided'} "
+                     f"({int(res.get('confidence') or 0)}%) - {res.get('action') or ''}"[:200])
+    if plan.get("fresh"):
+        try:
+            from . import subneed as _sn
+            asyncio.get_running_loop().create_task(_sn.fresh_followup(int(job.file_id), job.id, after_verify=True))
+        except Exception:                                    # noqa: BLE001
+            pass
+
+
+async def _qwen_job(w: Worker) -> None:
+    r"""One batch of the Qwen judge, inside a job. The job carries the first
+    pending file's name; the run reads every pending picture and track."""
+    from . import qwenjudge
+    job = w.job
+    if qwenjudge.paused():
+        _defer(job, "the Qwen judge is paused")
+        return
+    try:
+        with cursor() as cur:
+            r = cur.execute("SELECT plan_json FROM jobs WHERE job_id=?", (job.id,)).fetchone()
+        plan = json.loads((r["plan_json"] if r else "") or "{}")
+    except Exception:                                        # noqa: BLE001
+        plan = {}
+    w.sub_summary = plan.get("summary") or "the Qwen judge over the pending pictures and tracks"
+    w.set_stage("starting")
+    try:
+        res = await qwenjudge.run_job(w)
+    except Exception as e:                                   # noqa: BLE001
+        _finish(job, "failed", 0, 0, f"{type(e).__name__}: {e}"[:200])
+        return
+    if str(res).startswith("waiting"):
+        _defer(job, str(res))
+        return
+    _finish(job, "done", 0, 0, note=str(res)[:200])
 
 
 async def _subtiming_job(w: Worker) -> None:
@@ -8128,7 +8246,7 @@ def _why_idle(workers, depth: int) -> dict:
     # THE OTHER POOLS ARE WORKING, and saying so matters: an idle processing
     # panel beside a busy box reads as a fault otherwise.
     els = {p: sum(1 for w in workers if getattr(w, "pool", "") == p)
-           for p in ("subs", "subocr", "decode", "listen", "audio", "subread", "subtiming")}
+           for p in ("subs", "subocr", "decode", "listen", "audio", "subread", "subtiming", "verify", "qwen")}
     out["elsewhere"] = {k: v for k, v in els.items() if v}
     out["queued_all"] = int(depth or 0)
     return out
@@ -8288,7 +8406,9 @@ def live_snapshot() -> dict:
                      "listen": _capacity("listen"),
                      "subread": _capacity("subread"),
                      "submake": _capacity("submake"),
-                     "subtiming": _capacity("subtiming")},
+                     "subtiming": _capacity("subtiming"),
+                     "verify": _capacity("verify"),
+                     "qwen": _capacity("qwen")},
         "in_use": {"encode": _in_pool("encode"),
                    "passthrough": _in_pool("passthrough"),
                    "subocr": _in_pool("subocr"),
@@ -8298,7 +8418,9 @@ def live_snapshot() -> dict:
                    "listen": _in_pool("listen"),
                    "subread": _in_pool("subread"),
                    "submake": _in_pool("submake"),
-                   "subtiming": _in_pool("subtiming")},
+                   "subtiming": _in_pool("subtiming"),
+                   "verify": _in_pool("verify"),
+                   "qwen": _in_pool("qwen")},
         "paused": sorted(_wcfg.paused()),
         "subocr_inline": sum(1 for w in workers if w.sub_ocr_active),
         # How the recently-finished jobs ended, so a ghost card can say what
@@ -8470,7 +8592,9 @@ def snapshot(recent_limit: int = 60) -> dict:
                      "listen": _capacity("listen"),
                      "subread": _capacity("subread"),
                      "submake": _capacity("submake"),
-                     "subtiming": _capacity("subtiming")},
+                     "subtiming": _capacity("subtiming"),
+                     "verify": _capacity("verify"),
+                     "qwen": _capacity("qwen")},
         "in_use": {"encode": _in_pool("encode"),
                    "passthrough": _in_pool("passthrough"),
                    "subocr": _in_pool("subocr"),
@@ -8480,7 +8604,9 @@ def snapshot(recent_limit: int = 60) -> dict:
                    "listen": _in_pool("listen"),
                    "subread": _in_pool("subread"),
                    "submake": _in_pool("submake"),
-                   "subtiming": _in_pool("subtiming")},
+                   "subtiming": _in_pool("subtiming"),
+                   "verify": _in_pool("verify"),
+                   "qwen": _in_pool("qwen")},
         "paused": sorted(_wcfg.paused()),
         # How much of the subocr figure above is running INSIDE a transcode
         # rather than as a job of its own. Same budget, different home, and the

@@ -2764,7 +2764,7 @@ def sweep_all() -> dict:
             "took": round(time.time() - started, 1), **counts()}
 
 
-async def fresh_followup(file_id: int, job_id: str = "") -> None:
+async def fresh_followup(file_id: int, job_id: str = "", after_verify: bool = False) -> None:
     """THE SUBTITLE QUESTION FOR THIS FILE, NOW.
 
     A fresh file's rewrite has just landed (or its facts said no rewrite was
@@ -2790,14 +2790,16 @@ async def fresh_followup(file_id: int, job_id: str = "") -> None:
                                 (fid, MISSING, UNKNOWN)).fetchone()
             return str(r["state"]) if r else ""
         st = await asyncio.to_thread(_state)
-        if st == UNKNOWN:
+        if st == UNKNOWN and not after_verify:
+            # THE SECOND OPINION AS A JOB, at the front of its pool; when it
+            # is done the job calls back here with after_verify, the board
+            # is read again and a raw goes on to the maker.
             from . import subverify
-            r = await asyncio.to_thread(subverify.verify_file, fid)
-            if r.get("done"):
-                _jl.log("second opinion asked straight away for the fresh file", "info", job_id or None,
+            r = await asyncio.to_thread(subverify.enqueue_fresh, fid)
+            if r.get("queued"):
+                _jl.log("second opinion queued at the front for the fresh file", "info", job_id or None,
                         system="subneed")
-                await asyncio.to_thread(check_one, fid)
-                st = await asyncio.to_thread(_state)
+            return
         if st == MISSING:
             from . import submake
             if submake.gate(fid) == "none":

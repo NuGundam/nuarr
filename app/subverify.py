@@ -361,9 +361,10 @@ def _combine(votes: dict, strength: dict | None = None) -> tuple:
 
 
 # ------------------------------------------------------------ the work ----
-def verify_one(row: dict, act: bool | None = None, dry: bool = False) -> dict:
+def verify_one(row: dict, act: bool | None = None, dry: bool = False, w=None) -> dict:
     """One board row -> evidence from every engine, a verdict, and what was done.
-    dry: gather and judge, answer nothing, teach nothing - for checking the method."""
+    dry: gather and judge, answer nothing, teach nothing - for checking the method.
+    w: the queue Worker whose card follows the stages."""
     from . import subkind, hardsub, subtitletitle as stt, sublearn
     init()
     fid, source = int(row["file_id"]), str(row.get("source") or "")
@@ -377,6 +378,12 @@ def verify_one(row: dict, act: bool | None = None, dry: bool = False) -> dict:
 
     def tick(stage, pct=0.0):
         STATE.update(stage=stage, pct=float(pct))
+        if w is not None:
+            try:
+                w.set_stage(str(stage)[:60])
+                w.progress = max(0.0, min(1.0, float(pct) / 100.0))
+            except Exception:                                    # noqa: BLE001
+                pass
 
     ev: dict = {"rules": {"sure": int(row.get("sure") or 0), "why": (row.get("why") or "")[:300]}}
     votes: dict = {}
@@ -658,15 +665,9 @@ async def watch() -> None:
         t_tick = time.time()
         STATE["next_run"] = t_tick + TICK_S
         try:
-            if mode() != "off" and not paused():
-                now = time.time()
-                if now - STATE["hour_start"] > 3600:
-                    STATE.update(hour_start=now, hour_count=0)
-                room = per_hour() - STATE["hour_count"]
-                if room > 0:
-                    n = max(1, min(room, per_hour() * TICK_S / 3600 + 0.999).__int__())
-                    r = await asyncio.to_thread(run_batch, n)
-                    STATE["hour_count"] += int(r.get("done") or 0)
+            # THE QUEUE DOES THE WORK NOW: this tick tops it up at the
+            # hourly pace; the verify pool runs one at a time on the lane.
+            await asyncio.to_thread(feed)
         except Exception as e:                                   # noqa: BLE001
             joblog.log(f"second opinion: {type(e).__name__}: {e}", "error")
         # start to start, as in subtiming.watch: sleeping a full tick after
@@ -674,7 +675,94 @@ async def watch() -> None:
         await asyncio.sleep(max(10.0, TICK_S - (time.time() - t_tick)))
 
 
+def in_queue() -> int:
+    try:
+        with cursor() as cur:
+            return int(cur.execute("SELECT COUNT(*) n FROM jobs WHERE kind='verify' "
+                                   "AND state IN ('queued','pending','running')").fetchone()["n"])
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
+def _paths(ids: list) -> dict:
+    out: dict = {}
+    with cursor() as cur:
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            for r in cur.execute(f"SELECT id, path FROM files WHERE id IN ({','.join('?' * len(chunk))})", chunk):
+                out[int(r["id"])] = r["path"]
+    return out
+
+
+def _rows_for_queue(rows: list, fresh: bool = False) -> list:
+    paths = _paths([int(r["file_id"]) for r in rows])
+    out = []
+    for r in rows:
+        fid = int(r["file_id"])
+        p = r.get("path") or paths.get(fid) or ""
+        if not p:
+            continue
+        out.append({"file_id": fid, "path": p,
+                    "plan_json": json.dumps({"source": str(r.get("source") or ""), "act": mode() == "auto",
+                                             "fresh": bool(fresh),
+                                             "summary": "the second opinion on an unsure subtitle row"})})
+    return out
+
+
+def feed(n: int | None = None, manual: bool = False) -> dict:
+    """Top the queue up with the board's unsure rows, newest files first. The
+    hourly budget paces it; one runs at a time (the GPU lane)."""
+    from . import jobs as _jobs
+    if mode() == "off":
+        return {"queued": 0, "why": "switched off"}
+    if paused():
+        return {"queued": 0, "why": "paused"}
+    now = time.time()
+    if now - STATE["hour_start"] > 3600:
+        STATE.update(hour_start=now, hour_count=0)
+    if n is None:
+        room = per_hour() - STATE["hour_count"]
+        if room <= 0:
+            return {"queued": 0, "why": "this hour's budget is spent"}
+        n = max(1, min(room, int(per_hour() * TICK_S / 3600 + 0.999)))
+    inq = in_queue()
+    want = n if manual else n - inq
+    if want <= 0:
+        return {"queued": 0, "why": f"{inq} already waiting"}
+    rows = _rows_for_queue(candidates(want + inq + 5))
+    if not rows:
+        return {"queued": 0, "why": "nothing is unsure right now"}
+    g = _jobs.enqueue_many(rows[:want], "verify", priority=40 if manual else 80,
+                           source="ui" if manual else "verify")
+    made = int(g.get("made") or 0)
+    STATE["hour_count"] += made
+    return {"queued": made, "held": g.get("held") or {}, "skipped": int(g.get("skipped") or 0)}
+
+
+def enqueue_fresh(file_id: int) -> dict:
+    """The fresh-file follow-up: this file's unsure row to the front of the
+    queue, now. {queued} or {none} when the board is not unsure about it."""
+    from . import jobs as _jobs
+    rows = [r for r in candidates(800) if int(r.get("file_id") or 0) == int(file_id)]
+    rows = _rows_for_queue(rows[:1], fresh=True)
+    if not rows:
+        return {"none": True, "queued": 0}
+    g = _jobs.enqueue_many(rows, "verify", priority=_jobs.FRESH_PRIORITY, source="ui")
+    return {"queued": int(g.get("made") or 0)}
+
+
+def verify_job(w, file_id: int, source: str = "") -> dict:
+    """One file inside a queue job - the row is read from the board as it is
+    now, not as it was when queued. {none} when it is no longer unsure."""
+    rows = [r for r in candidates(800) if int(r.get("file_id") or 0) == int(file_id)
+            and (not source or str(r.get("source") or "") == source)]
+    if not rows:
+        return {"none": True}
+    return verify_one(rows[0], w=w)
+
+
 def as_running() -> list:
+    return []                    # the second opinion is a queue job now; its card comes from RUNNING
     if not STATE.get("running"):
         return []
     el = time.time() - float(STATE.get("started") or time.time())

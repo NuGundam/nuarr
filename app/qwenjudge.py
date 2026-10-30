@@ -326,16 +326,76 @@ async def run() -> str:
         heavy.release(LANE)
 
 
+def in_queue() -> int:
+    from .db import cursor
+    try:
+        with cursor() as cur:
+            return int(cur.execute("SELECT COUNT(*) n FROM jobs WHERE kind='qwen' "
+                                   "AND state IN ('queued','pending','running')").fetchone()["n"])
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
+def feed(force: bool = False) -> dict:
+    """One job for the next batch, when there is something to judge and no
+    judge job is queued or running. THE JOB IS THE BATCH: the judge loads a
+    7B model once and reads every pending picture and track in that run, so
+    one job per file would load it once per file. Titled by its first file."""
+    from . import jobs as _jobs
+    from .db import cursor
+    if paused() and not force:
+        return {"queued": 0, "why": "paused"}
+    if in_queue():
+        return {"queued": 0, "why": "a judge job is already queued or running"}
+    todo = pending()
+    tracks = pending_tracks()
+    if not todo and not tracks:
+        return {"queued": 0, "why": "nothing to judge"}
+    plan = json.dumps({"batch": True, "pictures": len(todo), "tracks": len(tracks),
+                       "summary": f"judge {len(todo)} picture(s) and {len(tracks)} track(s)"})
+    # THE FIRST PENDING FILE WITHOUT ANOTHER JOB: the queue takes one job
+    # per file, so a file mid-encode cannot carry the batch; the next can.
+    cands = [int(x) for x in todo[:20]] + [int(t["file_id"]) for t in tracks[:20]]
+    with cursor() as cur:
+        for fid in cands:
+            r = cur.execute("SELECT path FROM files WHERE id=?", (fid,)).fetchone()
+            if not r or not r["path"]:
+                continue
+            g = _jobs.enqueue_many([{"file_id": fid, "path": r["path"], "plan_json": plan}], "qwen",
+                                   priority=40 if force else 80, source="ui" if force else "qwen")
+            if int(g.get("made") or 0):
+                return {"queued": 1, "pictures": len(todo), "tracks": len(tracks)}
+    return {"queued": 0, "why": "every pending file has another job on it right now"}
+
+
+async def run_job(w) -> str:
+    """run() inside a queue job: the Worker's card follows STATE while it goes."""
+    async def _mirror():
+        while True:
+            await asyncio.sleep(1.0)
+            tot, done = int(STATE.get("total") or 0), int(STATE.get("done") or 0)
+            try:
+                w.set_stage(((f"{done} of {tot} · ") if tot else "") + str(STATE.get("stage") or "judging"))
+                w.progress = (done / tot) if tot else 0.0
+            except Exception:                                    # noqa: BLE001
+                pass
+    t = asyncio.create_task(_mirror())
+    try:
+        res = await run()
+    finally:
+        t.cancel()
+    STATE["last_result"] = res
+    return res
+
+
 async def watch() -> None:
     await asyncio.sleep(240)
     while True:
-        if paused():
-            STATE["last_result"] = "paused on the Concurrency page"
-            STATE["next_run"] = time.time() + POLL_S
-            await asyncio.sleep(POLL_S)
-            continue
         try:
-            STATE["last_result"] = await run()
+            # THE QUEUE RUNS THE JUDGE NOW: this only queues the next batch.
+            r = await asyncio.to_thread(feed)
+            if r.get("why") and r["why"] != "nothing to judge":
+                STATE["last_result"] = r["why"]
         except Exception as e:                                   # noqa: BLE001
             STATE["error"] = f"{type(e).__name__}: {e}"
         STATE["next_run"] = time.time() + POLL_S
@@ -444,6 +504,7 @@ def stop() -> bool:
 
 def as_running() -> list:
     """The judge as a worker card for the job feed, while it runs."""
+    return []                    # a queue job now; its card comes from RUNNING
     if not STATE.get("running"):
         return []
     el = time.time() - float(STATE.get("started") or time.time())

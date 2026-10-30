@@ -92,6 +92,10 @@ LIMITS = {
     # voice detector, then mkvmerge when a track moves), 15-30 s each. Fed
     # at the hourly pace from the Subtitles page; this is how many at once.
     "subtiming_workers": (0, 6, 3),
+    # The second opinion and the Qwen judge: GPU work on the heavy lane,
+    # which takes one holder at a time, so one is the only count that runs.
+    "verify_workers": (0, 1, 1),
+    "qwen_workers": (0, 1, 1),
     # ffprobe is cheap but still a pool read each - one seek per file, rated
     # disk 2 / cpu 1. Eight keeps a library walk moving without making the
     # pool sound like a scan.
@@ -327,6 +331,8 @@ LABELS = {
     "subread_workers": "Subtitle track reads at once",
     "submake_workers": "Subtitles made at once",
     "subtiming_workers": "Subtitle timing checks at once",
+    "verify_workers": "Second opinions at once",
+    "qwen_workers": "Qwen judge batches at once",
     "probe_workers": "File scans at once",
     "arr_concurrency": "Sonarr/Radarr calls at once",
     "hold_minutes": "Settle time (minutes)",
@@ -385,6 +391,13 @@ HINTS = {
                       "language identifier on the graphics card. One model "
                       "is loaded; a second job shares it and each runs at "
                       "half speed, so one is the honest default.",
+    "verify_workers": "How many unsure subtitle rows may get the second opinion at once: "
+                      "Whisper listens where the lines are, Qwen reads them, the screen reader "
+                      "weighs in. On the GPU lane, which takes one holder, so one. Fed at the "
+                      "hourly pace set on the Subtitle AI page, newest files first.",
+    "qwen_workers": "How many Qwen judge batches may run at once. One batch reads every "
+                    "pending burned-in picture and doubtful track title with the model loaded "
+                    "once; on the GPU lane, so one.",
     "subtiming_workers": "How many files may have their subtitle timing checked at once. "
                          "Each lines up the speech in the audio with every text track and "
                          "corrects a late, early or drifting track in place; one processor "
@@ -511,7 +524,7 @@ POOL_OF = {"encode_workers": "encode", "passthrough_workers": "passthrough",
            "subs_workers": "subs", "audio_workers": "audio",
            "decode_workers": "decode", "listen_workers": "listen",
            "subread_workers": "subread", "submake_workers": "submake",
-           "subtiming_workers": "subtiming"}
+           "subtiming_workers": "subtiming", "verify_workers": "verify", "qwen_workers": "qwen"}
 
 # Which tab each setting belongs to in the UI.
 TIMING_KEYS = ("hold_minutes", "scan_every_min", "ffmpeg_check_h",
@@ -537,6 +550,8 @@ class WorkerConfig:
     subread_workers: int
     submake_workers: int
     subtiming_workers: int
+    verify_workers: int
+    qwen_workers: int
     probe_workers: int
     arr_concurrency: int
     hold_minutes: int
@@ -679,6 +694,16 @@ COST = {
                "large-v3 listens to every stretch of speech (about 3 GB of "
                "video memory), PaddleOCR reads the on-screen text, Qwen "
                "translates. Minutes a file; the lane is held throughout."},
+    "verify_workers": {
+        "cpu": 1, "gpu": 2, "ram": 1, "disk": 1, "lead": "gpu",
+        "why": "Whisper (small) over a handful of fourteen-second windows where "
+               "the lines are, Qwen over the words, then the votes; a few "
+               "minutes of audio read off one pool disk. On the heavy lane."},
+    "qwen_workers": {
+        "cpu": 1, "gpu": 3, "ram": 2, "disk": 0, "lead": "gpu",
+        "why": "Qwen2.5-7B loaded once (about 5 GB of card memory) and asked "
+               "about every pending picture's lines and track sample in turn; "
+               "the lines are already in the database, so no file is read."},
     "subtiming_workers": {
         "cpu": 2, "gpu": 0, "ram": 1, "disk": 1, "lead": "cpu",
         "why": "The voice detector (Silero, on the processor) over the whole "
@@ -716,7 +741,7 @@ _COST_POOL = {"encode_workers": "encode", "passthrough_workers": "passthrough",
               "subs_workers": "subs", "audio_workers": "audio",
               "decode_workers": "decode", "listen_workers": "listen",
               "subread_workers": "subread", "submake_workers": "submake",
-              "subtiming_workers": "subtiming"}
+              "subtiming_workers": "subtiming", "verify_workers": "verify", "qwen_workers": "qwen"}
 
 _MED: dict = {"at": 0.0, "data": {}}
 

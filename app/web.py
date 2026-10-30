@@ -3991,7 +3991,7 @@ def _summary_impl():
 # The pools the queue can hold. Every one of them, because a replay that
 # knows only two of them cannot order the other six at all - see below.
 _QUEUE_POOLS = ("encode", "passthrough", "subocr", "subs", "audio", "decode",
-                "listen", "subread", "submake", "subtiming")
+                "listen", "subread", "submake", "subtiming", "verify", "qwen")
 
 
 def _dispatch_order(rows: list, want: int) -> list:
@@ -5392,9 +5392,10 @@ def api_qwenjudge_stop():
 
 @app.post("/api/qwenjudge/run")
 async def api_qwenjudge_run():
+    """One batch, as a queue job, ahead of the feeder's."""
     from . import qwenjudge
-    asyncio.create_task(qwenjudge.run())
-    return {"started": True}
+    r = await asyncio.to_thread(qwenjudge.feed, True)
+    return {"started": bool(r.get("queued")), **r}
 
 
 @app.get("/api/qwen")
@@ -11118,6 +11119,12 @@ async def api_verify_run(n: int = 3):
     """Verify the next N unsure rows now (the heavy lane permitting)."""
     from . import subverify
     n = max(1, min(600, int(n)))
+    # THROUGH THE QUEUE, ahead of the feeder's own rows; the verify pool
+    # runs them one at a time on the lane.
+    r = await asyncio.to_thread(subverify.feed, n, True)
+    if int(r.get("queued") or 0):
+        return {"started": int(r["queued"])}
+    return {"skipped": r.get("why") or "nothing queued"}
     if n <= 3:
         return await asyncio.to_thread(subverify.run_batch, n)
     # A big batch runs behind the answer (a file takes a minute or more); the
@@ -14213,26 +14220,6 @@ def _outside_live() -> list:
              "hint": ("Before an encode: sample encodes scored with VMAF and the banding index until the "
                       "smallest file that still scores the target is found. CPU work - more at once "
                       "starves the encoder of frames; two keeps NVENC busy.")},
-            {"key": "submake", "pool": "submake", "label": "Subtitle maker",
-             "running": 1 if submake.STATE.get("running") else 0, "cap": 1, "paused": submake.paused(),
-             "now": ("making " + submake.STATE.get("label", "")) if submake.STATE.get("running") else "",
-             "queued": len(submake._queue()),
-             "hint": ("English subtitles for a file that has none: Whisper for what is said, "
-                      "PaddleOCR and Qwen for what is written. Runs when you ask, or first for a raw "
-                      "in auto, before anything is replaced."), "cost": submake.cost()},
-            {"key": "qwen", "pool": "qwen", "label": "Qwen judge",
-             "running": 1 if qwenjudge.STATE.get("running") else 0, "cap": 1, "paused": qwenjudge.paused(),
-             "now": (f"judging {qwenjudge.STATE.get('done', 0)} of {qwenjudge.STATE.get('total', 0)}"
-                     if qwenjudge.STATE.get("running") else ""),
-             "queued": qwenjudge.waiting(),
-             "hint": ("Reads the lines the burned-in subtitle check kept and says how likely they are "
-                      "to be dialogue. Every ten minutes when there is something new."), "cost": qwenjudge.cost()},
-            {"key": "verify", "pool": "verify", "label": "Second opinion",
-             "running": 1 if sv.get("running") else 0, "cap": 1, "paused": subverify.paused(),
-             "now": ("checking " + (sv.get("label") or "")) if sv.get("running") else "",
-             "queued": 0,
-             "hint": ("Files the subtitle board is unsure about get Whisper, Qwen and the readers instead of a "
-                      "person; settles them at the sure % on the Subtitle AI page.")},
             {"key": "qwenvl", "pool": "qwenvl", "label": "Qwen-VL reader",
              "running": 0, "cap": 1, "paused": not qwenvl.on(),
              "now": "", "queued": 0,
@@ -17758,7 +17745,9 @@ html.mobile #logsPane{height:auto;min-height:60vh}
         <option value="listen">listen</option>
         <option value="subread">subread</option>
         <option value="submake">submake</option>
-        <option value="subtiming">subtiming</option></select>
+        <option value="subtiming">subtiming</option>
+        <option value="verify">verify</option>
+        <option value="qwen">qwen</option></select>
       <select id="qfDisk" onchange="qReload(this.value?('filtering to '+this.value+'…'):'showing all disks…')">
         <option value="">all disks</option></select>
       <input id="qfText" placeholder="filter by title or path" style="width:200px"
@@ -25349,6 +25338,8 @@ function poolColor(pool){
        : pool==='subread'     ? '#c9d1d9'         // grey - a measurement, not a change
        : pool==='submake'     ? '#79c0ff'         // blue - the Subtitle maker
        : pool==='subtiming'   ? '#6ee7f7'         // cyan - the timing fixer, its panel's colour
+       : pool==='qwen'        ? '#f0b37e'         // apricot - the Qwen judge
+       : pool==='verify'      ? '#ff7b72'         // coral - the second opinion
        : pool==='handler'     ? '#d2a8ff'         // lilac - script handlers
        : pool==='passthrough' ? 'var(--ok)'       // green - stream copy
        : pool==='audio'       ? '#39d3c3'         // teal - was violet, too close to subocr
@@ -30043,8 +30034,8 @@ function outsideRows(list){
   if(!list.length) return '';
   return `<div style="padding:10px 14px 4px"><b style="font-size:12px">Outside the queue</b>
       <div class="dim" style="font-size:11px">Work that is not a queue pool: the quality search runs inside an encode slot
-      before the encode proper; the rest each run in a process of their own, one at a time, on the GPU lane they share
-      with installs and engine tests. Only the quality search has a count to set; the others only run or pause.</div></div>
+      before the encode proper, and the Qwen-VL reader is asked by the OCR only when it doubts a picture. The Subtitle
+      maker, the Qwen judge, the second opinion and the timing check are queue pools now - their counts are above.</div></div>
     <table>${list.map(v=>{
       const pc=poolColor(v.pool), off=!!v.paused;
       return `<tr class="${off?'wpaused':''}">
@@ -50663,7 +50654,7 @@ function workersCompact(w){
   const KEYS = ['encode_workers','passthrough_workers','subocr_workers',
                 'subs_workers','audio_workers','decode_workers',
                 'listen_workers','subread_workers','submake_workers',
-                'subtiming_workers','probe_workers','arr_concurrency'];
+                'subtiming_workers','verify_workers','qwen_workers','probe_workers','arr_concurrency'];
   const cell = (k)=>{
     const v = w[k]; if(!v) return '';
     const col = v.pool ? poolColor(v.pool) : 'var(--dim)';

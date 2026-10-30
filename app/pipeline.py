@@ -495,7 +495,7 @@ def graph() -> dict:
               "audio": "Tags corrected", "subread": "What the subs are",
               "transcode": "The rewrite", "sub_ocr": "Subtitle OCR",
               "submake": "Subtitle maker", "subs": "Subtitle fixes",
-              "subtiming": "Subtitle timing"}
+              "subtiming": "Subtitle timing", "qwen": "Qwen judge", "verify": "Second opinion"}
     _REST = {
         "transcode": ("The rewrite",
                       "the standardising pass: unwanted tracks dropped, audio converted, "
