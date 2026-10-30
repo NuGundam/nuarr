@@ -969,6 +969,10 @@ async def _startup() -> None:
     asyncio.create_task(hevcconvert.watch())
     from . import groupscore
     asyncio.create_task(groupscore.watch())
+    # The scorecard's second stage: measured groups -> three nuarr-owned
+    # custom formats per arr, scored per profile. Writes only once armed.
+    from . import grouptier
+    asyncio.create_task(grouptier.watch())
     asyncio.create_task(subneed.watch())
     # Twice a day: do nuarr and the arrs still describe the same files? The
     # check existed before this line did, which meant it only ever ran when
@@ -11641,6 +11645,29 @@ def api_groups_pause(on: int = 1):
     from . import groupscore
     groupscore.set_paused(bool(on))
     return {"paused": groupscore.paused()}
+
+
+@app.get("/api/groups/tiers")
+def api_groups_tiers():
+    """Measured-group formats: bands, what is waiting out its week, last pass."""
+    from . import grouptier
+    return grouptier.snapshot()
+
+
+@app.post("/api/groups/tiers/arm")
+def api_groups_tiers_arm(on: int = 1):
+    from . import grouptier
+    grouptier.set_armed(bool(on))
+    joblog.log(f"measured groups: {'armed - formats and scores are written' if on else 'disarmed - preview only'}", "info")
+    return {"armed": grouptier.armed()}
+
+
+@app.post("/api/groups/tiers/run")
+async def api_groups_tiers_run():
+    """One pass now: a preview when disarmed, the real thing when armed."""
+    from . import grouptier
+    plan = await grouptier.run()
+    return {"armed": plan["armed"], "would": plan["would"], "pending": plan["pending"]}
 
 
 @app.get("/api/convert")
@@ -35441,6 +35468,7 @@ async function loadGroups(){
   const el=document.getElementById('grpBody'); if(!el) return;
   try{ _grp=await (await fetch('/api/groups?library='+encodeURIComponent(_grpLib))).json(); }catch(e){ el.innerHTML='<div class="dim">could not load</div>'; return; }
   _grpLib=_grp.library; grpPaint();
+  grpTierLoad();
   // LIVE, while the page is showing - new measurements appear on their own
   clearTimeout(window._grpT);
   window._grpT=setTimeout(()=>shownPoll('grpBody', loadGroups), 60000);
@@ -35537,6 +35565,45 @@ function grpPaint(){
   if(b1) b1.scrollTop=_k1; if(b2) b2.scrollTop=_k2;
 }
 async function grpPause(on){ await fetch('/api/groups/pause?on='+on,{method:'POST'}); loadGroups(); }
+// ---- measured-group formats (grouptier.py): the scorecard written into the arrs ----
+let _grpTier=null, _grpTierMsg=null;
+async function grpTierLoad(){
+  const el=document.getElementById('grpTierBody'); if(!el) return;
+  try{ _grpTier=await (await fetch('/api/groups/tiers')).json(); }catch(e){ return; }
+  grpTierPaint();
+}
+function grpTierPaint(){
+  const el=document.getElementById('grpTierBody'), v=_grpTier; if(!el||!v) return;
+  const kinds=[['sonarr','Sonarr'],['radarr','Radarr']];
+  const band=(k,b)=>Object.entries((v.tiers||{})[k]||{}).filter(([,x])=>x===b).map(([g])=>g).sort((a,b)=>a.localeCompare(b));
+  const col={A:'#7fd4a3',B:'#e2b341',poor:'#ff7b72'};
+  const last=v.last||{};
+  el.innerHTML=`<div class="lkind" style="padding:11px 12px">
+    <div class="lkindhead"><b style="color:#d4b8ff">Measured-group formats</b>
+      <span class="dim" style="font-size:11px">${v.armed?'armed - written to the arrs once a day':'preview only - nothing is written until armed'}${last.at?' · last pass '+ago(last.at)+(last.result?' · '+esc(last.result):''):''}</span>
+      <span style="margin-left:auto;display:flex;gap:6px;align-items:center;font-size:11px">
+        <button class="rmb" onclick="grpTierRun(this)" ${v.running?'disabled':''}>${v.armed?'Write now':'Preview now'}</button>
+        <button class="rmb" onclick="grpTierArm(${v.armed?0:1})" title="${v.armed?'stop writing; the formats stay as they are':'let nuarr create and score the three formats in every profile with a cutoff'}">${v.armed?'Disarm':'Arm'}</button></span></div>
+    ${_grpTierMsg&&Date.now()-_grpTierMsg.at<120000?`<div style="font-size:11.5px;margin:5px 0 0;color:${_grpTierMsg.c}">${_grpTierMsg.t}</div>`:''}
+    <div class="dim" style="font-size:11px;margin:5px 0 4px">Three formats per arr, owned by nuarr: <b>measured group A</b>, <b>B</b> and <b>poor</b> - one release-group list each, built from this scorecard
+      (a group needs ${v.min_measured}+ measured files across ${v.min_shows}+ shows; A is the cleanest quarter with no issues, poor the bottom quarter or ${3}+ issues).
+      Scored in every profile with a cutoff, scaled to it: A +${Math.round(v.pct_a*100)} % of the cutoff, B half, poor the negative - a nudge between two releases of one TRaSH tier, never a tier, a ban or the English-audio format.
+      A group changes band only after holding the new one for ${v.stable_d} days; its first band is taken at once.</div>
+    ${kinds.map(([k,n])=>`<div style="font-size:11.5px;margin:4px 0"><b>${n}</b> ${['A','B','poor'].map(b=>`<span style="margin-left:10px;color:${col[b]}"><b>${b}</b> ${band(k,b).length}</span>`).join('')}
+      <div class="dim" style="font-size:10.5px;margin:2px 0 0 8px">${['A','B','poor'].map(b=>band(k,b).length?`<span style="color:${col[b]}">${b}:</span> ${band(k,b).map(esc).join(', ')}`:'').filter(Boolean).join('<br>')||'nothing banded yet'}</div></div>`).join('')}
+    ${(v.pending||[]).length?`<div style="font-size:11px;margin-top:6px"><span class="dim">waiting out the week:</span> ${v.pending.slice(0,12).map(p=>`${esc(p.grp)} ${esc(p.from)}→${esc(p.to)} <span class="dim">(${p.due>Date.now()/1000?'in '+Math.max(1,Math.round((p.due-Date.now()/1000)/86400))+' d':'due'})</span>`).join(' · ')}${v.pending.length>12?' · …':''}</div>`:''}
+    ${(last.lines||[]).length?`<div style="font-size:11px;margin-top:6px"><span class="dim">${v.armed?'last pass wrote':'last preview would write'}:</span><div class="mono dim" style="font-size:10.5px;white-space:pre-wrap;margin-top:2px">${last.lines.slice(0,12).map(esc).join('\n')}</div></div>`:''}
+    ${(v.log||[]).length?`<div class="dim" style="font-size:10.5px;margin-top:6px">written ${v.log.length} time${v.log.length===1?'':'s'}, last ${ago(v.log[0].at)}</div>`:''}
+  </div>`;
+}
+async function grpTierArm(on){ await fetch('/api/groups/tiers/arm?on='+on,{method:'POST'}); _grpTierMsg={at:Date.now(),c:'var(--dim)',t:on?'armed - the next pass writes the formats and scores':'disarmed - preview only'}; grpTierLoad(); }
+async function grpTierRun(btn){
+  if(btn) btn.disabled=true;
+  try{ const d=await (await fetch('/api/groups/tiers/run',{method:'POST'})).json();
+    _grpTierMsg={at:Date.now(),c:d.would.length?'#7fd4a3':'var(--dim)',t:(d.armed?'wrote ':'would write ')+d.would.length+' change(s)'};
+  }catch(e){ _grpTierMsg={at:Date.now(),c:'#ff7b72',t:'failed: '+esc(String(e&&e.message||e))}; }
+  grpTierLoad();
+}
 async function convSet(o){
   const q=Object.entries(o).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');
   await fetch('/api/convert/cfg?'+q,{method:'POST'}); loadConvert();
