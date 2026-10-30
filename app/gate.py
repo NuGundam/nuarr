@@ -230,7 +230,7 @@ class GateStatus:
     # hold this as well. Naming it means a hold SAYS it is holding subtitle
     # work rather than letting it through in silence.
     POOLS = ("encode", "passthrough", "subocr", "subs", "audio", "decode",
-             "listen", "subread", "submake")
+             "listen", "subread", "submake", "subtiming")
 
     def headline(self) -> dict:
         """What the banner says: what is held, by whom, and what frees it.

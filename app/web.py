@@ -3991,7 +3991,7 @@ def _summary_impl():
 # The pools the queue can hold. Every one of them, because a replay that
 # knows only two of them cannot order the other six at all - see below.
 _QUEUE_POOLS = ("encode", "passthrough", "subocr", "subs", "audio", "decode",
-                "listen", "subread")
+                "listen", "subread", "submake", "subtiming")
 
 
 def _dispatch_order(rows: list, want: int) -> list:
@@ -11170,15 +11170,12 @@ async def api_subtiming_run(n: int = 3, file_id: int = 0, path: str = ""):
         if not file_id:
             raise HTTPException(404, "that path is not in the library")
     n = max(1, min(600, int(n)))
-    if file_id or n <= 5:
-        return await asyncio.to_thread(subtiming.run_batch, n, int(file_id))
-    # A BIG BATCH RUNS BEHIND THE ANSWER: 200 files is ~40 minutes, far past
-    # what a button's request should hold open. The panel's own poll shows
-    # it going, and Stop ends it between files.
-    if subtiming.STATE.get("running"):
-        return {"busy": True}
-    asyncio.get_running_loop().run_in_executor(None, subtiming.run_batch, n, 0)
-    return {"started": n}
+    if file_id:
+        return await asyncio.to_thread(subtiming.run_batch, 1, int(file_id))
+    # A BATCH GOES THROUGH THE QUEUE: the pool runs it side by side at the
+    # width set on the Concurrency page, ahead of the feeder's own rows.
+    r = await asyncio.to_thread(subtiming.feed, n, True)
+    return {"started": int(r.get("queued") or 0), "why": r.get("why") or ""}
 
 
 @app.post("/api/subtiming/stop")
@@ -14236,12 +14233,6 @@ def _outside_live() -> list:
              "queued": 0,
              "hint": ("Files the subtitle board is unsure about get Whisper, Qwen and the readers instead of a "
                       "person; settles them at the sure % on the Subtitle AI page.")},
-            {"key": "subtiming", "pool": "subtiming", "label": "Subtitle timing",
-             "running": len(subtiming.SLOTS), "cap": subtiming.workers(), "paused": subtiming.paused(),
-             "now": ("checking " + ", ".join(s["label"] for s in subtiming.slots())) if subtiming.SLOTS else "",
-             "queued": max(0, subtiming._WAIT.get("n", 0)),
-             "hint": ("Lines up each text subtitle with the speech in the audio; a track that is late, early "
-                      "or drifting (a frame-rate mismatch) is corrected in place. CPU, about 15 s a file.")},
             {"key": "qwenvl", "pool": "qwenvl", "label": "Qwen-VL reader",
              "running": 0, "cap": 1, "paused": not qwenvl.on(),
              "now": "", "queued": 0,
@@ -17766,7 +17757,8 @@ html.mobile #logsPane{height:auto;min-height:60vh}
         <option value="decode">decode</option>
         <option value="listen">listen</option>
         <option value="subread">subread</option>
-        <option value="submake">submake</option></select>
+        <option value="submake">submake</option>
+        <option value="subtiming">subtiming</option></select>
       <select id="qfDisk" onchange="qReload(this.value?('filtering to '+this.value+'…'):'showing all disks…')">
         <option value="">all disks</option></select>
       <input id="qfText" placeholder="filter by title or path" style="width:200px"
@@ -25356,11 +25348,13 @@ function poolColor(pool){
        : pool==='listen'      ? '#e5d352'         // yellow - Whisper on the card
        : pool==='subread'     ? '#c9d1d9'         // grey - a measurement, not a change
        : pool==='submake'     ? '#79c0ff'         // blue - the Subtitle maker
+       : pool==='subtiming'   ? '#6ee7f7'         // cyan - the timing fixer, its panel's colour
        : pool==='handler'     ? '#d2a8ff'         // lilac - script handlers
        : pool==='passthrough' ? 'var(--ok)'       // green - stream copy
        : pool==='audio'       ? '#39d3c3'         // teal - was violet, too close to subocr
        : pool==='decode'      ? '#e8a33d'         // amber - a CPU check, not a copy
        : pool==='submake'     ? '#79c0ff'         // light blue - the Subtitle maker, its panel's colour
+       : pool==='subtiming'   ? '#6ee7f7'         // cyan - the timing fixer
        : pool==='qwen'        ? '#f0b37e'         // apricot - the Qwen judge
        : pool==='quality'     ? '#a2e05e'         // lime - the VMAF quality search
        : pool==='verify'      ? '#ff7b72'         // coral - the second opinion
@@ -38958,7 +38952,7 @@ function stmPaint(){
         <select onchange="stmMode(this.value)" style="font-size:11px" title="off: never runs. advise: measures and lists, changes nothing. auto: corrects a fixed offset or a frame-rate drift in place, after proving the result is in step.">
           ${[['off','off'],['advise','advise only'],['auto','auto - fix in place']].map(([k,w])=>`<option value="${k}" ${v.mode===k?'selected':''}>${w}</option>`).join('')}</select>
         <input id="stmN" type="number" min="1" max="600" value="${v.per_hour}" style="width:62px;box-sizing:border-box;font-size:11px" oninput="stmNLabel(this.value)" onchange="stmBudget(this.value)">/hour
-        <input type="number" min="1" max="8" value="${v.workers||1}" style="width:44px;box-sizing:border-box;font-size:11px" title="files checked side by side - one CPU process each, below normal priority" onchange="stmWorkers(this.value)">at once
+        <span class="dim" title="set on the Concurrency page - Subtitle timing checks at once">${v.workers||1} at once</span>
         <button id="stmRunBtn" class="rmb" onclick="stmRun(this)" ${v.running?'disabled':''}>Check ${v.per_hour} now</button>
         ${v.running?`<button class="rmb" onclick="fetch('/api/subtiming/stop',{method:'POST'})">Stop</button>`:''}</span></div>
     ${_stmMsg&&Date.now()-_stmMsg.at<120000?`<div style="font-size:11.5px;margin:5px 0 0;color:${_stmMsg.c}">${esc(_stmMsg.t)}</div>`:''}
@@ -38968,7 +38962,7 @@ function stmPaint(){
       <span><b style="color:#6ee7f7">${fmt(v.fixed)}</b> <span class="dim">fixed</span></span>
       <span><b style="color:#e0575b">${fmt(by.messy||0)}</b> <span class="dim">out of step, left alone</span></span>
       <span><b>${fmt((by.unsure||0)+(by.skipped||0))}</b> <span class="dim">unsure / nothing to measure</span></span>
-      <span><b>${fmt(v.waiting<0?0:v.waiting)}</b> <span class="dim">in the queue</span></span>
+      <span><b>${fmt(v.waiting<0?0:v.waiting)}</b> <span class="dim">to check</span>${v.in_queue?` <span class="dim">· ${fmt(v.in_queue)} queued now</span>`:''}</span>
       <span class="dim">${v.avg_secs?`${v.avg_secs}s per file · ${v.hour_n} this hour`:'no pace measured yet'}${eta?` · queue done in ~${eta}`:''}</span>
     </div>
     ${v.running?(v.slots&&v.slots.length?v.slots:[{label:v.label,stage:v.stage,pct:v.pct,elapsed_s:v.elapsed_s}]).map(s=>`<div style="display:flex;gap:10px;align-items:center;font-size:11.5px;margin:2px 0 4px">
@@ -39012,7 +39006,7 @@ function stmGo(url,btn){
   fetch(url,{method:'POST'}).then(r=>r.ok?r.json():r.json().then(j=>Promise.reject(new Error(j.detail||('HTTP '+r.status))))).then(d=>{
     if(d.busy) stmSay('Already checking - the run in progress has to finish first.','#d29922');
     else if(d.started) stmSay('Checking the next '+d.started+' files - follow it in the table below; Stop ends it after the current file.','#3fb950');
-    else if(!d.done) stmSay('Nothing to check right now.');
+    else if(!d.done) stmSay('Nothing to check right now'+(d.why?' - '+d.why:'')+'.');
     else stmSay('Checked '+d.done+(d.done===1?' file':' files')+(d.fixed?', fixed '+d.fixed:'')+' - '+(d.results||[]).map(x=>x.verdict+(x.action?' ('+x.action+')':'')).join(', ')+'.','#3fb950');
   }).catch(e=>stmSay('The request failed: '+((e&&e.message)||e),'#f85149'));
   setTimeout(stmLoad,1500);
@@ -50669,7 +50663,7 @@ function workersCompact(w){
   const KEYS = ['encode_workers','passthrough_workers','subocr_workers',
                 'subs_workers','audio_workers','decode_workers',
                 'listen_workers','subread_workers','submake_workers',
-                'probe_workers','arr_concurrency'];
+                'subtiming_workers','probe_workers','arr_concurrency'];
   const cell = (k)=>{
     const v = w[k]; if(!v) return '';
     const col = v.pool ? poolColor(v.pool) : 'var(--dim)';

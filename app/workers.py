@@ -88,6 +88,10 @@ LIMITS = {
     # the GPU lane claimed for the whole run, so one is the only sane count;
     # two would load Whisper twice.
     "submake_workers": (0, 1, 1),
+    # The subtitle timing check: one below-normal CPU process a file (the
+    # voice detector, then mkvmerge when a track moves), 15-30 s each. Fed
+    # at the hourly pace from the Subtitles page; this is how many at once.
+    "subtiming_workers": (0, 6, 3),
     # ffprobe is cheap but still a pool read each - one seek per file, rated
     # disk 2 / cpu 1. Eight keeps a library walk moving without making the
     # pool sound like a scan.
@@ -322,6 +326,7 @@ LABELS = {
     "listen_workers": "Audio listens at once",
     "subread_workers": "Subtitle track reads at once",
     "submake_workers": "Subtitles made at once",
+    "subtiming_workers": "Subtitle timing checks at once",
     "probe_workers": "File scans at once",
     "arr_concurrency": "Sonarr/Radarr calls at once",
     "hold_minutes": "Settle time (minutes)",
@@ -380,6 +385,11 @@ HINTS = {
                       "language identifier on the graphics card. One model "
                       "is loaded; a second job shares it and each runs at "
                       "half speed, so one is the honest default.",
+    "subtiming_workers": "How many files may have their subtitle timing checked at once. "
+                         "Each lines up the speech in the audio with every text track and "
+                         "corrects a late, early or drifting track in place; one processor "
+                         "process at below-normal priority, 15-30 s a file, reading one pool "
+                         "disk. The Subtitles page sets how many an hour are fed in.",
     "submake_workers": "How many files may have English subtitles made at once. "
                        "Whisper large-v3 listens, PaddleOCR reads the picture, "
                        "Qwen translates - all on the graphics card, one after "
@@ -500,7 +510,8 @@ POOL_OF = {"encode_workers": "encode", "passthrough_workers": "passthrough",
            "subocr_workers": "subocr", "subocr_gpu_lanes": "subocr",
            "subs_workers": "subs", "audio_workers": "audio",
            "decode_workers": "decode", "listen_workers": "listen",
-           "subread_workers": "subread", "submake_workers": "submake"}
+           "subread_workers": "subread", "submake_workers": "submake",
+           "subtiming_workers": "subtiming"}
 
 # Which tab each setting belongs to in the UI.
 TIMING_KEYS = ("hold_minutes", "scan_every_min", "ffmpeg_check_h",
@@ -525,6 +536,7 @@ class WorkerConfig:
     listen_workers: int
     subread_workers: int
     submake_workers: int
+    subtiming_workers: int
     probe_workers: int
     arr_concurrency: int
     hold_minutes: int
@@ -667,6 +679,14 @@ COST = {
                "large-v3 listens to every stretch of speech (about 3 GB of "
                "video memory), PaddleOCR reads the on-screen text, Qwen "
                "translates. Minutes a file; the lane is held throughout."},
+    "subtiming_workers": {
+        "cpu": 2, "gpu": 0, "ram": 1, "disk": 1, "lead": "cpu",
+        "why": "The voice detector (Silero, on the processor) over the whole "
+               "audio track, then the lines of each text track matched against "
+               "it; mkvmerge rewrites the container only when a track moves. "
+               "One process a file at below-normal priority, about a core "
+               "while it runs, 15-30 s a file; the audio is one read off one "
+               "pool disk."},
     "subread_workers": {
         "cpu": 3, "gpu": 1, "ram": 1, "disk": 2, "lead": "cpu",
         "why": "THE HEAVIEST THING NUARR ASKS OF THE PROCESSOR, measured. A "
@@ -695,7 +715,8 @@ _COST_POOL = {"encode_workers": "encode", "passthrough_workers": "passthrough",
               "subocr_workers": "subocr", "subocr_gpu_lanes": "subocr",
               "subs_workers": "subs", "audio_workers": "audio",
               "decode_workers": "decode", "listen_workers": "listen",
-              "subread_workers": "subread", "submake_workers": "submake"}
+              "subread_workers": "subread", "submake_workers": "submake",
+              "subtiming_workers": "subtiming"}
 
 _MED: dict = {"at": 0.0, "data": {}}
 

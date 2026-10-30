@@ -63,7 +63,7 @@ import time
 
 from .db import cursor
 
-ORDER = ("decode", "listen", "audio", "subread", "transcode", "sub_ocr", "submake", "subs")
+ORDER = ("decode", "listen", "audio", "subread", "transcode", "sub_ocr", "submake", "subs", "subtiming")
 RANK = {k: i for i, k in enumerate(ORDER)}
 # WHAT EACH KIND ACTUALLY WAITS FOR - not everything before it in ORDER,
 # only the things whose absence makes its work wrong or wasted. A title fix
@@ -80,10 +80,14 @@ PREREQS = {"transcode": ("decode", "listen", "audio", "subread"),
            # to replace (Beerus S01E03, 2026-10-25), and only once the facts
            # say the file really has nothing to read
            "submake": ("decode", "listen", "audio", "subread", "transcode"),
-           "subs": ("transcode",)}
+           "subs": ("transcode",),
+           # the timing is measured on the container the others leave behind:
+           # not before a rewrite replaces the file or a fix moves its tracks
+           "subtiming": ("transcode", "sub_ocr", "submake", "subs")}
 POOL_OF_KIND = {"decode": "decode", "listen": "listen", "audio": "audio",
                 "subread": "subread", "transcode": "encode",
-                "sub_ocr": "subocr", "submake": "submake", "subs": "subs"}
+                "sub_ocr": "subocr", "submake": "submake", "subs": "subs",
+                "subtiming": "subtiming"}
 MAX_WAIT_S = 6 * 3600
 UNHELD_SOURCES = ("manual", "ui")
 

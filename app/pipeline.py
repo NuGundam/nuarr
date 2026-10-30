@@ -494,7 +494,8 @@ def graph() -> dict:
     _SHORT = {"decode": "Does it decode?", "listen": "What language?",
               "audio": "Tags corrected", "subread": "What the subs are",
               "transcode": "The rewrite", "sub_ocr": "Subtitle OCR",
-              "submake": "Subtitle maker", "subs": "Subtitle fixes"}
+              "submake": "Subtitle maker", "subs": "Subtitle fixes",
+              "subtiming": "Subtitle timing"}
     _REST = {
         "transcode": ("The rewrite",
                       "the standardising pass: unwanted tracks dropped, audio converted, "
@@ -782,7 +783,8 @@ def route(file_id: int) -> dict:
         steps.append(("failed", last.get("error") or "did not land"))
     _AFTER = {"subocr": ("subocr", "picture subtitles read into text"),
               "submake": ("submake", "English made from the audio and embedded"),
-              "subs": ("subs", "subtitle tracks settled")}
+              "subs": ("subs", "subtitle tracks settled"),
+              "subtiming": ("subs", "subtitle timing checked against the speech")}
     for p, (nid, txt) in _AFTER.items():
         n = sum(1 for j in jobs if j["pool"] == p and j["state"] == "done")
         if n:

@@ -85,6 +85,32 @@ def _mirror() -> None:
 def slots() -> list:
     with _SLOT_LOCK:
         return [dict(v, slot=k) for k, v in sorted(SLOTS.items())]
+
+
+class _WorkerState(dict):
+    """A check's state dict that also drives a queue Worker's card: the
+    stage and the percentage go to the card as they are set here."""
+    def __init__(self, w, **kw):
+        super().__init__(**kw)
+        self.w = w
+
+    def __setitem__(self, k, v):
+        super().__setitem__(k, v)
+        self._push(k, v)
+
+    def update(self, *a, **kw):
+        super().update(*a, **kw)
+        for k, v in dict(*a, **kw).items():
+            self._push(k, v)
+
+    def _push(self, k, v):
+        try:
+            if k == "stage":
+                self.w.set_stage(str(v)[:60])
+            elif k == "pct":
+                self.w.progress = max(0.0, min(1.0, float(v or 0) / 100.0))
+        except Exception:                                        # noqa: BLE001
+            pass
 _WAIT: dict = {"at": 0.0, "n": -1}
 
 
@@ -136,6 +162,15 @@ def workers() -> int:
 def set_workers(n: int) -> int:
     kv_set(KV_WORKERS, str(max(1, min(8, int(n)))))
     return workers()
+
+
+def _pool_width() -> int:
+    """How many run at once - the queue pool's knob (Concurrency page)."""
+    try:
+        from . import jobs as _jobs
+        return int(_jobs._capacity("subtiming"))
+    except Exception:                                            # noqa: BLE001
+        return workers()
 
 
 def paused() -> bool:
@@ -326,19 +361,27 @@ def fix(file_id: int, path: str, tracks: list) -> dict:
 
 
 # ----------------------------------------------------------------- one file --
-def check_one(row: dict, act: bool | None = None) -> dict:
-    """Measure one file, fix what can be fixed (auto), record it."""
+def check_one(row: dict, act: bool | None = None, w=None) -> dict:
+    """Measure one file, fix what can be fixed (auto), record it.
+    w: the queue Worker whose card follows; without one the check takes a
+    slot of its own (the hand-run path)."""
     init()
     fid, path = int(row["id"]), row["path"]
     act = (mode() == "auto") if act is None else act
     t0 = time.time()
     from . import outside as _out
-    st = {"file_id": fid, "label": _label(path), "stage": "listening for speech", "pct": 2.0, "started": t0}
-    with _SLOT_LOCK:
-        slot = next(i for i in range(64) if i not in SLOTS)
-        SLOTS[slot] = st
-        _mirror()
-    key = "subtiming" if slot == 0 else f"subtiming:{slot}"
+    fields = {"file_id": fid, "label": _label(path), "stage": "listening for speech", "pct": 2.0, "started": t0}
+    slot = None
+    if w is not None:
+        st = _WorkerState(w, **fields)
+        key = f"subtiming:j{fid}"
+    else:
+        st = fields
+        with _SLOT_LOCK:
+            slot = next(i for i in range(64) if i not in SLOTS)
+            SLOTS[slot] = st
+            _mirror()
+        key = "subtiming" if slot == 0 else f"subtiming:{slot}"
     _T.st, _T.key = st, key
     _out.start(key, fid)
     try:
@@ -401,11 +444,80 @@ def check_one(row: dict, act: bool | None = None) -> dict:
         STATE.update(last_run=time.time(), last_result=f"{_label(path)}: {verdict} - {action}")
         return {"file_id": fid, "verdict": verdict, "action": action, "note": note, "secs": secs}
     finally:
-        with _SLOT_LOCK:
-            SLOTS.pop(slot, None)
-            _mirror()
+        if slot is not None:
+            with _SLOT_LOCK:
+                SLOTS.pop(slot, None)
+                _mirror()
         _T.st = _T.key = None
         _out.stop(key)
+
+
+def check_job(w, file_id: int, act: bool | None = None) -> dict:
+    """One file inside a queue job - the Worker's card follows the check."""
+    with cursor() as cur:
+        r = cur.execute("SELECT id, path, mtime, pool_disk FROM files WHERE id=?", (int(file_id),)).fetchone()
+    if not r:
+        return {"file_id": int(file_id), "verdict": "skipped", "action": "not in the library", "note": "", "secs": 0}
+    return check_one(dict(r), act, w)
+
+
+def _spread(rows: list) -> list:
+    """Round-robin by disk, so a batch reads many spindles, not one."""
+    by: dict = {}
+    for r in rows:
+        by.setdefault(r.get("pool_disk") or "", []).append(r)
+    order: list = []
+    while any(by.values()):
+        for k in list(by):
+            if by[k]:
+                order.append(by[k].pop(0))
+    return order
+
+
+def in_queue() -> int:
+    try:
+        with cursor() as cur:
+            return int(cur.execute("SELECT COUNT(*) n FROM jobs WHERE kind='subtiming' "
+                                   "AND state IN ('queued','pending','running')").fetchone()["n"])
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
+def feed(n: int | None = None, manual: bool = False) -> dict:
+    """Top the queue up with the next files to check. The hourly budget
+    paces the feeder; how many run at once is the pool's knob on the
+    Concurrency page. A tick's worth waits in the queue, no more, so a
+    fresh import is not behind a long line."""
+    from . import jobs as _jobs
+    if mode() == "off":
+        return {"queued": 0, "why": "switched off"}
+    if paused():
+        return {"queued": 0, "why": "paused"}
+    now = time.time()
+    if now - STATE["hour_start"] > 3600:
+        STATE.update(hour_start=now, hour_count=0)
+    if n is None:
+        room = per_hour() - STATE["hour_count"]
+        if room <= 0:
+            return {"queued": 0, "why": "this hour's budget is spent"}
+        n = max(1, min(room, int(per_hour() * TICK_S / 3600 + 0.999)))
+    inq = in_queue()
+    want = n if manual else n - inq
+    if want <= 0:
+        return {"queued": 0, "why": f"{inq} already waiting"}
+    rows = _spread(candidates(max(want * 10, 150), busy_disks()))[:want]
+    if not rows:
+        return {"queued": 0, "why": "nothing left to check"}
+    g = _jobs.enqueue_many(
+        [{"file_id": r["id"], "path": r["path"],
+          "plan_json": json.dumps({"act": mode() == "auto", "summary": "subtitle timing against the speech"})}
+         for r in rows],
+        "subtiming", priority=40 if manual else 80, source="ui" if manual else "subtiming")
+    made = int(g.get("made") or 0)
+    STATE["hour_count"] += made
+    if made and _WAIT["n"] > 0:
+        _WAIT["n"] = max(0, _WAIT["n"] - made)
+    return {"queued": made, "held": g.get("held") or {}, "skipped": int(g.get("skipped") or 0)}
 
 
 def busy_disks() -> set:
@@ -429,16 +541,7 @@ def run_batch(n: int, file_id: int = 0) -> dict:
             # disk (Cold Case S03, three workers on one spindle). Ten times n
             # costs the same query time and reaches most disks.
             rows = candidates(max(n * 10, 150), busy_disks())
-        # SPREAD ACROSS DISKS: round-robin by disk, so three workers read
-        # three spindles rather than queueing on one.
-        by: dict = {}
-        for r in rows:
-            by.setdefault(r.get("pool_disk") or "", []).append(r)
-        order = []
-        while any(by.values()):
-            for k in list(by):
-                if by[k]:
-                    order.append(by[k].pop(0))
+        order = _spread(rows)
         if not file_id:
             order = order[:n]
         done = []
@@ -508,15 +611,9 @@ async def watch() -> None:
         except Exception:                                        # noqa: BLE001
             pass
         try:
-            if mode() != "off" and not paused():
-                now = time.time()
-                if now - STATE["hour_start"] > 3600:
-                    STATE.update(hour_start=now, hour_count=0)
-                room = per_hour() - STATE["hour_count"]
-                if room > 0:
-                    n = max(1, min(room, int(per_hour() * TICK_S / 3600 + 0.999)))
-                    r = await asyncio.to_thread(run_batch, n)
-                    STATE["hour_count"] += int(r.get("done") or 0)
+            # THE QUEUE DOES THE WORK NOW: this tick only tops it up at the
+            # hourly pace; the pool's knob says how many run side by side.
+            await asyncio.to_thread(feed)
         except Exception as e:                                   # noqa: BLE001
             joblog.log(f"subtitle timing: {type(e).__name__}: {e}", "error")
         # THE TICK IS START TO START. Sleeping a full TICK_S after the batch
@@ -587,7 +684,7 @@ def snapshot() -> dict:
     el = (time.time() - float(STATE["started"] or time.time())) if STATE.get("running") else 0.0
     now = time.time()
     return {"mode": mode(), "per_hour": per_hour(), "paused": paused(), "rows": rows, "recent": recent,
-            "workers": workers(),
+            "workers": _pool_width(), "in_queue": in_queue(),
             "slots": [{"label": s["label"], "stage": s["stage"], "pct": round(float(s["pct"] or 0), 1),
                        "elapsed_s": round(now - float(s["started"] or now))} for s in slots()],
             "total": sum(tot.values()), "by": tot, "fixed": int(fixed), "waiting": wait,
