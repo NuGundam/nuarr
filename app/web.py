@@ -25424,6 +25424,19 @@ function subOcrCell(w){
       ? '· the video is finished; this is the last step'
       : '· happening at the same time as the video work'}</span></div>`;
 }
+// THE VISION READER'S ROW, under the OCR's: it reads for this job's OCR, so
+// it is drawn as a step of it, the way the inline OCR is a step of the rewrite.
+function qwenVlCell(w){
+  const q=w.qwenvl; if(!q) return '';
+  const col=poolColor('qwenvl');
+  const pct=Math.max(0,Math.min(100,(q.progress||0)*100));
+  return `<div class="socr">
+    <span class="pill" style="color:${col};border-color:${col}">qwenvl</span>
+    <span class="socrbar"><i style="width:${pct.toFixed(1)}%;background:${col}"></i></span>
+    <span class="mono socrpct" style="color:${col};min-width:44px">${pct.toFixed(0)}%</span>
+    <span class="dim">${esc(q.stage||'')}${q.rate?' · '+q.rate+' '+esc(q.rate_unit||''):''}</span>
+    <span class="dim">· the reader of last resort - cues the OCR doubted, read by ${esc(q.tool||'the vision model')}</span></div>`;
+}
 // "-2% vs source" ASKS THE READER TO DO TWO CONVERSIONS IN THEIR HEAD.
 //
 // First, what does the sign mean? Minus is smaller, which is usually the good
@@ -26794,7 +26807,7 @@ async function loadJobs(){
     // does not appear here is a pool nobody can tell is running. Erik's
     // words for this strip were "missing the new integrated systems". The
     // name wears its pool colour, so the strip and the card pills agree.
-    + ['audio','decode','listen','subread','submake'].map(p=>
+    + ['audio','decode','listen','subread','submake','subtiming','verify','qwen'].map(p=>
         capCell(p, (j.in_use||{})[p]||0, (j.capacity||{})[p]||0, p)).join('')
     // AND EVERYTHING OUTSIDE THE QUEUE, each in its own colour - the quality
     // search, the Subtitle maker, the Qwen judge, the second opinion, Qwen-VL.
@@ -27053,7 +27066,7 @@ function paintRunning(j){
         <div class="bar big"><i class="${indet?'indet':''}${bs.held?' held':''}${reset?' nogrow':''}"
              style="width:${pct.toFixed(1)}%;background-color:${col}"></i></div>
         <div class="wkstats">${wkStatsHtml(w, pct, indet)}</div>
-        <div class="socrzone">${vmafCell(w)}${subOcrCell(w)}${subFixCell(w)}</div>
+        <div class="socrzone">${vmafCell(w)}${subOcrCell(w)}${qwenVlCell(w)}${subFixCell(w)}</div>
         <div class="iozone">${ioCell(w)}</div>
         <div class="wlzone">${w.last_line?`<div class="dim mono wkline">${esc(w.last_line)}</div>`:''}</div>
         ${watchId===w.job_id
@@ -27383,7 +27396,7 @@ function tryPatchCards(j){
     const st = card.querySelector('.wkstats');
     if(st) st.innerHTML = wkStatsHtml(w, bs.pct, bs.indet);
     const sz = card.querySelector('.socrzone');
-    if(sz) sz.innerHTML = vmafCell(w) + subOcrCell(w) + subFixCell(w);
+    if(sz) sz.innerHTML = vmafCell(w) + subOcrCell(w) + qwenVlCell(w) + subFixCell(w);
     const io = card.querySelector('.iozone');
     if(io) io.innerHTML = ioCell(w);
     const wl = card.querySelector('.wlzone');

@@ -8274,6 +8274,38 @@ def _oldest_first(rows: list) -> list:
     return sorted(rows, key=lambda w: -float(w.get("elapsed_s") or 0))
 
 
+def _attach_qwenvl(rows: list) -> list:
+    """THE VISION READER IS A STEP OF SOMEBODY'S OCR, not a job. While it is
+    reading, its card folds into the job it reads for - the one whose file it
+    names, else the one carrying an OCR - as a sub-row like the inline OCR's
+    (Erik: "shouldn't QWENVL be a sub task just like SUBOCR"). Loaded and
+    idle it has no parent and keeps its own small card, which is the only
+    place the memory it still holds is shown."""
+    vl = [r for r in rows if r.get("pool") == "qwenvl"]
+    if not vl or (vl[0].get("doing") or {}).get("why") != "reading":
+        return rows
+    card = vl[0]
+    fname = os.path.basename(str(card.get("file") or ""))
+    parent = None
+    for r in rows:
+        if r is card or r.get("pool") == "qwenvl":
+            continue
+        if fname and os.path.basename(str(r.get("path") or r.get("file") or "")) == fname:
+            parent = r
+            break
+    if parent is None:
+        for r in rows:
+            if r is not card and (r.get("sub_ocr_active") or r.get("pool") in ("subocr", "subread", "submake")):
+                parent = r
+                break
+    if parent is None:
+        return rows
+    parent["qwenvl"] = {"stage": card.get("stage") or "", "progress": float(card.get("progress") or 0),
+                        "rate": card.get("rate"), "rate_unit": card.get("rate_unit"),
+                        "tool": (card.get("doing") or {}).get("tool") or ""}
+    return [r for r in rows if r is not card]
+
+
 def _submake_running() -> list:
     """The Subtitle maker runs outside this queue; it is shown beside it."""
     out = []
@@ -8350,7 +8382,7 @@ def live_snapshot() -> dict:
         depth = cur.execute(
             "SELECT COUNT(*) n FROM jobs WHERE state='queued'").fetchone()["n"]
     return {
-        "running": _oldest_first([w.as_dict() for w in workers] + _submake_running()),
+        "running": _oldest_first(_attach_qwenvl([w.as_dict() for w in workers] + _submake_running())),
         "queued": depth,
         "overall": _overall(depth, workers),
         "io": {
@@ -8521,7 +8553,7 @@ def snapshot(recent_limit: int = 60) -> dict:
         w.sample_io()
     _batch_reset_if_idle(depth, len(workers))
     return {
-        "running": _oldest_first([w.as_dict() for w in workers] + _submake_running()),
+        "running": _oldest_first(_attach_qwenvl([w.as_dict() for w in workers] + _submake_running())),
         "queued": depth,
         "queue": upcoming,
         "recent": recent_done,
