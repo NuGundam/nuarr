@@ -2815,6 +2815,10 @@ def _outside_files() -> set:
             st = getattr(m, "STATE", {}) or {}
             if st.get("running") and st.get("file_id"):
                 out.add(int(st["file_id"]))
+            # the timing fixer runs several files at once
+            for s in (getattr(m, "SLOTS", None) or {}).copy().values():
+                if s.get("file_id"):
+                    out.add(int(s["file_id"]))
         except Exception:                                        # noqa: BLE001
             continue
     return out

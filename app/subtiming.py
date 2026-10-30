@@ -46,6 +46,8 @@ from .db import cursor, kv_get, kv_set
 KV_MODE = "subtiming.mode"          # off | advise | auto
 KV_PER_HOUR = "subtiming.per_hour"
 KV_PAUSED = "subtiming.paused"
+KV_WORKERS = "subtiming.workers"
+DEFAULT_WORKERS = 3
 DEFAULT_MODE = "auto"
 DEFAULT_PER_HOUR = 60
 TICK_S = 120.0
@@ -56,6 +58,33 @@ _LOCK = threading.Lock()
 STATE: dict = {"running": False, "file_id": 0, "label": "", "stage": "", "pct": 0.0, "started": 0.0,
                "last_run": 0.0, "last_result": "", "next_run": 0.0, "hour_count": 0, "hour_start": 0.0}
 _STOP = {"flag": False}
+# ONE STATE PER WORKER. STATE keeps the totals and mirrors the first worker
+# for the old single-file readers; SLOTS holds every file being checked.
+SLOTS: dict = {}                 # slot -> {"file_id","label","stage","pct","started"}
+_SLOT_LOCK = threading.Lock()
+_T = threading.local()
+
+
+def _st() -> dict:
+    return getattr(_T, "st", None) or STATE
+
+
+def _key() -> str:
+    return getattr(_T, "key", None) or "subtiming"
+
+
+def _mirror() -> None:
+    first = next(iter(SLOTS.values()), None)
+    if first:
+        STATE.update(running=True, file_id=first["file_id"], label=first["label"],
+                     stage=first["stage"], pct=first["pct"], started=first["started"])
+    else:
+        STATE.update(running=False, file_id=0, stage="", pct=0.0)
+
+
+def slots() -> list:
+    with _SLOT_LOCK:
+        return [dict(v, slot=k) for k, v in sorted(SLOTS.items())]
 _WAIT: dict = {"at": 0.0, "n": -1}
 
 
@@ -95,6 +124,18 @@ def per_hour() -> int:
 def set_per_hour(n: int) -> int:
     kv_set(KV_PER_HOUR, str(max(1, min(600, int(n)))))
     return per_hour()
+
+
+def workers() -> int:
+    try:
+        return max(1, min(8, int(kv_get(KV_WORKERS) or DEFAULT_WORKERS)))
+    except Exception:                                            # noqa: BLE001
+        return DEFAULT_WORKERS
+
+
+def set_workers(n: int) -> int:
+    kv_set(KV_WORKERS, str(max(1, min(8, int(n)))))
+    return workers()
 
 
 def paused() -> bool:
@@ -171,10 +212,11 @@ def _measure(path: str, tracks: str = "", check_only: bool = False) -> dict:
     if check_only:
         cmd += ["--check-only"]
     from . import outside as _out
+    st, key = _st(), _key()      # the reader thread below is not this worker's thread
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
                          errors="replace", cwd=root, creationflags=NO_WINDOW | 0x00004000,   # below normal
                          startupinfo=hidden_si(), stdin=subprocess.DEVNULL)
-    _out.set_pid("subtiming", p.pid)
+    _out.set_pid(key, p.pid)
     # PROGRESS AS IT GOES: the worker says "PROG i/n what" on stderr per piece
     base, span = (82.0, 8.0) if check_only else (5.0, 30.0)
     errs = []
@@ -184,9 +226,9 @@ def _measure(path: str, tracks: str = "", check_only: bool = False) -> dict:
             if ln.startswith("PROG "):
                 try:
                     i, n = ln.split()[1].split("/")
-                    STATE["pct"] = base + span * int(i) / max(1, int(n))
+                    st["pct"] = base + span * int(i) / max(1, int(n))
                     if ln.count(" ") >= 2:
-                        STATE["stage"] = ln.split(" ", 2)[2].strip()
+                        st["stage"] = ln.split(" ", 2)[2].strip()
                 except Exception:                                # noqa: BLE001
                     pass
             else:
@@ -241,24 +283,26 @@ def fix(file_id: int, path: str, tracks: list) -> dict:
         return {"ok": False, "why": why_room}
     tmp = fileops.cache_temp(".mkv", "subtiming")
     with fileops.cache_reserve(_size(path)):
+        st, key = _st(), _key()
+
         def _rep(p):
-            STATE["pct"] = 40 + 0.4 * float(p or 0)
-        STATE["stage"] = "rewriting the timing"
+            st["pct"] = 40 + 0.4 * float(p or 0)
+        st["stage"] = "rewriting the timing"
         from . import outside as _out
         r = _run_reporting([_mkvmerge(), "-o", tmp] + cmd_sync + [path], _rep,
-                           on_pid=lambda pid: _out.set_pid("subtiming", pid))
+                           on_pid=lambda pid: _out.set_pid(key, pid))
         if r.returncode >= 2 or not os.path.exists(tmp):
             fileops._quiet_remove(tmp)
             return {"ok": False, "why": (r.stderr or r.stdout or "mkvmerge failed").strip()[:300]}
         # EXIT 0 IS NOT PROOF: measure the rebuilt file the same way.
-        STATE.update(stage="measuring the result", pct=82)
+        st.update(stage="measuring the result", pct=82)
         chk = _measure(tmp, ",".join(str(t["ord"]) for t in tracks), check_only=True)
         bad = [t for t in (chk.get("tracks") or []) if t.get("verdict") != "ok"]
         if not chk.get("ok") or bad or len(chk.get("tracks") or []) != len(tracks):
             fileops._quiet_remove(tmp)
             why = "; ".join(f"track {t['ord'] + 1}: {t.get('why', '')}" for t in bad) or chk.get("why") or "the check failed"
             return {"ok": False, "why": "the corrected file still is not in step - nothing was changed (" + why + ")"}
-        STATE.update(stage="putting it back", pct=90)
+        st.update(stage="putting it back", pct=90)
         from .jobs import outside_commit as _oc
         res = fileops.safe_replace(path, tmp, **_oc(path, "subtiming"))
         fileops._quiet_remove(tmp)
@@ -289,8 +333,14 @@ def check_one(row: dict, act: bool | None = None) -> dict:
     act = (mode() == "auto") if act is None else act
     t0 = time.time()
     from . import outside as _out
-    _out.start("subtiming", fid)
-    STATE.update(running=True, file_id=fid, label=_label(path), stage="listening for speech", pct=2.0, started=t0)
+    st = {"file_id": fid, "label": _label(path), "stage": "listening for speech", "pct": 2.0, "started": t0}
+    with _SLOT_LOCK:
+        slot = next(i for i in range(64) if i not in SLOTS)
+        SLOTS[slot] = st
+        _mirror()
+    key = "subtiming" if slot == 0 else f"subtiming:{slot}"
+    _T.st, _T.key = st, key
+    _out.start(key, fid)
     try:
         if not os.path.exists(path):
             # RENAMED SINCE THE BATCH WAS PICKED - an encode committing, the
@@ -301,7 +351,7 @@ def check_one(row: dict, act: bool | None = None) -> dict:
             if r and r["path"] != path and os.path.exists(r["path"]):
                 path = r["path"]
                 row["mtime"] = r["mtime"]
-                STATE["label"] = _label(path)
+                st["label"] = _label(path)
         if not os.path.exists(path):
             # NOT RECORDED: a "failed" row with the file's mtime would never be
             # offered again, and eleven of the first twelve such files were
@@ -351,8 +401,11 @@ def check_one(row: dict, act: bool | None = None) -> dict:
         STATE.update(last_run=time.time(), last_result=f"{_label(path)}: {verdict} - {action}")
         return {"file_id": fid, "verdict": verdict, "action": action, "note": note, "secs": secs}
     finally:
-        STATE.update(running=False, stage="", pct=0.0)
-        _out.stop("subtiming")
+        with _SLOT_LOCK:
+            SLOTS.pop(slot, None)
+            _mirror()
+        _T.st = _T.key = None
+        _out.stop(key)
 
 
 def busy_disks() -> set:
@@ -373,11 +426,40 @@ def run_batch(n: int, file_id: int = 0) -> dict:
             rows = [dict(r)] if r else []
         else:
             rows = candidates(n, busy_disks())
-        done = []
+        # SPREAD ACROSS DISKS: round-robin by disk, so three workers read
+        # three spindles rather than queueing on one.
+        by: dict = {}
         for r in rows:
-            if _STOP["flag"]:
-                break
-            done.append(check_one(r))
+            by.setdefault(r.get("pool_disk") or "", []).append(r)
+        order = []
+        while any(by.values()):
+            for k in list(by):
+                if by[k]:
+                    order.append(by[k].pop(0))
+        done = []
+        n_w = 1 if file_id else min(workers(), max(1, len(order)))
+        if n_w == 1:
+            for r in order:
+                if _STOP["flag"]:
+                    break
+                done.append(check_one(r))
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            it = iter(order)
+            it_lock = threading.Lock()
+
+            def _worker():
+                out = []
+                while not _STOP["flag"]:
+                    with it_lock:
+                        r = next(it, None)
+                    if r is None:
+                        break
+                    out.append(check_one(r))
+                return out
+            with ThreadPoolExecutor(n_w, thread_name_prefix="subtiming") as ex:
+                for f in [ex.submit(_worker) for _ in range(n_w)]:
+                    done += f.result()
         if done:
             _WAIT["n"] = max(0, _WAIT["n"] - len(done)) if _WAIT["n"] > 0 else _WAIT["n"]
         return {"done": len(done), "fixed": sum(1 for d in done if d["action"].startswith("fixed")), "results": done}
@@ -430,21 +512,23 @@ async def watch() -> None:
 
 
 def as_running() -> list:
-    if not STATE.get("running"):
-        return []
-    el = time.time() - float(STATE.get("started") or time.time())
     from . import outside as _out
-    pct = max(0.0, min(1.0, float(STATE["pct"] or 0) / 100.0))
-    return [{"job_id": f"subtiming-{STATE['file_id']}", "pool": "subtiming", "kind": "subtiming",
-             "title": STATE["label"], "file": STATE["label"], "stage": STATE["stage"], "progress": pct,
-             "elapsed_s": round(el), "eta_s": None, "eta_est": True,
-             "plan": "subtitle timing: the speech in the audio against each text track's lines",
-             "why_pool": "CPU - the voice detector, then mkvmerge if a track needs moving",
-             "doing": {"tool": "Silero VAD + ffmpeg" if pct < 0.4 else "mkvmerge --sync", "hw": "CPU",
-                       "why": STATE["stage"]},
-             "disk": _out.disk_of(STATE["file_id"]), "dest_disk": "", "fps": 0.0, "speed": 0.0,
-             "paused_for_viewer": False, "paused_for_load": False, "cancelled": False, "by_bytes": False,
-             **_out.fields("subtiming", pct)}]
+    out = []
+    for s in slots():
+        el = time.time() - float(s.get("started") or time.time())
+        pct = max(0.0, min(1.0, float(s["pct"] or 0) / 100.0))
+        key = "subtiming" if s["slot"] == 0 else f"subtiming:{s['slot']}"
+        out.append({"job_id": f"subtiming-{s['file_id']}", "pool": "subtiming", "kind": "subtiming",
+                    "title": s["label"], "file": s["label"], "stage": s["stage"], "progress": pct,
+                    "elapsed_s": round(el), "eta_s": None, "eta_est": True,
+                    "plan": "subtitle timing: the speech in the audio against each text track's lines",
+                    "why_pool": "CPU - the voice detector, then mkvmerge if a track needs moving",
+                    "doing": {"tool": "Silero VAD + ffmpeg" if pct < 0.4 else "mkvmerge --sync", "hw": "CPU",
+                              "why": s["stage"]},
+                    "disk": _out.disk_of(s["file_id"]), "dest_disk": "", "fps": 0.0, "speed": 0.0,
+                    "paused_for_viewer": False, "paused_for_load": False, "cancelled": False, "by_bytes": False,
+                    **_out.fields(key, pct)})
+    return out
 
 
 def snapshot() -> dict:
@@ -487,7 +571,11 @@ def snapshot() -> dict:
     if wait > 0 and mode() != "off":
         eta = max(wait * (avg or 15.0), wait / per_hour() * 3600)
     el = (time.time() - float(STATE["started"] or time.time())) if STATE.get("running") else 0.0
+    now = time.time()
     return {"mode": mode(), "per_hour": per_hour(), "paused": paused(), "rows": rows, "recent": recent,
+            "workers": workers(),
+            "slots": [{"label": s["label"], "stage": s["stage"], "pct": round(float(s["pct"] or 0), 1),
+                       "elapsed_s": round(now - float(s["started"] or now))} for s in slots()],
             "total": sum(tot.values()), "by": tot, "fixed": int(fixed), "waiting": wait,
             "avg_secs": round(avg, 1), "hour_n": int(hour_n), "eta_s": round(eta), "elapsed_s": round(el),
             **{k: STATE[k] for k in ("running", "label", "stage", "pct", "last_run", "last_result", "next_run")}}

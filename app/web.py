@@ -11155,6 +11155,12 @@ def api_subtiming_budget(per_hour: int):
     return {"per_hour": subtiming.set_per_hour(per_hour)}
 
 
+@app.post("/api/subtiming/workers")
+def api_subtiming_workers(n: int):
+    from . import subtiming
+    return {"workers": subtiming.set_workers(n)}
+
+
 @app.post("/api/subtiming/run")
 async def api_subtiming_run(n: int = 3, file_id: int = 0, path: str = ""):
     """Check the next N files now - or one file, by id or by path."""
@@ -14231,8 +14237,8 @@ def _outside_live() -> list:
              "hint": ("Files the subtitle board is unsure about get Whisper, Qwen and the readers instead of a "
                       "person; settles them at the sure % on the Subtitle AI page.")},
             {"key": "subtiming", "pool": "subtiming", "label": "Subtitle timing",
-             "running": 1 if subtiming.STATE.get("running") else 0, "cap": 1, "paused": subtiming.paused(),
-             "now": ("checking " + (subtiming.STATE.get("label") or "")) if subtiming.STATE.get("running") else "",
+             "running": len(subtiming.SLOTS), "cap": subtiming.workers(), "paused": subtiming.paused(),
+             "now": ("checking " + ", ".join(s["label"] for s in subtiming.slots())) if subtiming.SLOTS else "",
              "queued": max(0, subtiming._WAIT.get("n", 0)),
              "hint": ("Lines up each text subtitle with the speech in the audio; a track that is late, early "
                       "or drifting (a frame-rate mismatch) is corrected in place. CPU, about 15 s a file.")},
@@ -38952,6 +38958,7 @@ function stmPaint(){
         <select onchange="stmMode(this.value)" style="font-size:11px" title="off: never runs. advise: measures and lists, changes nothing. auto: corrects a fixed offset or a frame-rate drift in place, after proving the result is in step.">
           ${[['off','off'],['advise','advise only'],['auto','auto - fix in place']].map(([k,w])=>`<option value="${k}" ${v.mode===k?'selected':''}>${w}</option>`).join('')}</select>
         <input id="stmN" type="number" min="1" max="600" value="${v.per_hour}" style="width:62px;box-sizing:border-box;font-size:11px" oninput="stmNLabel(this.value)" onchange="stmBudget(this.value)">/hour
+        <input type="number" min="1" max="8" value="${v.workers||1}" style="width:44px;box-sizing:border-box;font-size:11px" title="files checked side by side - one CPU process each, below normal priority" onchange="stmWorkers(this.value)">at once
         <button id="stmRunBtn" class="rmb" onclick="stmRun(this)" ${v.running?'disabled':''}>Check ${v.per_hour} now</button>
         ${v.running?`<button class="rmb" onclick="fetch('/api/subtiming/stop',{method:'POST'})">Stop</button>`:''}</span></div>
     ${_stmMsg&&Date.now()-_stmMsg.at<120000?`<div style="font-size:11.5px;margin:5px 0 0;color:${_stmMsg.c}">${esc(_stmMsg.t)}</div>`:''}
@@ -38964,10 +38971,10 @@ function stmPaint(){
       <span><b>${fmt(v.waiting<0?0:v.waiting)}</b> <span class="dim">in the queue</span></span>
       <span class="dim">${v.avg_secs?`${v.avg_secs}s per file · ${v.hour_n} this hour`:'no pace measured yet'}${eta?` · queue done in ~${eta}`:''}</span>
     </div>
-    ${v.running?`<div style="display:flex;gap:10px;align-items:center;font-size:11.5px;margin:2px 0 6px">
-      <span class="dlspin"></span><b style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px">${esc(v.label||'')}</b>
-      <div class="vfybar"><div class="vfyfill" style="background:#6ee7f7;width:${Math.max(2,Math.min(100,Math.round(v.pct||0)))}%"></div><div class="vfyrun"></div></div>
-      <span class="dim" style="white-space:nowrap">${esc(v.stage||'')} · ${v.elapsed_s||0}s</span></div>`:
+    ${v.running?(v.slots&&v.slots.length?v.slots:[{label:v.label,stage:v.stage,pct:v.pct,elapsed_s:v.elapsed_s}]).map(s=>`<div style="display:flex;gap:10px;align-items:center;font-size:11.5px;margin:2px 0 4px">
+      <span class="dlspin"></span><b style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px">${esc(s.label||'')}</b>
+      <div class="vfybar"><div class="vfyfill" style="background:#6ee7f7;width:${Math.max(2,Math.min(100,Math.round(s.pct||0)))}%"></div><div class="vfyrun"></div></div>
+      <span class="dim" style="white-space:nowrap">${esc(s.stage||'')} · ${s.elapsed_s||0}s</span></div>`).join(''):
       `<div class="dim" style="font-size:11px;margin:0 0 4px">${v.mode==='off'?'switched off - nothing runs':v.paused?'paused on the Concurrency page':v.waiting>0?`idle - next pass ${v.next_run&&v.next_run>Date.now()/1000?'in '+Math.max(1,Math.round((v.next_run-Date.now()/1000)/60))+' min':'within 2 minutes'}`:'idle - every file has been checked'}${v.last_result?' · last: '+esc(v.last_result):''}</div>`}
     <div class="dim" style="font-size:11px;margin:4px 0 2px">Checks every text subtitle once against where the audio has speech, newest files first. A track that is <b>late or early by a fixed amount</b>,
       or that <b>drifts</b> because it was timed for another frame rate, is shifted in place with mkvmerge and measured again before the file is replaced.
@@ -38998,6 +39005,7 @@ function stmPaint(){
 }
 async function stmMode(m){ await fetch('/api/subtiming/mode?mode='+m,{method:'POST'}); stmLoad(); }
 async function stmBudget(n){ await fetch('/api/subtiming/budget?per_hour='+encodeURIComponent(n),{method:'POST'}); stmLoad(); }
+async function stmWorkers(n){ await fetch('/api/subtiming/workers?n='+encodeURIComponent(n),{method:'POST'}); stmLoad(); }
 function stmSay(t,c){ _stmMsg={t:t,c:c||'var(--dim)',at:Date.now()}; stmLoad(); }
 function stmGo(url,btn){
   if(btn){ btn.disabled=true; btn.innerHTML='<span class="dlspin"></span>checking…'; }
