@@ -425,7 +425,10 @@ def run_batch(n: int, file_id: int = 0) -> dict:
                 r = cur.execute("SELECT id, path, mtime, pool_disk FROM files WHERE id=?", (int(file_id),)).fetchone()
             rows = [dict(r)] if r else []
         else:
-            rows = candidates(n, busy_disks())
+            # A WIDE POOL, THEN SPREAD: the newest n were one season on one
+            # disk (Cold Case S03, three workers on one spindle). Ten times n
+            # costs the same query time and reaches most disks.
+            rows = candidates(max(n * 10, 150), busy_disks())
         # SPREAD ACROSS DISKS: round-robin by disk, so three workers read
         # three spindles rather than queueing on one.
         by: dict = {}
@@ -436,6 +439,8 @@ def run_batch(n: int, file_id: int = 0) -> dict:
             for k in list(by):
                 if by[k]:
                     order.append(by[k].pop(0))
+        if not file_id:
+            order = order[:n]
         done = []
         n_w = 1 if file_id else min(workers(), max(1, len(order)))
         if n_w == 1:
@@ -445,17 +450,26 @@ def run_batch(n: int, file_id: int = 0) -> dict:
                 done.append(check_one(r))
         else:
             from concurrent.futures import ThreadPoolExecutor
-            it = iter(order)
+            left = list(order)
             it_lock = threading.Lock()
+            reading: dict = {}               # disk -> workers on it
 
             def _worker():
                 out = []
                 while not _STOP["flag"]:
+                    # A DISK NOBODY ELSE IS READING, if the batch still has one
                     with it_lock:
-                        r = next(it, None)
-                    if r is None:
-                        break
-                    out.append(check_one(r))
+                        if not left:
+                            break
+                        r = next((x for x in left if not reading.get(x.get("pool_disk") or "")), left[0])
+                        left.remove(r)
+                        d = r.get("pool_disk") or ""
+                        reading[d] = reading.get(d, 0) + 1
+                    try:
+                        out.append(check_one(r))
+                    finally:
+                        with it_lock:
+                            reading[d] -= 1
                 return out
             with ThreadPoolExecutor(n_w, thread_name_prefix="subtiming") as ex:
                 for f in [ex.submit(_worker) for _ in range(n_w)]:
