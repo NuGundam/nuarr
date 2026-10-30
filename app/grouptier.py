@@ -70,6 +70,20 @@ def _kind_for(library: str) -> str:
     return "radarr" if lib.kind == "movie" else "sonarr"
 
 
+# WORDS THE ARR PARSER MISTAKES FOR A GROUP. "Dual-Audio" gives "Audio",
+# "10-bit" gives "bit", a hand import gives "Manual" or "Unknown". In a
+# release-title regex -(Audio) or -(bit) would match nearly every anime
+# title and hand the whole indexer a B score, so these never get a band.
+_JUNK = {"audio", "dual", "bit", "anime", "unknown", "manual", "web", "webdl", "webrip", "multi",
+         "hevc", "x265", "x264", "aac", "flac", "dub", "dubbed", "sub", "subs", "raw", "raws",
+         "eng", "jpn", "english", "japanese", "bluray", "remux", "hdr", "sdr", "dv", "uhd"}
+
+
+def _junk(g: str) -> bool:
+    g = (g or "").strip()
+    return len(g) < 3 or g.lower() in _JUNK or not re.fullmatch(r"[A-Za-z0-9][\w.+! -]*", g)
+
+
 def _band(r: dict) -> str:
     """A group's band from its scorecard row, "" when there is not enough."""
     if r.get("measured", 0) >= 3 and r.get("issues", 0) >= POOR_ISSUES:
@@ -110,7 +124,7 @@ def compute(now: float | None = None, commit: bool = False) -> dict:
         except Exception as e:                                   # noqa: BLE001
             libs[l.name] = {"error": f"{type(e).__name__}: {e}"}
             continue
-        bands = {r["grp"]: b for r in rows if (b := _band(r))}
+        bands = {r["grp"]: b for r in rows if not _junk(r["grp"]) and (b := _band(r))}
         libs[l.name] = {"kind": kind, "bands": bands,
                         "eligible": sum(1 for r in rows if r.get("measured", 0) >= MIN_MEASURED and r.get("shows", 0) >= MIN_SHOWS)}
         for g, b in bands.items():
@@ -122,6 +136,9 @@ def compute(now: float | None = None, commit: bool = False) -> dict:
         cands = {g: (bs.pop() if len(bs) == 1 else "") for g, bs in want.get(kind, {}).items()}
         tiers: dict = {}
         for g in set(cands) | set(st):
+            if _junk(g):                      # out at once, no week's hold for a word
+                st.pop(g, None)
+                continue
             cand = cands.get(g, "")
             rec = st.get(g) or {"tier": "", "cand": cand, "since": now}
             if rec.get("cand") != cand:
