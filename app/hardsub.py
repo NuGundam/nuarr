@@ -560,12 +560,55 @@ def _card_chunk(path: str, ts: list, dl_fmt: str) -> bytes:
     return r.stdout
 
 
+_PIX_SEEN: dict = {}                   # path -> (download format, height), from the band pass
+
+
+def _png_name(t: float) -> str:
+    """Where _read_text expects the thresholded crop of the frame at t."""
+    return os.path.join(os.environ.get("TEMP") or ".", f"nuarr-hs-{os.getpid()}-{int(t)}.png")
+
+
+def _card_pngs(path: str, ts: list) -> bool:
+    """THE OCR'S OWN GRABS, ON THE CARD, A CHUNK AT A TIME. _read_text takes
+    one full-resolution frame per process - measured 1.1 s and 1.2 cpu-s each,
+    up to CONFIRM_MAX of them a file, which after the band pass moved to the
+    card was most of what a read still cost the processor. The same frames
+    through one NVDEC process, eight inputs, eight PNGs: 3.3 cpu-s for eight
+    (-65%), byte-identical files. The reader finds them already on disk and
+    skips its own grab. Returns False to say "grab them yourself"."""
+    dl_fmt = (_PIX_SEEN.get(path) or ("", 0))[0]
+    if not dl_fmt or not ts or not CARD_OK.get("ok", True):
+        return False
+    cmd = [_ffmpeg(), "-hide_banner", "-v", "error", "-nostdin"]
+    fc = []
+    for i, t in enumerate(ts):
+        cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-threads", "2", "-ss", f"{t:.2f}", "-i", path]
+        fc.append(f"[{i}:v]trim=end_frame=1,hwdownload,format={dl_fmt},{LOW_BAND},scale=1280:-1,format=gray,"
+                  f"lut=y='if(gt(val,{BRIGHT}),0,255)'[o{i}]")
+    cmd += ["-filter_threads", "1", "-filter_complex", ";".join(fc)]
+    for i, t in enumerate(ts):
+        cmd += ["-map", f"[o{i}]", "-frames:v", "1", "-y", _png_name(t)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=180, creationflags=NO_WINDOW, startupinfo=hidden_si())
+    except Exception:                                            # noqa: BLE001
+        return False
+    if r.returncode != 0:
+        for t in ts:                                  # half a chunk is worse than none
+            try:
+                os.remove(_png_name(t))
+            except OSError:
+                pass
+        return False
+    return True
+
+
 def _bands_card(path: str, marks: list, say=None) -> dict | None:
     """Every frame's (low, high) from the card, or None to fall back."""
     pf, h = _pix(path)
     if not pf:
         return None
     dl_fmt = "p010le" if "10" in pf else "nv12"
+    _PIX_SEEN[path] = (dl_fmt, h)
     chunks = [marks[i:i + CARD_CHUNK] for i in range(0, len(marks), CARD_CHUNK)]
     got: dict = {}
     n = W * H
@@ -828,19 +871,20 @@ def _read_text(path: str, t: float, band: str) -> str:
     # which is a verdict about the file rather than about the install.
     if not _worker_engine(engine) and not exe:
         return ""
-    tmp = os.path.join(os.environ.get("TEMP") or ".",
-                       f"nuarr-hs-{os.getpid()}-{int(t)}.png")
+    tmp = _png_name(t)
     try:
         # Upscaled and hard-thresholded: Tesseract is far better on big clean
         # black-on-white than on a subtitle sitting over artwork.
-        subprocess.run(
-            [_ffmpeg(), "-hide_banner", "-v", "error", "-nostdin"] + FF_IN +
-            ["-ss", f"{t:.2f}", "-i", path] + FF_OUT +
-            ["-frames:v", "1",
-             "-vf", f"{band},scale=1280:-1,format=gray,"
-                    f"lut=y='if(gt(val,{BRIGHT}),0,255)'",
-             "-y", tmp], capture_output=True, timeout=90,
-            creationflags=NO_WINDOW, startupinfo=hidden_si())
+        # ALREADY HERE when _card_pngs grabbed this chunk ahead of the reader.
+        if not os.path.exists(tmp):
+          subprocess.run(
+              [_ffmpeg(), "-hide_banner", "-v", "error", "-nostdin"] + FF_IN +
+              ["-ss", f"{t:.2f}", "-i", path] + FF_OUT +
+              ["-frames:v", "1",
+               "-vf", f"{band},scale=1280:-1,format=gray,"
+                      f"lut=y='if(gt(val,{BRIGHT}),0,255)'",
+               "-y", tmp], capture_output=True, timeout=90,
+              creationflags=NO_WINDOW, startupinfo=hidden_si())
         if not os.path.exists(tmp):
             return ""
         if _worker_engine(engine):
@@ -996,9 +1040,24 @@ def probe_one(file_id: int, samples: int = SAMPLES,
     _eng = _engine_name(ocr_engine())
     cap_frames = 0                       # frames holding a subtitle-shaped line
     lines: list = []                     # what each read frame said, for the Qwen judge
+    # A CHUNK AHEAD. The reader stops early most of the time (two frames of
+    # speech settle it), so the grabs are made eight at a time as the reader
+    # reaches them, the next chunk decoding on the card while this one is
+    # read - never the whole list up front. Whatever the reader never reaches
+    # is removed below.
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    _ahead = _TPE(max_workers=1)
+    _chunks = [[tt for tt, _ in _shown[i:i + CARD_CHUNK]] for i in range(0, len(_shown), CARD_CHUNK)]
+    _futs = {0: _ahead.submit(_card_pngs, path, _chunks[0])} if _chunks and card is not None else {}
     for _i, (t, _c) in enumerate(_shown, 1):
         _say(f"reading frame {_i} of {len(_shown)} \u00b7 {_eng}",
              55.0 + 33.0 * (_i - 1) / max(1, len(_shown)))
+        _k = (_i - 1) // CARD_CHUNK
+        if _k in _futs:
+            if (_i - 1) % CARD_CHUNK == 0:
+                _futs[_k].result()                    # this chunk's crops are on disk (or not)
+                if _k + 1 < len(_chunks):
+                    _futs[_k + 1] = _ahead.submit(_card_pngs, path, _chunks[_k + 1])
         _txt = _read_text(path, t, LOW_BAND)
         if re.search(r"[A-Za-z]{2,}", _txt or ""):
             lines.append({"t": round(t), "text": " ".join(_txt.split())[:200]})
@@ -1030,6 +1089,12 @@ def probe_one(file_id: int, samples: int = SAMPLES,
         elif _i >= max(0, confirm) and text_frames >= MIN_TEXT_FRAMES \
                 and len(set(words)) >= 24:
             break                        # plenty read, none of it speech
+    _ahead.shutdown(wait=True)
+    for tt, _ in _shown:                             # crops the reader never reached
+        try:
+            os.remove(_png_name(tt))
+        except OSError:
+            pass
     # ONE LOOK UNDER THE FLOOR, WHEN NOTHING DIM HAS BEEN SEEN YET.
     #
     # The candidates above are the brightest frames, so on a file where a few
