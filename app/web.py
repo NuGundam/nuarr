@@ -780,6 +780,8 @@ async def _startup() -> None:
         # Drains itself and then idles - see webhooks.backfill_scores.
         from . import webhooks as _wh
         asyncio.create_task(_wh.backfill_scores())
+        from . import relgroup as _relgroup          # once: clear the junk group names
+        asyncio.create_task(_relgroup.repair())
         # Commits land on the emptiest free disk - the chooser hooks into
         # fileops so every commit path gets it.
         from . import placement

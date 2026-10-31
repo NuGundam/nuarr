@@ -80,8 +80,8 @@ _JUNK = {"audio", "dual", "bit", "anime", "unknown", "manual", "web", "webdl", "
 
 
 def _junk(g: str) -> bool:
-    g = (g or "").strip()
-    return len(g) < 3 or g.lower() in _JUNK or not re.fullmatch(r"[A-Za-z0-9][\w.+! -]*", g)
+    from .relgroup import junk
+    return junk(g) or (g or "").strip().lower() in _JUNK
 
 
 def _band(r: dict) -> str:

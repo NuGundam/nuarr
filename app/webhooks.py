@@ -34,6 +34,7 @@ from .arr import ArrClient
 from . import schedules
 from .config import SETTINGS
 from .db import cursor, kv_get, kv_set, log_event
+from .relgroup import clean as clean_group
 
 router = APIRouter()
 
@@ -275,7 +276,7 @@ async def _score_one_parent(cfg, parent_id: int) -> int:
             names = ", ".join(
                 str(x.get("name")) for x in (rec.get("customFormats") or [])
                 if isinstance(x, dict) and x.get("name"))[:300] or None
-            grp = str(rec.get("releaseGroup") or "")[:80] or None
+            grp = clean_group(rec.get("releaseGroup"), rec.get("sceneName"))
             if score is None and names is None and grp is None:
                 continue
             cur.execute(
@@ -465,7 +466,7 @@ async def _sync_file(cfg, file_id: int, parent_id: int | None, why: str,
         cf_names = ", ".join(
             str(x.get("name")) for x in (rec.get("customFormats") or [])
             if isinstance(x, dict) and x.get("name"))[:300] or None
-        rel_grp = str(rec.get("releaseGroup") or "")[:80] or None
+        rel_grp = clean_group(rec.get("releaseGroup"), rec.get("sceneName"))
 
         with cursor() as cur:
             row = cur.execute(
