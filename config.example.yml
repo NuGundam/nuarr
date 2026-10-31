@@ -1,0 +1,53 @@
+# Copy this to config.yml and fill it in. config.yml is gitignored because it
+# holds your Plex token and API keys in plaintext.
+#
+# Plex token:            https://support.plex.tv/articles/204059436
+# Sonarr / Radarr keys:  Settings -> General -> API Key
+#
+# The installer writes this for you from what you enter in the wizard; this
+# file is for running from source.
+
+plex_direct: true
+# Cross-check Plex's session data against Tautulli. Off by default: nuarr reads
+# playback straight from Plex, and Tautulli is a second process that can die
+# independently of the thing being measured.
+plex_cross_check: false
+
+# One entry per library folder. kind is "tv" or "movie" and decides which rules
+# apply — an episode and a film are not the same problem.
+libraries: []
+# - name: TV Shows
+#   path: D:\TV Shows
+#   kind: tv
+#   enabled: true
+# - name: Movies
+#   path: D:\Movies
+#   kind: movie
+#   enabled: true
+
+# Sonarr and Radarr, so a rename nuarr performs stays in step with them.
+arrs: []
+# - name: Sonarr
+#   kind: sonarr
+#   url: http://localhost:8989
+#   api_key: ""
+#   enabled: true
+
+# Scratch space. Every encode is written here in full before it replaces the
+# original, so it wants to be fast, local, and NOT on the pool — writing output
+# to the same spindles being read from turns one sequential read into a read
+# and a write on the same disk, which is the easiest way to make Plex stutter.
+cache_dir: ""
+# Jobs stop rather than fill the disk.
+cache_min_free_gb: 100
+
+plex_url: ""
+plex_token: ""
+
+# Optional. Only used when plex_cross_check is on.
+tautulli_url: ""
+tautulli_api_key: ""
+
+# Where to look for newer nuarr releases, as owner/name. Empty means nuarr
+# never contacts GitHub.
+update_repo: ""

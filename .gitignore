@@ -1,0 +1,35 @@
+# THE ONE THAT MATTERS. config.yml holds the Plex token and the Sonarr /
+# Radarr API keys in plaintext. A backup bundle of this project once shipped a
+# working copy of it by accident, which is the whole reason this file leads
+# with it rather than with __pycache__.
+config.yml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# nuarr's own state. The database lives under ProgramData on an installed
+# system, but a source checkout run in place will drop these here.
+*.db
+*.db-wal
+*.db-shm
+logs/
+cache/
+backups/
+
+# Build output. The installer is 165 MB; it belongs on Releases, not in git.
+dist/
+build/
+*.exe
+*.zip
+
+# Editors and Windows
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
