@@ -20596,7 +20596,7 @@ function runPanelPaint(){
                     border-radius:2px;transition:width 1.05s linear"></div>
       </div>
       <div class="dim" style="font-size:10.5px;margin-top:3px">
-        ${esc(w.stage||'')}${w.disk?' · '+esc(w.disk):''}</div>
+        ${esc(w.stage||'')}${w.disk?` · <b class="mono" style="color:${diskColor(w.disk)};font-weight:600">${esc(w.disk)}</b>`:''}</div>
       ${sub}
     </div>`;
   }).join('');
