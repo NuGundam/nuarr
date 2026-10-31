@@ -191,7 +191,40 @@ def _sample_times(duration: float, n: int, length: float) -> list[float]:
     return [lo + (hi - lo) * i / max(1, n - 1) for i in range(n)]
 
 
-def _cut_reference(ff, src, t, length, out) -> bool:
+# THE SEARCH WAS THE CPU COST OF AN ENCODE, not the encode. Measured on a
+# 24 s 1080p cut, per probe: FFV1 reference decoded twice on the CPU (once to
+# feed NVENC, once to feed libvmaf) plus the distorted side's software decode
+# came to 88 cpu-s, and cutting the FFV1 reference another 32 - against ~15
+# cpu-s for the whole real encode. Five probes a file, four files at once.
+#
+# NVENC's lossless HEVC is bit-exact (PSNR inf against the FFV1 cut, 8- and
+# 10-bit, checked) and NVDEC can decode it, which FFV1 it cannot. So the
+# reference is cut on the card (1.2 cpu-s instead of 32), the sample encode
+# never leaves the card (1.0 instead of 21), and the scorer takes both sides
+# off NVDEC (43 instead of 67 - libvmaf itself is the rest, and stays on the
+# CPU: this build has no libvmaf_cuda). FFV1 remains the fallback, taken for
+# the whole search when any cut fails on the card, since a mixed set of
+# references would need two scorer paths.
+_CARD = {"ok": True, "why": ""}
+_LOSSLESS_NVENC = ["-c:v", "hevc_nvenc", "-preset", "p1", "-tune", "lossless", "-rc", "constqp", "-qp", "0"]
+_NVDEC = ["-hwaccel", "cuda"]
+_NVDEC_CARD = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+
+
+def _card_wanted(family: str) -> bool:
+    return family == "nvenc" and _CARD.get("ok", True)
+
+
+def _card_failed(why: str) -> None:
+    _CARD.update(ok=False, why=(why or "")[:200])
+    try:
+        from . import joblog
+        joblog.log(f"VMAF target: card path failed, references on FFV1 from here - {(why or '')[:160]}", "warn")
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+def _cut_reference(ff, src, t, length, out, card: bool = False) -> bool:
     """The source's frames at this moment, cut ONCE and losslessly (FFV1).
 
     WHY. Seeking the source twice - once to encode the sample, once to score
@@ -200,7 +233,19 @@ def _cut_reference(ff, src, t, length, out) -> bool:
     times (JUJUTSU KAISEN starts at 0.007 s, Slime at 0.021 s). One frame of
     drift turns a 96 into a 41 on a moving shot, and the search then believes
     the target is unreachable. Encoding FROM this cut and scoring AGAINST it
-    means both sides hold exactly the same frames, numbered from zero."""
+    means both sides hold exactly the same frames, numbered from zero.
+
+    `card`: decode on NVDEC, keep the frames there, write NVENC lossless HEVC
+    (see _CARD above). False on any failure so the caller can fall back."""
+    if card:
+        args = ([ff, "-hide_banner", "-nostdin", "-y", "-v", "error"] + _NVDEC_CARD +
+                ["-ss", f"{t:.3f}", "-t", f"{length:.3f}", "-i", src, "-map", "0:v:0", "-an", "-sn", "-dn"]
+                + _LOSSLESS_NVENC + [out])
+        rc, err = _run(args, 300)
+        if rc == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+            return True
+        _card_failed(err.strip().splitlines()[-1] if err and err.strip() else f"rc {rc}")
+        return False
     args = [ff, "-hide_banner", "-nostdin", "-y", "-v", "error", "-ss", f"{t:.3f}", "-t", f"{length:.3f}",
             "-i", src, "-map", "0:v:0", "-an", "-sn", "-dn", "-c:v", "ffv1", "-level", "3", out]
     rc, err = _run(args, 300)
@@ -228,7 +273,7 @@ def burn_filter(src: str, burn: int, image: bool, ten: bool) -> tuple[str, str]:
     return "vf", vf
 
 
-def _cut_reference_burned(ff, src, t, length, out, burn: int, image: bool, ten: bool) -> bool:
+def _cut_reference_burned(ff, src, t, length, out, burn: int, image: bool, ten: bool, card: bool = False) -> bool:
     """The reference with the signs painted on, as the encode will paint them.
 
     WHY. VMAF scores an encode against its reference. With a burn, the encode
@@ -251,24 +296,37 @@ def _cut_reference_burned(ff, src, t, length, out, burn: int, image: bool, ten: 
         args += ["-filter_complex", f, "-map", "[v]"]
     else:
         args += ["-map", "0:v:0", "-vf", f]
-    args += ["-ss", f"{t:.3f}", "-t", f"{length:.3f}", "-an", "-sn", "-dn",
-             "-c:v", "ffv1", "-level", "3", out]
-    rc, err = _run(args, 300)
+    args += ["-ss", f"{t:.3f}", "-t", f"{length:.3f}", "-an", "-sn", "-dn"]
+    # The painting needs CPU frames, so the decode stays in software; the
+    # lossless WRITE still goes to NVENC when the card path is on, which is
+    # the FFV1 encode's share of the cost and makes the reference NVDEC-able.
+    rc, err = _run(args + (_LOSSLESS_NVENC if card else ["-c:v", "ffv1", "-level", "3"]) + [out], 300)
+    if card and not (rc == 0 and os.path.exists(out) and os.path.getsize(out) > 0):
+        _card_failed(err.strip().splitlines()[-1] if err and err.strip() else f"rc {rc}")
+        return False
     return rc == 0 and os.path.exists(out) and os.path.getsize(out) > 0
 
 
-def _encode_sample(ff, ref, family, codec, cq, preset, ten, out) -> int:
-    """One sample at one CQ, from the reference cut; its size in bytes (0 on failure)."""
+def _encode_sample(ff, ref, family, codec, cq, preset, ten, out, card: bool = False, src10: bool = False) -> int:
+    """One sample at one CQ, from the reference cut; its size in bytes (0 on failure).
+
+    `card`: the reference is NVDEC-able and the frames stay on the card into
+    NVENC - the same path the real encode takes (jobs.build_ffmpeg), down to
+    scale_cuda widening an 8-bit reference for a 10-bit sample."""
     from . import encoders
-    args = [ff, "-hide_banner", "-nostdin", "-y", "-v", "error",
-            "-i", ref, "-map", "0:v:0", "-an", "-sn", "-dn"]
-    args += encoders.video_args(family, codec, int(cq), preset, ten, False)
+    args = [ff, "-hide_banner", "-nostdin", "-y", "-v", "error"]
+    if card:
+        args += _NVDEC_CARD
+    args += ["-i", ref, "-map", "0:v:0", "-an", "-sn", "-dn"]
+    if card and ten and not src10:
+        args += ["-vf", "scale_cuda=format=p010le"]
+    args += encoders.video_args(family, codec, int(cq), preset, ten, card)
     args += [out]
     rc, err = _run(args, 300)
     return os.path.getsize(out) if rc == 0 and os.path.exists(out) else 0
 
 
-def _score(ff, ref, enc, ten, threads) -> tuple[float, float, float] | None:
+def _score(ff, ref, enc, ten, threads, card: bool = False) -> tuple[float, float, float] | None:
     """(mean VMAF, 5th-percentile-ish VMAF, mean CAMBI) of an encoded sample.
 
     CAMBI is Netflix's banding index, computed by the same libvmaf call. VMAF
@@ -284,7 +342,10 @@ def _score(ff, ref, enc, ten, threads) -> tuple[float, float, float] | None:
            f"[1:v]format={fmt},setpts=PTS-STARTPTS[r];"
            f"[d][r]libvmaf=log_fmt=json:log_path='{log.replace(chr(92), '/').replace(':', chr(92) + ':')}'"
            f":n_threads={threads}:n_subsample={SUBSAMPLE}:feature=name=cambi")
-    args = [ff, "-hide_banner", "-nostdin", "-v", "error", "-i", enc, "-i", ref,
+    # Both sides off NVDEC when the references are HEVC; libvmaf itself
+    # wants system frames, so the format= step above is where they come down.
+    hw = _NVDEC if card else []
+    args = [ff, "-hide_banner", "-nostdin", "-v", "error"] + hw + ["-i", enc] + hw + ["-i", ref,
             "-lavfi", lav, "-f", "null", "-"]
     rc, err = _run(args, 600)
     if rc != 0 or not os.path.exists(log):
@@ -380,6 +441,9 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
     # up front: a library with a learned CQ usually settles in 3-4, a cold one
     # takes up to MAX_PROBES. The estimate starts there and grows if the
     # search runs past it, so the bar never sits at 100 % while work remains.
+    _vs0 = next((x for x in (probe or {}).get("streams", []) if x.get("codec_type") == "video"), None) or {}
+    src10 = "10" in str(_vs0.get("pix_fmt") or "") or str(_vs0.get("bits_per_raw_sample") or "") == "10"
+    card = _card_wanted(family)
     _g0 = guess(library, target, family)
     est = {"probes": 4 if _g0 is not None else MAX_PROBES}
     tried: dict[int, dict] = {}
@@ -401,8 +465,24 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
         _report(f"cutting sample {k + 1}/{len(times)} from the source", k / max(1, len(times)))
         ref = os.path.join(work_dir, f"ref-{k}.mkv")
         _burn = getattr(plan, "burn_index", None)
-        ok = (_cut_reference_burned(ff, src, t, length, ref, int(_burn), bool(getattr(plan, "burn_image", False)), ten)
-              if _burn is not None else _cut_reference(ff, src, t, length, ref))
+        ok = (_cut_reference_burned(ff, src, t, length, ref, int(_burn), bool(getattr(plan, "burn_image", False)), ten, card)
+              if _burn is not None else _cut_reference(ff, src, t, length, ref, card))
+        if not ok and card:
+            # ONE SET OF REFERENCES, ONE PATH: start the cuts over on FFV1.
+            card = False
+            for r0 in refs:
+                try:
+                    os.remove(r0)
+                except OSError:
+                    pass
+            refs = []
+            ok = (_cut_reference_burned(ff, src, t, length, ref, int(_burn), bool(getattr(plan, "burn_image", False)), ten)
+                  if _burn is not None else _cut_reference(ff, src, t, length, ref))
+            for k0, t_0 in list(enumerate(times))[:k]:       # the ones already cut on the card
+                r0 = os.path.join(work_dir, f"ref-{k0}.mkv")
+                if (_cut_reference_burned(ff, src, t_0, length, r0, int(_burn), bool(getattr(plan, "burn_image", False)), ten)
+                        if _burn is not None else _cut_reference(ff, src, t_0, length, r0)):
+                    refs.append(r0)
         if ok:
             refs.append(ref)
     if not refs:
@@ -412,7 +492,7 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
     src_band = []
     for k, ref in enumerate(refs):
         _report(f"measuring the source's own banding {k + 1}/{len(refs)}", 1.0)
-        sc0 = _score(ff, ref, ref, ten, threads)
+        sc0 = _score(ff, ref, ref, ten, threads, card)
         src_band.append(float(sc0[2]) if sc0 else 0.0)
     t0 = time.time()
     STATE[job_id] = {"label": os.path.basename(src), "probe": 0, "cq": None, "at": t0}
@@ -427,10 +507,10 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
             _report(f"CQ {cq}: sample {k + 1}/{len(refs)}", 1 + len(tried) + k / len(refs))
             out = os.path.join(work_dir, f"enc-{cq}-{k}.mkv")
             try:
-                sz = _encode_sample(ff, ref, family, codec, cq, preset, ten, out)
+                sz = _encode_sample(ff, ref, family, codec, cq, preset, ten, out, card, src10)
                 if not sz:
                     raise RuntimeError("sample encode failed")
-                sc = _score(ff, ref, out, ten, threads)
+                sc = _score(ff, ref, out, ten, threads, card)
                 if not sc:
                     raise RuntimeError("VMAF could not score the sample")
                 sizes += sz
