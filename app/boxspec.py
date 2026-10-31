@@ -66,6 +66,7 @@ COST_CORES = {
 # A subread is two different jobs wearing one name. The pump asks for the
 # shape it is about to run; the recommender sizes for the expensive one.
 COST_CORES_SUBREAD_TRACK = 0.5
+COST_CORES_SUBREAD_CARD = 1.0
 # AND THE EXPENSIVE ONE IS PRICED BY THE LANE, because the lane count is no
 # longer six everywhere (hardsub.lanes). Measured: 9.1 cores over 6 lanes,
 # 5.1 over 3, 3.5 over 2 - so a lane is about 1.6 cores and the overhead of
@@ -232,6 +233,14 @@ def subread_cores(picture: bool = True, running: int | None = None) -> float:
     """What one subtitle read is about to cost the processor."""
     if not picture:
         return COST_CORES_SUBREAD_TRACK
+    # ON THE CARD the frames cost about a core (measured 5-8 cpu-s over 6-8 s);
+    # only when the card path last failed is the lanes' price the real one.
+    try:
+        from .hardsub import CARD_OK
+        if CARD_OK.get("ok", True):
+            return COST_CORES_SUBREAD_CARD
+    except Exception:                                            # noqa: BLE001
+        pass
     return round(lanes(running) * LANE_CORES, 2)
 
 

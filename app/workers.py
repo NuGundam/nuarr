@@ -410,12 +410,12 @@ HINTS = {
                        "the models twice and halve both.",
     "subread_workers": "How many files may have their subtitles read at once "
                        "- frames sampled for burned-in words, or a track's "
-                       "events read to judge its title. The frame sampler is "
-                       "the most processor-hungry job here: six ffmpeg "
-                       "processes pulling 24 frames, measured at nine cores "
-                       "for sixteen seconds on a 1080p episode. Each is also "
-                       "a whole-file read off one pool disk, never two on the "
-                       "same disk.",
+                       "events read to judge its title. The frame sampler "
+                       "decodes its 24 frames on the graphics card, eight "
+                       "seeks to a process - about a core for six seconds on "
+                       "a 1080p episode, where it was nine cores for sixteen "
+                       "on the processor. Each is also a whole-file read off "
+                       "one pool disk, never two on the same disk.",
     "probe_workers": "How many files may be inspected at once. Cheap on the "
                      "processor, one disk read each.",
     "arr_concurrency": "How many questions Nuarr may ask Sonarr and Radarr at "
@@ -713,16 +713,16 @@ COST = {
                "while it runs, 15-30 s a file; the audio is one read off one "
                "pool disk."},
     "subread_workers": {
-        "cpu": 3, "gpu": 1, "ram": 1, "disk": 2, "lead": "cpu",
-        "why": "THE HEAVIEST THING NUARR ASKS OF THE PROCESSOR, measured. A "
-               "picture read grabs 24 frames through six ffmpeg processes at "
-               "two threads each: on a 1080p 10-bit episode that is 145 "
-               "cpu-seconds in 16 wall seconds - nine cores while it runs, "
-               "where a decode check is three. The OCR is the small half and "
-               "it is on the card; the frames are the big half and they are "
-               "not (NVDEC loses on one frame per process - see hardsub). A "
-               "track read instead walks one subtitle stream end to end, "
-               "which is disk."},
+        "cpu": 1, "gpu": 2, "ram": 1, "disk": 2, "lead": "gpu",
+        "why": "WAS THE HEAVIEST THING NUARR ASKED OF THE PROCESSOR: 24 frames "
+               "through six ffmpeg processes, nine cores for 16 seconds on a "
+               "1080p 10-bit episode. The frames are decoded on the card now, "
+               "eight seeks to a process with the pictures kept in its memory, "
+               "so the same read is 6-8 cpu-seconds over 6 wall seconds - about "
+               "a core - and the OCR that follows was on the card already. It "
+               "falls back to the processor for a codec NVDEC lacks. A track "
+               "read instead walks one subtitle stream end to end, which is "
+               "disk."},
     "probe_workers": {
         "cpu": 1, "gpu": 0, "ram": 0, "disk": 2, "lead": "disk",
         "why": "ffprobe reads a header. The cost is one seek per file across "

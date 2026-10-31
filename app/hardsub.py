@@ -492,6 +492,107 @@ def _bands(path: str, t: float) -> tuple:
             sum(1 for v in b[n:n * 2] if v > BRIGHT))
 
 
+# ON THE CARD AFTER ALL - the measurement above was right about what it
+# measured and wrong about what to conclude. It ran ONE frame per process, so
+# every frame paid a CUDA context. Give one process EIGHT seeks as eight
+# inputs and the context is paid once for eight frames; keep the decoded
+# frames on the card and only the two 320x60 crops come back. Measured on the
+# box, 24 frames of a 1080p 10-bit episode, identical pixel counts:
+#
+#   today, 24 processes, 3 lanes      11.4s wall    42-48 cpu-s
+#   one process, 24 inputs, on card    7.2-7.9s      5.3-5.9      -87% cpu
+#   three processes x 8, on card       5.9-6.1s      7.5-7.8      -83% cpu
+#   4K HEVC, today                    58.7s        262 cpu-s
+#   4K HEVC, 3 x 8 one after another  13.0s         11.2         -96% cpu
+#
+# EIGHT PER PROCESS BECAUSE OF THE CARD'S MEMORY: every input holds its own
+# decoder and frame pool, ~45 MB each at 1080p and ~440 MB at 4K. 24 inputs
+# of 4K wanted 10.5 GB; eight want 3.7. So 1080p runs its three chunks at
+# once (about 1 GB in all), anything taller runs them one after another.
+#
+# THE DOWNLOAD FORMAT HAS TO MATCH THE SOURCE: hwdownload takes the first
+# format it is offered and fails on a mismatch, so a 10-bit source needs
+# p010le and an 8-bit one nv12 - read off ffprobe, one call a file.
+#
+# Any failure - a codec NVDEC lacks (MPEG-4 part 2, old DVD rips), the card
+# full, a build without the filters - falls back to the lanes below, which
+# is today's path, unchanged. CARD_OK remembers the last outcome so the cost
+# the gate is told (boxspec.subread_cores) matches what will actually run.
+CARD_CHUNK = 8
+CARD_PARALLEL_MAX_H = 1100
+CARD_OK = {"ok": True, "why": ""}
+
+
+def _ffprobe() -> str:
+    from .jobs import _ffprobe_exe
+    return _ffprobe_exe()
+
+
+def _pix(path: str) -> tuple:
+    """(pix_fmt, height) of the first video stream, ("", 0) if unknown."""
+    try:
+        r = subprocess.run([_ffprobe(), "-v", "error", "-select_streams", "v:0", "-show_entries",
+                            "stream=pix_fmt,height", "-of", "default=nw=1", path],
+                           capture_output=True, text=True, timeout=30, creationflags=NO_WINDOW, startupinfo=hidden_si())
+        # key=value lines: ffprobe prints them in ITS order, not the asked one
+        kv = dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln)
+        return kv.get("pix_fmt", "").strip(), int(kv.get("height") or 0)
+    except Exception:                                            # noqa: BLE001
+        return "", 0
+
+
+def _card_chunk(path: str, ts: list, dl_fmt: str) -> bytes:
+    """One ffmpeg, len(ts) inputs decoded on NVDEC, both bands of each frame
+    stacked into one rawvideo pipe: low band, high band, next frame..."""
+    cmd = [_ffmpeg(), "-hide_banner", "-v", "error", "-nostdin"]
+    fc = []
+    for i, t in enumerate(ts):
+        cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-threads", "2", "-ss", f"{t:.2f}", "-i", path]
+        fc.append(f"[{i}:v]trim=end_frame=1,hwdownload,format={dl_fmt},split=2[a{i}][b{i}];"
+                  f"[a{i}]{LOW_BAND},scale={W}:{H},format=gray[l{i}];"
+                  f"[b{i}]{HIGH_BAND},scale={W}:{H},format=gray[h{i}]")
+    fc.append("".join(f"[l{i}][h{i}]" for i in range(len(ts))) + f"vstack=inputs={2 * len(ts)}[out]")
+    cmd += ["-filter_threads", "1", "-filter_complex", ";".join(fc), "-map", "[out]", "-frames:v", "1"] + FF_OUT + ["-f", "rawvideo", "-"]
+    r = subprocess.run(cmd, capture_output=True, timeout=180, creationflags=NO_WINDOW, startupinfo=hidden_si())
+    if r.returncode != 0 or len(r.stdout or b"") < 2 * W * H * len(ts):
+        tail = (r.stderr or b"").decode(errors="replace").strip().splitlines()
+        raise RuntimeError(tail[-1] if tail else "no frames")
+    return r.stdout
+
+
+def _bands_card(path: str, marks: list, say=None) -> dict | None:
+    """Every frame's (low, high) from the card, or None to fall back."""
+    pf, h = _pix(path)
+    if not pf:
+        return None
+    dl_fmt = "p010le" if "10" in pf else "nv12"
+    chunks = [marks[i:i + CARD_CHUNK] for i in range(0, len(marks), CARD_CHUNK)]
+    got: dict = {}
+    n = W * H
+
+    def take(ts, raw):
+        for i, t in enumerate(ts):
+            lo, hi = raw[i * 2 * n:(i * 2 + 1) * n], raw[(i * 2 + 1) * n:(i + 1) * 2 * n]
+            got[t] = (sum(1 for v in lo if v > BRIGHT), sum(1 for v in hi if v > BRIGHT))
+        if say:
+            say(f"measuring frame {len(got)} of {len(marks)}", 55.0 * len(got) / max(1, len(marks)))
+    try:
+        if h and h > CARD_PARALLEL_MAX_H:
+            for ts in chunks:                      # 4K: one at a time, for the card's memory
+                take(ts, _card_chunk(path, ts, dl_fmt))
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=len(chunks)) as ex:
+                for ts, raw in zip(chunks, ex.map(lambda ts: _card_chunk(path, ts, dl_fmt), chunks)):
+                    take(ts, raw)
+    except Exception as e:                                       # noqa: BLE001
+        CARD_OK.update(ok=False, why=str(e)[:200])
+        joblog.log(f"burned-in reader: card decode failed, using the processor - {str(e)[:160]}", "warn")
+        return None
+    CARD_OK.update(ok=True, why="")
+    return got
+
+
 def _tesseract() -> str:
     try:
         from . import subocr
@@ -815,14 +916,20 @@ def probe_one(file_id: int, samples: int = SAMPLES,
     # time and the pool has twelve disks to answer from.
     from concurrent.futures import ThreadPoolExecutor, as_completed
     low, high, read = [], [], 0
-    _lanes = lanes()
-    with ThreadPoolExecutor(max_workers=_lanes) as ex:
+    # THE CARD FIRST - see _bands_card. The lanes below are the fallback.
+    card = _bands_card(path, marks, _say)
+    got: dict = {}
+    if card is not None:
+        for t, (lo, hi) in card.items():
+            got[(t, LOW_BAND)] = lo
+            got[(t, HIGH_BAND)] = hi
+    _lanes = lanes() if card is None else 0
+    with ThreadPoolExecutor(max_workers=max(1, _lanes)) as ex:
         # ONE JOB PER FRAME, NOT ONE PER BAND. Both crops come out of a
         # single decode - see _bands. This was 48 ffmpeg processes for 24
         # frames, each pair seeking to the same timestamp for two crops of
         # the same picture.
-        futs = {ex.submit(_bands, path, t): t for t in marks}
-        got: dict = {}
+        futs = {ex.submit(_bands, path, t): t for t in marks} if card is None else {}
         # AS THEY FINISH, NOT IN THE ORDER THEY WERE SUBMITTED. Twelve lanes
         # answer in whatever order the disks feel like; waiting on the first
         # while eleven others are already done makes a progress bar stand
