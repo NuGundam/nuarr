@@ -6436,7 +6436,7 @@ def _health_build():
 
     def add(key, label, goto, n, note, mode=None, running=False, warn=None,
             when="", pool=None, done=None, left=None, true_left=None,
-            true_why=""):
+            true_why="", needs_you=None):
         # HOW LONG THIS CHECK TOOK, on the row - the page waits for the
         # slowest of them, and "the Health page is slow" needs a name.
         _now = time.perf_counter()
@@ -6444,6 +6444,17 @@ def _health_build():
         rem = REMEDY.get(key)
         if done is None and left is None and key in POOL:
             done, left = _progress(key)
+        # ONLY WHAT NEEDS YOU IS A WARNING. A check in auto mode with
+        # findings is already fixing them on its own schedule - "3 record(s)
+        # disagree" with a fix-in-place switch on auto is work in progress,
+        # not a question. It shows as "fixing" and does not count towards
+        # "found something". What still counts: a fix that failed or was
+        # refused (needs_you), a check that could not run, and every finding
+        # of a check in manual mode or with no switch at all.
+        _found = bool(warn if warn is not None else n)
+        fixing = bool(_found and mode == "auto" and not needs_you)
+        if fixing:
+            warn = False
         checks.append({"ms": _ms, "remedy": rem[0] if rem else "",
                        "pool": pool if pool is not None else POOL.get(key, ""),
                        "done": done, "left": left,
@@ -6466,8 +6477,8 @@ def _health_build():
                        # decide - it is counted live and fixed by the queue -
                        # and saying so is shorter than leaving a hole.
                        "when": when or ("counted live" if mode is None else ""),
-                       "running": bool(running),
-                       "warn": bool(warn if warn is not None else n)})
+                       "running": bool(running), "fixing": fixing,
+                       "warn": False if fixing else bool(warn if warn is not None else n)})
         _clock[0] = time.perf_counter()
 
     try:
@@ -6504,7 +6515,7 @@ def _health_build():
             (f"{fails} could not be corrected" if fails else
              f"{d.get('total') or 0} record(s) disagree" if d.get("total") else
              "records and files agree" if d.get("have") else "not checked yet"),
-            mode=d.get("mode"), running=d.get("running"))
+            mode=d.get("mode"), running=d.get("running"), needs_you=bool(fails))
     except Exception as e:                                   # noqa: BLE001
         add("arrsync", "Do Nuarr and the arrs still agree?", "arrsync", 0,
             f"check unavailable: {type(e).__name__}", warn=True)
@@ -6520,7 +6531,7 @@ def _health_build():
              if d.get("total") else
              "every title matches its stream" if d.get("have") else
              "not checked yet"),
-            mode=d.get("mode"), running=d.get("running"))
+            mode=d.get("mode"), running=d.get("running"), needs_you=bool(fails))
     except Exception as e:                                   # noqa: BLE001
         add("audiotitle", "Does the audio picker tell the truth?", "audiotitle",
             0, f"check unavailable: {type(e).__name__}", warn=True)
@@ -6538,7 +6549,7 @@ def _health_build():
              "every file the arrs manage is here" if d.get("have") else
              "not checked yet"),
             mode=d.get("mode"), running=d.get("running"),
-            warn=bool((d.get("fixable") or 0) or errs))
+            warn=bool((d.get("fixable") or 0) or errs), needs_you=bool(errs))
     except Exception as e:                                   # noqa: BLE001
         add("arrgap", "Files the arrs manage that Nuarr has no entry for",
             "arrgap", 0, f"check unavailable: {type(e).__name__}", warn=True)
@@ -33678,8 +33689,9 @@ function hlPaint(){
                 font-size:12px;margin-bottom:8px">
       ${_hl.from_before_restart?`<span class="dim" style="font-size:11px">showing the answer from before the restart (${ago(Date.now()/1000-(_hl.age_s||0))}) - a fresh one is being built</span>`:''}
       <b style="color:${_hl.all_clear?'var(--ok)':'var(--warn)'}">
-        ${_hl.all_clear?'everything checks out'
-          :fmt(_hl.warnings)+' check'+(_hl.warnings===1?'':'s')+' found something'}</b>
+        ${_hl.all_clear?'nothing needs you'
+          :fmt(_hl.warnings)+' check'+(_hl.warnings===1?'':'s')+' need'+(_hl.warnings===1?'s':'')+' you'}</b>
+      ${(_hl.checks||[]).some(c=>c.fixing)?`<span style="font-size:11px;color:#6fb0ff">${(_hl.checks||[]).filter(c=>c.fixing).length} fixing on their own</span>`:''}
       <button onclick="hlRun()" style="font-size:11px;padding:2px 9px"
         title="Ask every check to look again. They run in the background and each row reports itself.">Check everything now</button>
       <span style="display:inline-flex;border:1px solid var(--line);
@@ -33706,14 +33718,14 @@ function hlPaint(){
          onclick="location.hash='${esc(c.goto)}'"
          title="open the full card">
       <span style="width:9px;height:9px;border-radius:50%;flex:none;
-        background:${c.running?'var(--acc)':(c.warn?'var(--warn)':'var(--ok)')}"></span>
+        background:${c.running?'var(--acc)':(c.warn?'var(--warn)':c.fixing?'#6fb0ff':'var(--ok)')}"></span>
       <b style="flex:0 1 290px;min-width:200px">${esc(c.label)}</b>
       <span style="flex:none;min-width:64px">${c.pool
         ?`<span class="pill" style="color:${poolColor(c.pool)};border-color:${poolColor(c.pool)};font-size:10px"
             title="the queue pool that does this row's work">${esc(c.pool)}</span>`:''}</span>
       <span class="${c.warn?'warn':'dim'}" style="flex:1 1 240px;min-width:0;overflow:hidden;
         text-overflow:ellipsis;white-space:nowrap" title="${esc(c.note||'')}">
-        ${(c.running&&!(c.done!=null&&c.mode==null))?'checking now… ':''}${esc(c.note||'')}</span>
+        ${(c.running&&!(c.done!=null&&c.mode==null))?'checking now… ':''}${esc(c.note||'')}${c.fixing?' <span style="color:#6fb0ff">· fixing on its own</span>':''}</span>
       <span class="mono" style="flex:none;min-width:150px;text-align:right;font-size:10.5px"
         title="how many files this row's system has been through, and how many are still to come">${
         c.done!=null
@@ -33759,7 +33771,7 @@ function hlPaint(){
   const groupHtml=g=>`<div style="margin:12px 0 4px;display:flex;align-items:baseline;gap:8px">
       <b style="font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#6fb0ff">${esc(g.name)}</b>
       <span class="dim" style="font-size:10.5px">${g.rows.length} check${g.rows.length===1?'':'s'}${
-        g.warns?` · <span style="color:var(--warn)">${g.warns} found something</span>`:''}</span>
+        g.warns?` · <span style="color:var(--warn)">${g.warns} need${g.warns===1?'s':''} you</span>`:''}</span>
     </div>`+g.rows.map(row).join('');
   el.innerHTML=head+glist.map(groupHtml).join('')
     +`<div class="dim" style="font-size:10.5px;margin-top:6px">Each row is a
