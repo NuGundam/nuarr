@@ -12591,11 +12591,11 @@ def api_activity(q: str = "", page: int = 1, page_size: int = 50):
 
 
 @app.get("/api/attention")
-async def api_attention(limit: int = 400):
-    return await asyncio.to_thread(_attention, limit)
+async def api_attention(limit: int = 400, fresh: int = 0):
+    return await asyncio.to_thread(_attention, limit, bool(fresh))
 
 
-def _attention(limit: int = 400):
+def _attention(limit: int = 400, fresh: bool = False):
     """THE ACTUAL FILES behind the Attention tile, not just the counts.
 
     The tile could say "3" and send you to a panel that listed none of them:
@@ -12751,7 +12751,7 @@ def _attention(limit: int = 400):
 
     try:
         from . import userinput as _ui
-        for _r in _ui.rows():
+        for _r in _ui.rows(fresh):
             its = _r.get("items") or [{"title": _r["note"], "detail": ""}]
             for it in its:
                 out.append({"source": _r["what"], "id": 0, "title": it.get("title") or "",
@@ -20412,7 +20412,7 @@ async function loadAttention(force){
   if(b && (force || !_attn.items.length))
     b.innerHTML='<div class="skel" style="padding:12px"><i style="width:60%"></i>'
                +'<i style="width:44%"></i><i style="width:52%"></i></div>';
-  try{ _attn=await (await fetch('/api/attention')).json(); }
+  try{ _attn=await (await fetch('/api/attention'+(force?'?fresh=1':''))).json(); }
   catch(e){ if(b) b.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
   attnPaint();
 }

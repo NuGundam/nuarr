@@ -187,7 +187,7 @@ def _rebuild() -> None:
         _LOCK.release()
 
 
-def rows() -> list:
+def rows(fresh: bool = False) -> list:
     """[{what, n, note, goto, items}] - every source waiting on a person.
 
     NEVER WAITED FOR. The Subtitle User Input count is the panel's own
@@ -195,6 +195,13 @@ def rows() -> list:
     summary poll on every page. The last answer is returned and a thread
     builds the next one; before the first build there is nothing to say yet.
     """
+    if fresh:
+        # A PERSON PRESSED REFRESH, usually right after answering something:
+        # build now and wait (~0.3-3 s), or the row they just answered comes
+        # back from the cache and the button looks broken.
+        with _LOCK:
+            _build()
+        return list(_CACHE["rows"] or [])
     if _CACHE["rows"] is None or time.time() - _CACHE["at"] >= TTL_S:
         threading.Thread(target=_rebuild, daemon=True, name="userinput").start()
     return list(_CACHE["rows"] or [])
