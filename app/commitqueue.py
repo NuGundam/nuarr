@@ -302,8 +302,14 @@ def stats() -> dict:
     with cursor() as cur:
         pend = cur.execute("SELECT COUNT(*) n FROM commit_queue "
                            "WHERE done_at IS NULL").fetchone()["n"]
-        gave = cur.execute("SELECT COUNT(*) n FROM commit_queue WHERE done_at "
-                           "IS NOT NULL AND last_error LIKE 'gave up%'").fetchone()["n"]
+        # ONLY A GAVE-UP WITH ITS OUTPUT STILL IN THE CACHE is something to
+        # act on. The count used to include every gave-up ever recorded, so
+        # "1 gave up" sat on the panel for a release that had since been
+        # replaced and whose output was long gone (SHIROHIYO, 2026-11-01).
+        gave = sum(1 for r in cur.execute(
+            "SELECT cache_path FROM commit_queue WHERE done_at IS NOT NULL "
+            "AND last_error LIKE 'gave up%'")
+            if r["cache_path"] and os.path.exists(r["cache_path"]))
         held = cur.execute("SELECT COALESCE(SUM(size_after),0) b FROM commit_queue "
                            "WHERE done_at IS NULL").fetchone()["b"]
         rows = [dict(r) for r in cur.execute(
