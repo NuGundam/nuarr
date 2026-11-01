@@ -118,6 +118,42 @@ def _done_ids(cur) -> set:
         "AND state NOT IN ('queued','running')", (SOURCE, PLAN_MARK))}
 
 
+_GAVE_UP: dict = {"at": 0.0, "map": {}}
+
+
+def gave_up(file_id: int, size_bytes: int = 0) -> bool:
+    """THE PLANNER'S DO-NOT-RETRY. The feeder above already skips a file that
+    has had a go, but the planner did not - so every other path that re-plans
+    a file (the subtitle rules drain above all) asked for the conversion again,
+    the 20% gate threw it away again, and whatever else rode on that plan (a
+    subtitle strip, a burn) was thrown away with it. Measured 2026-11-01: 41
+    files, 1,777 discarded encodes, ~294 encode-hours; Cyberpunk: Edgerunners
+    S02E03 alone ~80 times, never losing its 36 unwanted subtitle tracks.
+
+    Same file only: a discard recorded against a different size (a new
+    release, a rewrite) does not count, so a replacement gets its own try.
+    Cached for five minutes - decide() is called for every plan."""
+    now = time.time()
+    if now - _GAVE_UP["at"] > 300:
+        m: dict = {}
+        try:
+            with cursor() as cur:
+                for r in cur.execute(
+                        "SELECT file_id, size_before FROM jobs "
+                        " WHERE plan_json LIKE ? AND state='skipped' "
+                        "   AND (coalesce(result_json,'') LIKE '%discarded%' "
+                        "        OR coalesce(error,'') LIKE '%discarded%')",
+                        (PLAN_MARK,)):
+                    m.setdefault(int(r["file_id"] or 0), set()).add(int(r["size_before"] or 0))
+        except Exception:                                        # noqa: BLE001
+            m = _GAVE_UP["map"]
+        _GAVE_UP.update(at=now, map=m)
+    sizes = _GAVE_UP["map"].get(int(file_id or 0))
+    if not sizes:
+        return False
+    return not size_bytes or int(size_bytes) in sizes or 0 in sizes
+
+
 def candidates(force: bool = False) -> list:
     """Every file still worth converting, highest bitrate first. Cached 30 min."""
     if not force and STATE["cands"] and time.time() - STATE["cand_at"] < 1800:

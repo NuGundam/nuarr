@@ -1827,6 +1827,11 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
     try:
         from . import hevcconvert as _hc
         _conv = _hc.wants(library, vcodec, bool(ten_bit), bool(hdr), int(height or 0), float(overall_mbps or 0))
+        # Tried on this very file and discarded for not saving enough - see
+        # hevcconvert.gave_up. Asking again only throws the rest of the plan
+        # away with it; without the conversion a subtitle strip is a remux.
+        if _conv and file_id and _hc.gave_up(file_id, size_bytes):
+            _conv = False
     except Exception:                                    # noqa: BLE001
         _conv = False
     oversized = ((_v("shrink_enabled", CONFIG["spaceSaver"]["enabled"]) or _trial)
