@@ -48846,7 +48846,7 @@ async function loadArrsTab(refresh){
         +'One exception to that: a download whose file is a program (.exe, .scr, '
         +'.bat, .msi and the like) posing as an episode or movie is removed the '
         +'moment its file list is known, even mid-download, and blocklisted so the '
-        +'arr goes looking for a real release instead. And a finished download the arr cannot place - "Unable to parse release", an unknown series or film - has its name read by Qwen, and is imported when that reading matches exactly one film or episode here and the arr offers the file for it; anything else stays for you.',
+        +'arr goes looking for a real release instead. And a finished download the arr cannot place - "Unable to parse release", an unknown series or film - has its name read by Qwen, and is imported when that reading matches exactly one film or episode here and the arr offers the file for it; anything else stays for you. A download Sonarr refuses for its shape - a single episode where a two-episode file sits on disk, or a name its parser reads differently from its own grab - is imported when it beats every file it would replace (higher quality in the profile, or the same quality and a higher score), and removed when it beats none of them.',
         d.toggles.queue_janitor, qjst,
         {label:'', kind:'queue_janitor', names:{}, empty:'', adder:qjList(qj)})
     + `<div id="bcBox" style="margin-top:12px"></div>`;
@@ -49127,7 +49127,7 @@ function qjRowHtml(r,i){
     <td class="c dim">${esc(r.client||'')}</td>
     <td class="l" style="cursor:pointer" title="${esc(r.title||'')}" onclick="qjOpen('${id}',event)"
       ><span class="actcaret">${open?'▾':'▸'}</span><span class="mono">${esc(r.title||'')}</span>
-      <div class="${r.kind==='malware'?'':'dim'}" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:14px${r.kind==='malware'?';color:var(--bad,#e5534b);font-weight:600':r.kind==='stalled'?';color:#e8a33d':r.kind==='parsed'?';color:#f0b37e':''}">${esc(r.why||'')}</div></td>
+      <div class="${r.kind==='malware'?'':'dim'}" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:14px${r.kind==='malware'?';color:var(--bad,#e5534b);font-weight:600':r.kind==='stalled'?';color:#e8a33d':r.kind==='parsed'?';color:#f0b37e':r.kind==='better'?';color:#4caf50':''}">${esc(r.why||'')}</div></td>
   </tr>${open?`<tr class="det" id="qjdet-${esc(id)}"><td colspan="4" style="padding:0;border-bottom:1px solid var(--line);white-space:normal;background:rgba(255,255,255,.025)">
     <div style="font-size:11px;padding:6px 10px 8px 34px">
       <div style="display:flex;gap:8px;margin:2px 0"><span class="dim" style="flex:none;width:96px;text-align:right">release</span><span class="mono" style="overflow-wrap:anywhere">${esc(r.title||'')}</span></div>

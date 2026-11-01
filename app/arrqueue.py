@@ -440,6 +440,130 @@ def _import_known(items: list) -> list:
     return rows
 
 
+# ------------------------------------- refused for its shape, not its worth --
+# "Episode file on disk contains more episodes than this file contains": a
+# 2160p single refused because a 1080p DOUBLE (E09-E10) sits on disk. "Episode
+# 1x05 was not found in the grabbed release": Sonarr's parser and its own
+# grab disagree about a name. Neither says the file is worse - Sonarr simply
+# will not decide. So it is decided here, the way Sonarr would for a clean
+# import: better quality in the series' profile, or the same quality and a
+# higher custom-format score, than EVERY file it would replace -> imported
+# with the arr's own mapping (ManualImport ignores the shape check). Not
+# better than any of them -> removed without a blocklist, exactly as the
+# arr's own "not an upgrade" rows are. Mixed, or no mapping -> left for you.
+SHAPE_SAYS = ("contains more episodes than", "was not found in the grabbed release")
+
+
+def _shape_refused(row: dict) -> bool:
+    low = " | ".join(m for s in (row.get("statusMessages") or [])
+                     for m in list(s.get("messages") or [])).lower()
+    return any(k in low for k in SHAPE_SAYS)
+
+
+def _profile_rank(a, profile_id: int, cache: dict) -> dict:
+    """quality name -> position in the profile, low to high."""
+    if profile_id in cache:
+        return cache[profile_id]
+    names: list = []
+    for it in (_call(a, f"/api/v3/qualityprofile/{int(profile_id)}") or {}).get("items") or []:
+        if it.get("quality"):
+            names.append((it["quality"] or {}).get("name") or "")
+        else:
+            names.extend(((q.get("quality") or {}).get("name") or "") for q in (it.get("items") or []))
+    cache[profile_id] = {n: i for i, n in enumerate(names)}
+    return cache[profile_id]
+
+
+def _import_better(queues: list) -> tuple[list, set]:
+    """-> (rows for the recent list, queue ids removed here)."""
+    rows: list = []
+    gone_ids: set = set()
+    for a, qrows in queues:
+        if a.kind != "sonarr":
+            continue
+        groups: dict = {}
+        for r in qrows:
+            if (r.get("trackedDownloadStatus") or "") != "warning" or not _shape_refused(r):
+                continue
+            if (r.get("status") or "") != "completed" or (r.get("sizeleft") or 0) > 0:
+                continue
+            if r.get("downloadId"):
+                groups.setdefault(str(r["downloadId"]), []).append(r)
+        ranks: dict = {}
+        for did, grp in groups.items():
+            name = grp[0].get("title") or ""
+            have = ""
+            try:
+                cands = _video_cands(a, grp[0])
+                series = grp[0].get("series") or {}
+                sid = grp[0].get("seriesId") or series.get("id")
+                if not cands or not sid:
+                    STATS["detail"].append(f"{a.name}: {name[:60]} - nothing the arr would offer for import, left for you")
+                    continue
+                series = series or (_call(a, f"/api/v3/series/{int(sid)}") or {})
+                rank = _profile_rank(a, int(series.get("qualityProfileId") or 0), ranks)
+                eps = {int(e["id"]): e for e in (_call(a, f"/api/v3/episode?seriesId={int(sid)}") or [])}
+                files = {int(f["id"]): f for f in (_call(a, f"/api/v3/episodefile?seriesId={int(sid)}") or [])}
+                plan: list = []
+                better = worse = 0
+                for c in cands:
+                    ep_ids = [int(e["id"]) for e in (c.get("episodes") or []) if e.get("id")]
+                    if not ep_ids and len(cands) == 1 and len(grp) == 1 and grp[0].get("episodeId"):
+                        ep_ids = [int(grp[0]["episodeId"])]       # the row's own episode, one file
+                    if not ep_ids:
+                        plan = []
+                        break
+                    cq = ((c.get("quality") or {}).get("quality") or {}).get("name") or ""
+                    ccf = int(c.get("customFormatScore") or grp[0].get("customFormatScore") or 0)
+                    for eid in ep_ids:
+                        fid = (eps.get(eid) or {}).get("episodeFileId") or 0
+                        f = files.get(int(fid)) if fid else None
+                        if not f:
+                            better += 1
+                            continue
+                        fq = ((f.get("quality") or {}).get("quality") or {}).get("name") or ""
+                        fcf = int(f.get("customFormatScore") or 0)
+                        if rank.get(cq, -1) > rank.get(fq, -1) or (rank.get(cq, -1) == rank.get(fq, -1) and ccf > fcf):
+                            better += 1
+                        else:
+                            worse += 1
+                            have = f"{fq} score {fcf}"
+                    plan.append({"path": c["path"], "quality": c.get("quality"), "languages": c.get("languages") or [],
+                                 "releaseGroup": c.get("releaseGroup") or "", "downloadId": did,
+                                 "seriesId": int(sid), "episodeIds": ep_ids})
+                if not plan:
+                    STATS["detail"].append(f"{a.name}: {name[:60]} - the arr cannot say which episode a file is, left for you")
+                    continue
+                said = "; ".join(sorted({m for r in grp for s in (r.get("statusMessages") or [])
+                                         for m in (s.get("messages") or [])}))[:120]
+                if better and not worse:
+                    _call(a, "/api/v3/command", "POST", {"name": "ManualImport", "files": plan, "importMode": "auto"})
+                    for r in grp:
+                        r["_nuarr_imported"] = True
+                    rows.append({"at": time.time(), "arr": a.name, "title": name, "client": grp[0].get("downloadClient") or "",
+                                 "why": f"the arr refused it for its shape ({said}), not its worth - better than the "
+                                        f"{better} file(s) it replaces, so imported", "kind": "better"})
+                    STATS["detail"].append(f"{a.name}: imported {name[:60]} - better than what was on disk")
+                elif worse and not better:
+                    for r in grp:
+                        try:
+                            _remove(a, r, blocklist=False)
+                        except urllib.error.HTTPError as he:
+                            if he.code != 404:
+                                raise
+                        gone_ids.add(r.get("id"))
+                    rows.append({"at": time.time(), "arr": a.name, "title": name, "client": grp[0].get("downloadClient") or "",
+                                 "why": f"not better than the file already here ({have}) - removed, not blocklisted",
+                                 "kind": ""})
+                    STATS["detail"].append(f"{a.name}: removed {name[:60]} - not better than the file on disk")
+                else:
+                    STATS["detail"].append(f"{a.name}: {name[:60]} - better than some of the files it replaces and not "
+                                           f"others, left for you")
+            except Exception as e:                               # noqa: BLE001
+                STATS["detail"].append(f"{a.name}: could not judge {name[:60]}: {type(e).__name__}: {e}"[:160])
+    return rows, gone_ids
+
+
 def _remove(a, row: dict, blocklist: bool = False) -> None:
     _call(a, f"/api/v3/queue/{row['id']}?removeFromClient=true"
              f"&blocklist={'true' if blocklist else 'false'}&skipRedownload=false", "DELETE")
@@ -744,6 +868,16 @@ def _pass() -> str:
                     tracked.add(str(r["downloadId"]))
         queues = [(a, [r for r in rows if r.get("id") not in hold]) for a, rows in queues]
     new_parsed = cut_rows + new_parsed
+    # REFUSED FOR ITS SHAPE - see _import_better. Imported or removed here;
+    # the rows it removed leave the pass so nothing below asks after them.
+    try:
+        better_rows, gone_now = _import_better(queues)
+    except Exception as e:                                       # noqa: BLE001
+        better_rows, gone_now = [], set()
+        STATS["detail"].append(f"shape-refused imports: {type(e).__name__}: {e}"[:160])
+    if gone_now:
+        queues = [(a, [r for r in rows if r.get("id") not in gone_now]) for a, rows in queues]
+    new_parsed = better_rows + new_parsed
     for a, rows in queues:
         # TWO DOWNLOADS FOR ONE EPISODE: KEEP THE BEST, DROP THE REST NOW.
         # The arr grabs a release, a better one appears, it grabs that too as
