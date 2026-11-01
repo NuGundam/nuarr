@@ -680,7 +680,14 @@ def snapshot() -> dict:
     avg = sum(last) / len(last) if last else 0.0
     eta = 0.0
     if wait > 0 and mode() != "off":
-        eta = max(wait * (avg or 15.0), wait / per_hour() * 3600)
+        # THE SLOWER OF TWO LIMITS: the hourly budget, or what the pool can
+        # actually get through with its lanes running side by side. The old
+        # form multiplied the queue by the per-file time as if files ran one
+        # after another, and said 38.8 h for a queue the 400/h cap drains in
+        # 22.8 (Erik, 2026-11-01: "should calculate for 400").
+        lanes = max(1, int(_pool_width() or 1))
+        can = min(float(per_hour()), lanes * 3600.0 / (avg or 15.0))
+        eta = wait / max(1.0, can) * 3600
     el = (time.time() - float(STATE["started"] or time.time())) if STATE.get("running") else 0.0
     now = time.time()
     return {"mode": mode(), "per_hour": per_hour(), "paused": paused(), "rows": rows, "recent": recent,
