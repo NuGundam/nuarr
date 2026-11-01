@@ -808,6 +808,16 @@ def embed_pending(file_id: int) -> dict:
     res = restyle_one(int(file_id), it.get("style") or "", text, add=True)
     if res.get("ok"):
         drop_pending(int(file_id))
+        # THE FILE IS NOT A RAW ANY MORE. The Raws verdict is only redone by
+        # the 15-minute sweep, so Needs attention kept offering "blocklist or
+        # keep" for a file that had just been given its English track. The
+        # verdict goes now; the next sweep judges the file afresh from facts.
+        try:
+            from .db import cursor as _cur
+            with _cur() as cur:
+                cur.execute("DELETE FROM sub_need WHERE file_id=? AND state='missing'", (int(file_id),))
+        except Exception:                                        # noqa: BLE001
+            pass
     return res
 
 
