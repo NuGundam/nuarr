@@ -185,8 +185,8 @@ def place(src: str, dst: str, mode: str = "", arr: str = "") -> dict:
     if not land:
         return _defer(f"no landing folder for {label}", src, arr)
     _batch_start(src, arr)
-    staged = os.path.join(land, f"{os.path.basename(dst)}.{os.getpid()}-"
-                                f"{time.time_ns() % 10**9}.nuarr-new")
+    staged = fileops.landing_name(land, os.path.basename(dst),
+                                  f"{os.getpid()}-{time.time_ns() % 10**9}") + ".nuarr-new"
     t0 = time.time()
     tok = f"{os.getpid()}-{time.time_ns()}"
     CURRENT[tok] = {"file": os.path.basename(dst), "arr": arr, "disk": label,

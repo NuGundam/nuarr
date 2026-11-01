@@ -192,7 +192,7 @@ def candidates(limit: int, only_disks: list[str] | None = None) -> list[dict]:
     base_where = ("state='eligible' AND arr_file_id IS NOT NULL "
                   "AND id NOT IN (SELECT file_id FROM jobs "
                   "               WHERE file_id IS NOT NULL "
-                  "                 AND state IN ('queued','running')) ")
+                  "                 AND state IN ('queued','running','deferred')) ")
     cols = ("id, path, title, season, episode, mtime, size, requeued_at, "
             "pool_disk, first_seen")
     # TARGETED TOP-UP. When the caller is filling a full-but-stuck queue, the

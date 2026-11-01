@@ -675,6 +675,25 @@ PLACED = None
 # The old direct path is kept as the fallback for a member with no landing
 # folder (a disk added before its rule exists), so nothing is ever refused.
 LANDING_DIR = ".nuarr-land"
+LANDING_MAX_PATH = 240         # under Windows' 260, with room for ".nuarr-new"
+
+
+def landing_name(land: str, base: str, tag: str) -> str:
+    r"""`<land>/<base>.<tag>`, the base cut short when the whole path would
+    pass MAX_PATH. The library path is long but the landing folder drops the
+    show and season folders, so it was the FILENAME alone that broke it: a
+    205-character episode name plus `.nuarr-land/<disk>/` plus the unique
+    tag came to 286 and every copy failed "[Errno 22] Invalid argument"
+    (SHIROHIYO S01E12, 2026-11-01). The landing name is never shown and the
+    file is renamed onto its real path at the swap, so only uniqueness
+    matters - the tag carries that."""
+    p = os.path.join(land, f"{base}.{tag}")
+    over = len(p) + len(".nuarr-new") - LANDING_MAX_PATH
+    if over > 0:
+        stem, ext = os.path.splitext(base)
+        stem = stem[:max(16, len(stem) - over)].rstrip(" .")
+        p = os.path.join(land, f"{stem}{ext}.{tag}")
+    return p
 
 
 def landing_dir(target: str, label: str) -> str:
@@ -769,9 +788,9 @@ def safe_replace(target: str, replacement: str, *, attempts: int = 5,
                     # Through the pool, into the pinned folder. A unique
                     # name: two commits of same-named files on one disk
                     # must not share a staging path.
-                    landed_via = os.path.join(
-                        land, f"{os.path.basename(os.path.normpath(target))}"
-                              f".{os.getpid()}-{time.time_ns() % 10**9}")
+                    landed_via = landing_name(
+                        land, os.path.basename(os.path.normpath(target)),
+                        f"{os.getpid()}-{time.time_ns() % 10**9}")
                 else:
                     try:
                         from . import scanner as _sc

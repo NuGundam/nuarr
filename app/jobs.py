@@ -2038,6 +2038,18 @@ async def enqueue(file_id: int, path: str, title: str = "",
         if dup:
             raise ValueError(
                 f"already {dup['state']} as job {dup['job_id']}: {path}")
+        # A FINISHED ENCODE WAITING TO BE SWAPPED IN is the same file's work
+        # already done. Not counting it let the auto-queue plan the original
+        # again every ten minutes while the swap retried: SHIROHIYO S01E12 was
+        # encoded 21 times on 2026-11-01, 22 identical outputs in the cache.
+        if kind == "transcode":
+            with cursor() as cur:
+                held = cur.execute(
+                    "SELECT job_id FROM jobs WHERE file_id=? AND kind='transcode' "
+                    "AND state='deferred' LIMIT 1", (file_id,)).fetchone()
+            if held:
+                raise ValueError(f"encode {held['job_id']} is finished and waiting "
+                                 f"to be swapped in: {path}")
 
     job_id = uuid.uuid4().hex[:12]
     # Always derive the display name from the DB so it carries the episode.
