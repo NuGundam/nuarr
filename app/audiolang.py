@@ -3341,6 +3341,21 @@ def fix_mislabel(file_id: int, track: int) -> dict:
                       "rebuild" if x["fake_dual"] else "")}
 
 
+def queue_owns() -> set:
+    """File ids the audio queue has in hand: waiting, running, held, or
+    asking in Audio User Input. A mismatch on one of these is not a separate
+    thing that needs you - it is either being done or already asked."""
+    try:
+        from . import audqueue
+        audqueue.init()
+        with cursor() as cur:
+            return {int(r["file_id"]) for r in cur.execute(
+                "SELECT file_id FROM aud_queue WHERE state IN (?,?,?,?)",
+                (audqueue.QUEUED, audqueue.RUNNING, audqueue.ASK, audqueue.HELD))}
+    except Exception:                                            # noqa: BLE001
+        return set()
+
+
 def attention() -> dict | None:
     r"""What the Attention tile should say, or nothing.
 
@@ -3354,11 +3369,12 @@ def attention() -> dict | None:
     asking for a decision that has already been made. What stays is the band
     between the lines, which is exactly the part auto will not touch.
     """
+    # ONE FILE, ONE ROW. The ones in the band are already questions in
+    # Audio User Input (its own tile line), and the confident ones are queued;
+    # what is left is what the queue gave up on or never took.
     try:
-        m = mismatches(500)
-        if mode() == "auto":
-            m = [x for x in m
-                 if verdict_for(x).get("auto") == "ask"]
+        owned = queue_owns()
+        m = [x for x in mismatches(500) if int(x["file_id"]) not in owned]
     except Exception:                                    # noqa: BLE001
         return None
     if not m:

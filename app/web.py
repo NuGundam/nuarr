@@ -12689,7 +12689,10 @@ def _attention(limit: int = 400):
     # learn to ignore.
     try:
         from . import audiolang as _alg
+        _owned = _alg.queue_owns()           # same rule as the tile: one file, one row
         for m in _alg.mismatches(limit)[:limit]:
+            if int(m["file_id"]) in _owned:
+                continue
             out.append({
                 "source": "mislabelled audio", "id": m["file_id"],
                 "track": m["track"],

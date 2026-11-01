@@ -162,7 +162,7 @@ def replan(limit: int = 100000, force: bool = False) -> dict:
         rows = audplan.by_file(ctx)[:int(limit)]
         with cursor() as cur:
             have = {int(r["file_id"]): dict(r) for r in cur.execute(
-                "SELECT file_id, state, steps, asks, rev, tries "
+                "SELECT file_id, state, steps, asks, rev, tries, path "
                 "  FROM aud_queue")}
         seen = set()
         for f in rows:
@@ -180,7 +180,12 @@ def replan(limit: int = 100000, force: bool = False) -> dict:
             same = (old is not None
                     and old["rev"] == rev
                     and old["steps"] == json.dumps(p["steps"])
-                    and old["asks"] == json.dumps(p["asks"]))
+                    and old["asks"] == json.dumps(p["asks"])
+                    # A RENAME IS A CHANGE. An upgrade replaces the file under a
+                    # new name with the same file id and, often, the same
+                    # instruction; a row left on the old name fails "not on
+                    # disk" three times and gives up (VERTEX FORCE, 2026-10-31).
+                    and (old.get("path") or "") == (p.get("path") or ""))
             if same and old["state"] in (QUEUED, ASK, FAILED, HELD, DONE):
                 # DONE under these very rules, with the same instruction, means
                 # the work already happened; re-queueing would redo it.
@@ -486,6 +491,20 @@ def do_one(row: dict, report=None, claim: bool = True) -> dict:
         steps = []
     if not steps:
         return {"ok": True, "why": "nothing to do"}
+    if not os.path.exists(path):
+        # Renamed since the row was planned - take the file's current name.
+        try:
+            with cursor() as cur:
+                f = cur.execute("SELECT path FROM files WHERE id=?", (fid,)).fetchone()
+            now = (f["path"] if f else "") or ""
+            if now and now != path and os.path.exists(now):
+                path = now
+                row = dict(row, path=now, name=os.path.basename(now))
+                with cursor() as cur:
+                    cur.execute("UPDATE aud_queue SET path=?, name=? WHERE file_id=?",
+                                (now, os.path.basename(now), fid))
+        except Exception:                                        # noqa: BLE001
+            pass
     if not os.path.exists(path):
         return {"ok": False, "why": "the file is not on disk"}
 
