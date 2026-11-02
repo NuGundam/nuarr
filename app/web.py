@@ -11730,11 +11730,12 @@ def api_vmaf():
 
 
 @app.post("/api/vmaf/cfg")
-def api_vmaf_cfg(on: int = -1, target: float = 0, samples: int = 0, floor: float = -1, banding: float = 0):
+def api_vmaf_cfg(on: int = -1, target: float = 0, samples: int = 0, floor: float = -1, banding: float = 0,
+                 verify: int = -1):
     from . import vmaftarget
     c = vmaftarget.set_cfg(on=None if on < 0 else bool(on), target=target or None,
                            samples=samples or None, floor=None if floor < 0 else floor,
-                           banding=banding or None)
+                           banding=banding or None, verify=None if verify < 0 else bool(verify))
     joblog.log(f"VMAF target: {'on' if c['on'] else 'off'}, {c['target']:g}, {c['samples']} samples", "info")
     return c
 
@@ -13507,8 +13508,8 @@ def api_browse_list(path: str | None = None, library: str | None = None):
     for i in range(0, len(ids), 400):
         batch = ids[i:i + 400]
         ph = ",".join("?" * len(batch))
-        for r in _rows("SELECT file_id, cq_chosen, vmaf, cambi, note FROM vmaf_log "
-                       f"WHERE file_id IN ({ph}) ORDER BY id", tuple(batch)):
+        for r in _rows("SELECT file_id, cq_chosen, vmaf, cambi, note, final_vmaf, final_vmaf_min, final_cambi "
+                       f"FROM vmaf_log WHERE file_id IN ({ph}) ORDER BY id", tuple(batch)):
             enc[r["file_id"]] = r
         for r in _rows("SELECT file_id, banding FROM group_measure "
                        f"WHERE file_id IN ({ph}) AND banding IS NOT NULL", tuple(batch)):
@@ -13535,6 +13536,9 @@ def api_browse_list(path: str | None = None, library: str | None = None):
                 "vmaf": (enc.get(r.get("id")) or {}).get("vmaf"),
                 "cambi": (enc.get(r.get("id")) or {}).get("cambi"),
                 "enc_note": (enc.get(r.get("id")) or {}).get("note"),
+                "final_vmaf": (enc.get(r.get("id")) or {}).get("final_vmaf"),
+                "final_worst": (enc.get(r.get("id")) or {}).get("final_vmaf_min"),
+                "final_cambi": (enc.get(r.get("id")) or {}).get("final_cambi"),
                 "src_banding": srcband.get(r.get("id")),
             })
         except OSError:
@@ -21927,12 +21931,19 @@ function renderBrowse(d){
     // shows the source's banding from the group scorecard when it has one.
     let encv='';
     if(f.cq!=null){
-      const tip=`quality search: CQ ${f.cq} reached VMAF ${f.vmaf??'?'}`
+      // The search's figures are a prediction from sample encodes; when the
+      // final file was scored against the kept cuts, THAT number is shown and
+      // the prediction moves to the tooltip.
+      const fin=f.final_vmaf!=null;
+      const tip=`quality search: CQ ${f.cq} reached VMAF ${f.vmaf??'?'} on the samples`
         +(f.cambi!=null?`, banding (CAMBI) ${f.cambi} - under 5 is not visible`:'')
+        +(fin?`; the final file measured VMAF ${f.final_vmaf} (worst ${f.final_worst??'?'})`+(f.final_cambi!=null?`, banding ${f.final_cambi}`:''):'')
         +(f.enc_note?` - ${f.enc_note}`:'');
+      const vm=fin?f.final_vmaf:f.vmaf, cb=fin&&f.final_cambi!=null?f.final_cambi:f.cambi;
       encv=`<span class="benc" title="${esc(tip)}">CQ <b>${f.cq}</b>`
-        +(f.vmaf!=null?` · VMAF <b>${f.vmaf}</b>`:'')
-        +(f.cambi!=null?` · band <b style="color:${f.cambi>=5?'var(--warn)':'inherit'}">${f.cambi}</b>`:'')
+        +(vm!=null?` · VMAF <b>${vm}</b>`:'')
+        +(cb!=null?` · band <b style="color:${cb>=5?'var(--warn)':'inherit'}">${cb}</b>`:'')
+        +(fin?` <span class="dim" style="font-size:10px">final file</span>`:` <span class="dim" style="font-size:10px">samples</span>`)
         +`</span>`;
     } else if(f.src_banding!=null){
       encv=`<span class="benc dim" title="banding (CAMBI) measured on this file by the release-group scorecard - under 5 is not visible">band ${f.src_banding}</span>`;
@@ -35555,6 +35566,8 @@ async function loadVmaf(){
         <input type="number" min="0" max="10" step="0.5" value="${c.floor}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="vmafSet({floor:this.value})"></span>
       <span style="font-size:11.5px" title="CAMBI, Netflix's banding index: about 5 is where banding in flat colours and dark gradients becomes visible. VMAF alone under-scores banding, and banding is what cartoons show first.">banding at most
         <input type="number" min="1" max="20" step="0.5" value="${c.banding}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="vmafSet({banding:this.value})"></span>
+      <span class="pill ${c.verify?'p-ok':'p-dim'}" style="cursor:pointer" onclick="vmafSet({verify:${c.verify?0:1}})"
+        title="keep the reference cuts until the encode is finished and score the FINAL file against them before it replaces the original. The search's VMAF is a prediction from sample encodes; this is the measurement. Adds about a minute per file and ${c.samples} x ${c.sample_s}-second lossless cuts in the cache while the encode runs.">check the final file: ${c.verify?'ON':'off'}</span>
     </div>
     <div class="dim" style="font-size:11px;margin-top:6px">One CQ for every file is right for none of them: it spends the same on a flat cartoon, where most of it is wasted,
       as on grainy film. Before each encode nuarr cuts ${c.samples} ${c.sample_s}-second samples from across the file, encodes them with the very
@@ -35580,8 +35593,8 @@ async function loadVmaf(){
       <table style="width:100%;border-collapse:collapse;margin-top:3px">
         ${d.recent.map(r=>`<tr style="border-top:1px solid var(--line)"><td style="padding:3px 6px;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.name)}">${esc(r.name)}</td>
           <td class="mono">CQ ${r.cq_fixed} → <b>${r.cq_chosen}</b></td>
-          <td class="mono" title="mean over the samples; worst sample ${r.vmaf_min}">${r.vmaf}</td>
-          <td class="mono dim" title="banding (CAMBI) - under 5 is not visible">${r.cambi==null?'':'band '+r.cambi}</td><td>${sz(r.saved_pct)}</td>
+          <td class="mono" title="mean over the samples; worst sample ${r.vmaf_min}${r.final_vmaf!=null?` - the final file measured ${r.final_vmaf} (worst ${r.final_vmaf_min}), ${r.final_note||''}`:''}">${r.vmaf}${r.final_vmaf!=null?` <span class="${r.final_vmaf>=r.want?'ok':'warn'}" style="font-size:10.5px">final ${r.final_vmaf}</span>`:''}</td>
+          <td class="mono dim" title="banding (CAMBI) - under 5 is not visible${r.final_cambi!=null?` - the final file measured ${r.final_cambi}`:''}">${r.cambi==null?'':'band '+r.cambi}${r.final_cambi!=null?` <span style="font-size:10.5px">final ${r.final_cambi}</span>`:''}</td><td>${sz(r.saved_pct)}</td>
           <td class="dim">${r.probes} probes · ${Math.round(r.secs)}s</td><td class="dim">${esc(ago(r.at))}</td></tr>`).join('')}
       </table></details>`:''}
   </div>`;

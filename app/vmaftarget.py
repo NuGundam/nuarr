@@ -45,7 +45,10 @@ from .db import cursor, kv_get, kv_set
 
 KV = "vmaf.cfg"
 KV_LEARN = "vmaf.learn"
-DEFAULTS = {"on": True, "target": 95.0, "samples": 4, "sample_s": 6.0, "floor": 2.0, "banding": 4.0}
+DEFAULTS = {"on": True, "target": 95.0, "samples": 4, "sample_s": 6.0, "floor": 2.0, "banding": 4.0,
+            # keep the reference cuts and score the FINISHED file against them
+            # before it is committed - see verify_final()
+            "verify": True}
 CQ_DOWN = 4            # at most this many CQ steps BELOW the library's CQ
 CQ_UP = 14             # at most this many above it (was 10; burn-heavy anime passed VMAF 96-98 at the old cap of +10)
 MIN_MINUTES = 4.0
@@ -122,7 +125,7 @@ def set_cfg(**kw) -> dict:
     for k, v in kw.items():
         if k not in DEFAULTS or v is None:
             continue
-        if k == "on":
+        if k == "on" or k == "verify":
             c[k] = bool(v)
         elif k == "samples":
             c[k] = max(2, min(8, int(v)))
@@ -145,8 +148,15 @@ def init() -> None:
             path TEXT, library TEXT, target TEXT, family TEXT,
             cq_fixed INTEGER, cq_chosen INTEGER, vmaf REAL, vmaf_min REAL, want REAL,
             saved_pct REAL, probes INTEGER, secs REAL, note TEXT)""")
-        if "cambi" not in [r["name"] for r in cur.execute("PRAGMA table_info(vmaf_log)")]:
+        have = [r["name"] for r in cur.execute("PRAGMA table_info(vmaf_log)")]
+        if "cambi" not in have:
             cur.execute("ALTER TABLE vmaf_log ADD COLUMN cambi REAL")
+        # THE FINAL FILE'S OWN SCORES, filled in by verify_final() once the
+        # real encode exists. NULL until then - and forever, for a file that
+        # was searched before this existed or with the check switched off.
+        for col in ("final_vmaf REAL", "final_vmaf_min REAL", "final_cambi REAL", "final_at REAL", "final_note TEXT"):
+            if col.split()[0] not in have:
+                cur.execute(f"ALTER TABLE vmaf_log ADD COLUMN {col}")
 
 
 def _learn() -> dict:
@@ -435,6 +445,11 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
     # the three wrote over each other and none could be scored.
     import re as _re
     import shutil as _sh
+    # reference folders left by a job that never came back for them
+    try:
+        sweep(os.path.dirname(os.path.normpath(work_dir)))
+    except Exception:                                    # noqa: BLE001
+        pass
     work_dir = os.path.join(work_dir, _re.sub(r"[^\w-]", "_", str(job_id)) or "job")
     os.makedirs(work_dir, exist_ok=True)
     # HOW FAR ALONG, HONESTLY. The probes a search will need are not known
@@ -447,6 +462,7 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
     _g0 = guess(library, target, family)
     est = {"probes": 4 if _g0 is not None else MAX_PROBES}
     tried: dict[int, dict] = {}
+    keep_refs = [False]
 
     def _report(text, done_units):
         if not tick:
@@ -596,6 +612,21 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
         note = ("reached the target" if chosen["ok"] else
                 f"could not reach {want:g} without banding within CQ {lo}-{hi}")
         _remember(library, target, family, best)
+        # KEEP THE REFERENCES FOR THE FINAL FILE. Everything above scored
+        # SAMPLE encodes; the real encode is a different ffmpeg run over the
+        # whole file. With the cuts kept, verify_final() can put the finished
+        # file up against the very same frames and record what it really
+        # scored, not what the samples predicted.
+        if c.get("verify"):
+            try:
+                with open(os.path.join(work_dir, "verify.json"), "w", encoding="utf-8") as fh:
+                    json.dump({"refs": [os.path.basename(r) for r in refs], "times": times, "length": length,
+                               "ten": ten, "card": card, "threads": threads, "src": src,
+                               "sample_vmaf": chosen["vmaf"], "sample_worst": chosen["worst"],
+                               "sample_cambi": chosen["cambi"]}, fh)
+                keep_refs[0] = True
+            except OSError:
+                pass
         with cursor() as cur:
             cur.execute("INSERT INTO vmaf_log(at,file_id,job_id,path,library,target,family,cq_fixed,cq_chosen,"
                         "vmaf,vmaf_min,want,saved_pct,probes,secs,note,cambi) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -613,6 +644,146 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
         return {"cq": None, "note": f"failed: {type(e).__name__}"}
     finally:
         STATE.pop(job_id, None)
+        if keep_refs[0]:
+            # the sample encodes and their logs go; the reference cuts and the
+            # manifest stay for verify_final(), which removes the folder
+            for name in os.listdir(work_dir):
+                if not (name.startswith("ref-") or name == "verify.json"):
+                    try:
+                        os.remove(os.path.join(work_dir, name))
+                    except OSError:
+                        pass
+        else:
+            _sh.rmtree(work_dir, ignore_errors=True)
+
+
+def _job_dir(cache_dir: str, job_id: str) -> str:
+    import re as _re
+    return os.path.join(cache_dir, "vmaf", _re.sub(r"[^\w-]", "_", str(job_id)) or "job")
+
+
+def discard(cache_dir: str, job_id: str) -> None:
+    """Drop a job's kept reference cuts - the job ended without a file to check."""
+    import shutil as _sh
+    d = _job_dir(cache_dir, job_id)
+    if os.path.isdir(d):
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def sweep(cache_dir: str, max_age_s: float = 3 * 86400) -> int:
+    """Reference folders nobody came back for (a crash between search and
+    commit): gone after three days. Returns how many were removed."""
+    import shutil as _sh
+    base = os.path.join(cache_dir, "vmaf")
+    n = 0
+    try:
+        for name in os.listdir(base):
+            p = os.path.join(base, name)
+            try:
+                if os.path.isdir(p) and time.time() - os.path.getmtime(p) > max_age_s:
+                    _sh.rmtree(p, ignore_errors=True)
+                    n += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return n
+
+
+def verify_final(job_id: str, final: str, cache_dir: str, tick=None) -> dict | None:
+    """Score the FINISHED encode against the reference cuts the search kept.
+
+    The search's VMAF is a prediction: sample encodes against sample cuts. This
+    is the measurement: the same moments of the real output file, decoded and
+    cut the same way, against the same reference frames. Mean and worst VMAF
+    over the samples and the worst banding, written onto the file's vmaf_log
+    row as final_*; None when there is nothing kept to check against.
+
+    ALIGNMENT. The reference was cut from the source at t; the final is cut
+    from the encode at t. Both seeks are exact, but the encode's first frame
+    can sit a frame off the source's (timestamps are rebuilt by the encode),
+    and one frame of drift on a moving shot reads as a 40-point loss. Each
+    sample is scored at three alignments - as cut, reference one frame on,
+    output one frame on - and the best is the true one: a wrong alignment can
+    only ever score lower than the right one."""
+    import shutil as _sh
+    from . import jobs
+    work_dir = _job_dir(cache_dir, job_id)
+    man = os.path.join(work_dir, "verify.json")
+    if not os.path.exists(man):
+        return None
+    try:
+        m = json.load(open(man, encoding="utf-8"))
+    except Exception:                                    # noqa: BLE001
+        _sh.rmtree(work_dir, ignore_errors=True)
+        return None
+    ff = jobs._ffmpeg_exe()
+    ten, card, length = bool(m["ten"]), bool(m["card"]), float(m["length"])
+    threads = max(2, int(m.get("threads") or 4))
+    fmt = "yuv420p10le" if ten else "yuv420p"
+    means, worsts, bands = [], [], []
+    t0 = time.time()
+    try:
+        for k, name in enumerate(m["refs"]):
+            ref = os.path.join(work_dir, name)
+            try:
+                idx = int(name[4:-4])                  # ref-{k}.mkv -> the time it was cut at
+                t = float(m["times"][idx])
+            except (ValueError, IndexError):
+                continue
+            if not os.path.exists(ref):
+                continue
+            if tick:
+                try:
+                    tick(f"checking the final file: sample {k + 1}/{len(m['refs'])}", k / max(1, len(m["refs"])))
+                except Exception:                        # noqa: BLE001
+                    pass
+            cut = os.path.join(work_dir, f"fin-{idx}.mkv")
+            if not _cut_reference(ff, final, t, length, cut, card):
+                if not (card and _cut_reference(ff, final, t, length, cut, False)):
+                    continue
+            best = None
+            for dskip, rskip in ((0, 0), (0, 1), (1, 0)):
+                log = cut + f".{dskip}{rskip}.json"
+                lav = (f"[0:v]format={fmt},trim=start_frame={dskip},setpts=PTS-STARTPTS[d];"
+                       f"[1:v]format={fmt},trim=start_frame={rskip},setpts=PTS-STARTPTS[r];"
+                       f"[d][r]libvmaf=log_fmt=json:log_path='{log.replace(chr(92), '/').replace(':', chr(92) + ':')}'"
+                       f":n_threads={threads}:n_subsample={SUBSAMPLE}:feature=name=cambi")
+                hw = _NVDEC if card else []
+                rc, _err = _run([ff, "-hide_banner", "-nostdin", "-v", "error"] + hw + ["-i", cut] + hw + ["-i", ref,
+                                 "-lavfi", lav, "-f", "null", "-"], 600)
+                if rc != 0 or not os.path.exists(log):
+                    continue
+                try:
+                    d = json.load(open(log, encoding="utf-8"))
+                    frames = [f["metrics"]["vmaf"] for f in d.get("frames") or [] if "vmaf" in f.get("metrics", {})]
+                    mean = float(d["pooled_metrics"]["vmaf"]["mean"])
+                    low = sorted(frames)[max(0, len(frames) // 20)] if frames else mean
+                    cambi = float(((d["pooled_metrics"].get("cambi") or {}).get("mean")) or 0.0)
+                except Exception:                        # noqa: BLE001
+                    continue
+                if best is None or mean > best[0]:
+                    best = (mean, float(low), cambi)
+            if best:
+                means.append(best[0]); worsts.append(best[1]); bands.append(best[2])
+        if not means:
+            res = {"vmaf": None, "worst": None, "cambi": None, "samples": 0, "secs": round(time.time() - t0, 1),
+                   "note": "could not score the final file against the kept samples"}
+        else:
+            res = {"vmaf": round(statistics.mean(means), 2), "worst": round(min(worsts), 2),
+                   "cambi": round(max(bands), 2), "samples": len(means), "secs": round(time.time() - t0, 1),
+                   "note": f"{len(means)} of {len(m['refs'])} samples" if len(means) < len(m["refs"]) else "all samples",
+                   "sample_vmaf": m.get("sample_vmaf"), "sample_worst": m.get("sample_worst"),
+                   "sample_cambi": m.get("sample_cambi")}
+        try:
+            with cursor() as cur:
+                cur.execute("UPDATE vmaf_log SET final_vmaf=?, final_vmaf_min=?, final_cambi=?, final_at=?, final_note=? "
+                            "WHERE id=(SELECT MAX(id) FROM vmaf_log WHERE job_id=?)",
+                            (res["vmaf"], res["worst"], res["cambi"], time.time(), res["note"], job_id))
+        except Exception:                                # noqa: BLE001
+            pass
+        return res
+    finally:
         _sh.rmtree(work_dir, ignore_errors=True)
 
 
@@ -622,7 +793,7 @@ def snapshot() -> dict:
     with cursor() as cur:
         rows = [dict(r) for r in cur.execute(
             "SELECT at,file_id,path,library,target,family,cq_fixed,cq_chosen,vmaf,vmaf_min,want,saved_pct,"
-            "probes,secs,note,cambi FROM vmaf_log ORDER BY id DESC LIMIT 40")]
+            "probes,secs,note,cambi,final_vmaf,final_vmaf_min,final_cambi,final_note FROM vmaf_log ORDER BY id DESC LIMIT 40")]
         tot = cur.execute("SELECT COUNT(*) n, AVG(saved_pct) s, AVG(secs) t, AVG(probes) p, "
                           "AVG(cq_chosen - cq_fixed) d FROM vmaf_log").fetchone()
         by = [dict(r) for r in cur.execute(

@@ -6756,6 +6756,45 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
                 "new file will be planned fresh")
         return
 
+    # THE FINAL FILE AGAINST THE SAMPLES IT WAS PROMISED FROM - see
+    # vmaftarget.verify_final. Only when the search ran for this job (it left
+    # its reference cuts behind); a minute or so of scoring, before the
+    # original is touched, so the number recorded is for the file that ships.
+    if job.plan.encode and (job.plan.venc or {}).get("vmaf") is not None:
+        try:
+            from . import vmaftarget as _vt2
+            if _vt2.cfg().get("verify"):
+                w.set_stage("checking the result (VMAF)")
+
+                def _vtick2(line, frac, info=None):
+                    w.vmaf_stage, w.vmaf_frac = line, float(frac or 0)
+                _fv = await asyncio.to_thread(_vt2.verify_final, job.id, out, SETTINGS.cache_dir, _vtick2)
+                if _fv and _fv.get("vmaf") is not None:
+                    w.vmaf_result = dict(w.vmaf_result or {}, final=_fv)
+                    job.plan.venc = dict(job.plan.venc or {}, final_vmaf=_fv["vmaf"], final_worst=_fv["worst"],
+                                         final_cambi=_fv["cambi"])
+                    _pv, _pc = _fv.get("sample_vmaf"), _fv.get("sample_cambi")
+                    _short = (" - BELOW the target" if _fv["vmaf"] < float(_vt2.cfg()["target"]) else "")
+                    joblog.log(f"final file checked against the kept samples: VMAF {_fv['vmaf']} "
+                               f"(worst {_fv['worst']}), banding {_fv['cambi']}"
+                               + (f" - the samples predicted {_pv}, banding {_pc}" if _pv is not None else "")
+                               + f"; {_fv['note']} in {_fv['secs']:.0f}s{_short}",
+                               "warn" if _short else "ok", job.id)
+                    try:
+                        job.plan.add("video", f"final file checked: VMAF {_fv['vmaf']}, worst sample {_fv['worst']}, banding {_fv['cambi']}",
+                                     (f"the samples predicted VMAF {_pv}, banding {_pc}; " if _pv is not None else "") + _fv["note"])
+                        with cursor() as cur:
+                            cur.execute("UPDATE jobs SET plan_json=? WHERE job_id=?",
+                                        (json.dumps(job.plan.to_dict()), job.id))
+                    except Exception:                        # noqa: BLE001
+                        pass
+                elif _fv:
+                    joblog.log(f"could not check the final file: {_fv.get('note')}", "warn", job.id)
+            else:
+                _vt2.discard(SETTINGS.cache_dir, job.id)
+        except Exception as e:                               # noqa: BLE001
+            joblog.log(f"final-file check skipped ({type(e).__name__}: {e})", "warn", job.id)
+
     # Commit through fileops: waits for locks, verifies, can roll back. The
     # original is never removed until the replacement is verified in place.
     # Commit can outlast the encode on a big remux: it waits for locks, stages
@@ -7339,6 +7378,12 @@ def _finish(job: Job, state: str, before: int, after: int,
             event: str = "") -> None:
     _remember_fate(job.id, state)
     _finish_stage(job.id, state)
+    if job.kind == "transcode":
+        try:
+            from . import vmaftarget as _vtd
+            _vtd.discard(SETTINGS.cache_dir, job.id)
+        except Exception:                                        # noqa: BLE001
+            pass
     if state == "done" and job.kind in ("subs", "sub_ocr") and job.file_id:
         # A SUBTITLE REWRITE LEAVES THE AUDIO AND THE PICTURE AS THEY WERE,
         # in the same order - only subtitle tracks come and go. The listen
