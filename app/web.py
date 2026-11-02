@@ -19189,9 +19189,27 @@ function jpopEl(){
   return _jpop;
 }
 function jpopHide(){
+  if(_jpopPinned) return;                       // pinned by a click: stays until unpinned
   if(_jpopTimer) clearTimeout(_jpopTimer);
   _jpopTimer=setTimeout(()=>{ if(!_jpopHover && _jpop){ _jpop.style.display='none'; _jpopKey=''; } }, 160);
 }
+// CLICK TO PIN. The hover card goes when the pointer does, which is right for
+// a glance and wrong for reading twelve lines about a drive. A click on a
+// drive row pins its card; the same row again, a click anywhere else, or
+// Esc lets it go. Erik: "add clickable box with more info per drive".
+let _jpopPinned='';
+function jpopUnpin(){ _jpopPinned=''; _jpopHover=false; jpopHide(); }
+document.addEventListener('click', e=>{
+  const row=e.target.closest && e.target.closest('[data-dpop="health"]');
+  if(row){
+    if(e.target.closest('button')) return;
+    const key=popKeyOf(row);
+    if(_jpopPinned===key){ jpopUnpin(); return; }
+    _jpopPinned=key; jpopShow(row); return;
+  }
+  if(_jpopPinned && !(e.target.closest && e.target.closest('.jpop'))) jpopUnpin();
+});
+document.addEventListener('keydown', e=>{ if(e.key==='Escape' && _jpopPinned) jpopUnpin(); });
 function jpopHtml(disk){
   const bd=((_lastIo||{}).by_disk)||[];
   // The totals row asks for the whole array: every job, tagged with its disk.
@@ -19268,6 +19286,13 @@ function jpopShow(anchor){
 // with fresh numbers - and close it only if the pointer has really left.
 function popsRefresh(){
   if(_jpop && _jpop.style.display!=='none' && _jpopKey){
+    if(_jpopPinned && _jpopKey===_jpopPinned){
+      // the row was rebuilt under the card: fresh numbers, same place
+      const i=_jpopPinned.indexOf(':');
+      const row=document.querySelector(`[data-dpop="${_jpopPinned.slice(0,i)}"][data-ddisk="${CSS.escape(_jpopPinned.slice(i+1))}"]`);
+      _jpop.innerHTML=popHtmlFor(_jpopKey); if(row) jpopPlace(row);
+      return;
+    }
     const a=_under('[data-jdisk],[data-dpop],[data-wpop]');
     if(_jpopHover || (a && popKeyOf(a)===_jpopKey)){ if(_jpopTimer) clearTimeout(_jpopTimer); _jpop.innerHTML=popHtmlFor(_jpopKey); if(a) jpopPlace(a); }
     else jpopHide();
@@ -31542,43 +31567,30 @@ function tmGpuView(H){
           : '<div class="dim" style="font-size:11.5px">nothing is holding a context</div>');
 }
 // ---- disk ------------------------------------------------------------------
-// THE CONTROLLERS, one block each: the card on its own line, its ports under
-// it. Colour says what needs looking at - a reset in the last day, a link
-// below what the drive can do, a wait that reached the timeout.
-function tmCtlTable(C){
-  const cs = C.controllers||[];
-  if(!cs.length) return `<div class="dim" style="font-size:11.5px">${C.building?'reading the controllers…':esc(C.why||'no controllers found')}</div>`;
-  const when = t=>t?ago(t):'—';
-  const ms = v=>v==null?'—':v>=1000?`<span style="color:${v>=25000?'#e5534b':'#e8a33d'}">${(v/1000).toFixed(1)} s</span>`:`${Math.round(v)} ms`;
-  const CC = [{t:'port · drive', w:'auto', a:'left'}, {t:'link', w:'9%'}, {t:'worst write · read', w:'13%'},
-              {t:'retried IO 24h · 30d', w:'12%'}, {t:'uncorrected', w:'9%'}, {t:'CRC · timeouts', w:'10%'}];
-  return cs.map(c=>{
-    const p = c.pcie||{};
-    const pcie = p.onboard ? 'onboard' : `PCIe ${p.gen}.0 x${p.lanes}${c.pcie_down?` <span class="warn">of the x${p.lanes_max} it has</span>`:c.pcie_slower?` <span class="dim">(gen${p.gen_max} card in a gen${p.gen} slot)</span>`:''}`
-                 + (p.mbps?` <span class="dim">· ~${p.mbps>=1000?(p.mbps/1000).toFixed(1)+' GB/s':p.mbps+' MB/s'}${c.ports.length>1?' for '+c.ports.length+' drives':''}</span>`:'');
-    const resets = c.resets_30d
-      ? `<span style="color:${c.resets_24h?'#e5534b':c.resets_7d?'#e8a33d':'inherit'}">${fmt(c.resets_24h)} · ${fmt(c.resets_7d)} · ${fmt(c.resets_30d)}</span> <span class="dim">resets 24h · 7d · 30d, last ${when(c.last_reset)}</span>`
-      : `<span style="color:var(--ok)">no port resets in ${C.days||30} d</span>`;
-    const head = `<div style="display:flex;gap:14px;align-items:baseline;flex-wrap:wrap;margin:10px 0 3px">
-        <b style="color:${c.problem?'#e5534b':c.resets_24h?'#f0883e':'inherit'}">${esc(c.model)}</b>
-        <span class="dim" style="font-size:10.5px">${esc(c.slot||'')}${c.ports_total?` · ${c.ports.length} of ${c.ports_total} ports`:` · ${c.ports.length} drive${c.ports.length===1?'':'s'}`}${c.raidports&&c.raidports.length?` · RaidPort ${c.raidports.join(',')}`:''} · driver ${esc(c.driver||'?')}</span>
-        <span style="font-size:10.5px">${pcie}</span>
-        <span style="font-size:10.5px">${resets}</span>
-        ${c.problem?`<span class="warn" style="font-size:10.5px">PnP problem code ${c.problem}</span>`:''}
-      </div>`;
-    const rows = c.ports.map(q=>`<tr style="border-top:1px solid var(--line)">
-        ${tmCell(CC[0], `<span class="dim mono" style="font-size:10px">port ${q.port}</span> <b style="color:${diskColor(q.label)}">${esc(q.label)}</b> <span class="dim" style="font-size:10px">${esc(q.model||'')}</span>${q.warn_drive?' <span class="warn" style="font-size:10px">drive warns</span>':''}`)}
-        ${tmCell(CC[1], q.link_gbps!=null?`<span class="mono" style="color:${q.link_down?'#e5534b':'inherit'}">${q.link_gbps} Gb/s</span>${q.link_down?`<span class="dim" style="font-size:10px"> of ${q.link_max_gbps}</span>`:''}`:(c.bus==='NVMe'?`<span class="dim">PCIe</span>`:'—'))}
-        ${tmCell(CC[2], `<span class="mono">${ms(q.wr_max_ms)} · ${ms(q.rd_max_ms)}</span>`)}
-        ${tmCell(CC[3], `<span class="mono" style="color:${q.retried_24h?'#e5534b':q.retried_30d?'#e8a33d':'inherit'}">${fmt(q.retried_24h)} · ${fmt(q.retried_30d)}</span>${q.last_retried?`<span class="dim" style="font-size:10px"> ${when(q.last_retried)}</span>`:''}`)}
-        ${tmCell(CC[4], `<span class="mono" style="color:${(q.rd_unc||q.wr_unc)?'#e5534b':'inherit'}">${q.rd_unc==null&&q.wr_unc==null?'—':fmt(q.rd_unc||0)+' r · '+fmt(q.wr_unc||0)+' w'}</span>`)}
-        ${tmCell(CC[5], `<span class="mono" style="color:${q.crc?'#e8a33d':'inherit'}">${q.crc==null?'—':fmt(q.crc)}</span> · <span class="mono" style="color:${q.timeouts?'#e8a33d':'inherit'}">${q.timeouts==null?'—':fmt(q.timeouts)}</span>`)}
-      </tr>`).join('') || `<tr><td colspan="6" class="dim" style="padding:4px 6px">no drives on this controller</td></tr>`;
-    const other = (c.other_30d||[]).length
-      ? `<div class="dim" style="font-size:10.5px;margin:2px 0 0 6px">also in the log: ${c.other_30d.slice(0,4).map(o=>esc(o.what)+(o.disk!=null?' on disk '+o.disk:'')+' '+when(o.t)).join(' · ')}</div>` : '';
-    return head + `<table style="width:100%;font-size:11.5px;border-collapse:collapse;table-layout:fixed">${tmCols(CC)}<tbody>${rows}</tbody></table>` + other;
-  }).join('') + (C.stray_resets_30d?`<div class="dim" style="font-size:10.5px;margin-top:6px">${fmt(C.stray_resets_30d)} reset(s) in the log on a port no listed drive sits on</div>`:'')
-    + `<div class="dim" style="font-size:10px;margin-top:6px">read without touching the drives' logs: the SCT and Phy-counter reads that would give the drives' own link error counts reset these ports when tried, so they are not asked for</div>`;
+// A CONTROLLER'S OWN LINE: the card, its slot and driver, its PCIe link,
+// and what the System log holds against it. Its drives sit under it in the
+// merged table (dwCtlTable). Fewer lanes than the card has is a fault; a lower
+// generation is the slot it is in and is only noted.
+function tmCtlHead(c, C){
+  const p = c.pcie||{};
+  const pcie = p.onboard ? 'onboard' : `PCIe ${p.gen}.0 x${p.lanes}${c.pcie_down?` <span class="warn">of the x${p.lanes_max} it has</span>`:c.pcie_slower?` <span class="dim">(gen${p.gen_max} card in a gen${p.gen} slot)</span>`:''}`
+               + (p.mbps?` <span class="dim">· ~${p.mbps>=1000?(p.mbps/1000).toFixed(1)+' GB/s':p.mbps+' MB/s'}${c.ports.length>1?' for '+c.ports.length+' drives':''}</span>`:'');
+  const resets = c.resets_30d
+    ? `<span style="color:${c.resets_24h?'#e5534b':c.resets_7d?'#e8a33d':'inherit'}">${fmt(c.resets_24h)} · ${fmt(c.resets_7d)} · ${fmt(c.resets_30d)}</span> <span class="dim">port resets 24h · 7d · 30d, last ${ago(c.last_reset)}</span>`
+    : `<span style="color:var(--ok)">no port resets in ${(C&&C.days)||30} d</span>`;
+  const other = (c.other_30d||[]).length
+    ? ` <span class="dim" title="other storage events in the log for this controller's drives">· also ${c.other_30d.slice(0,3).map(o=>esc(o.what)+(o.disk!=null?' on disk '+o.disk:'')+' '+ago(o.t)).join(', ')}</span>` : '';
+  return `<div style="display:flex;gap:14px;align-items:baseline;flex-wrap:wrap;margin:12px 0 3px">
+      <b style="color:${c.problem?'#e5534b':c.resets_24h?'#f0883e':'inherit'}">${esc(c.model)}</b>
+      <span class="dim" style="font-size:10.5px">${esc(c.slot||'')}${c.ports_total?` · ${c.ports.length} of ${c.ports_total} ports`:` · ${c.ports.length} drive${c.ports.length===1?'':'s'}`}${c.raidports&&c.raidports.length?` · RaidPort ${c.raidports.join(',')}`:''} · driver ${esc(c.driver||'?')}</span>
+      <span style="font-size:10.5px">${pcie}</span>
+      <span style="font-size:10.5px">${resets}${other}</span>
+      ${c.problem?`<span class="warn" style="font-size:10.5px">PnP problem code ${c.problem}</span>`:''}
+    </div>`;
+}
+function tmCtlFoot(C){
+  return (C&&C.stray_resets_30d?`<div class="dim" style="font-size:10.5px;margin-top:6px">${fmt(C.stray_resets_30d)} reset(s) in the log on a port no listed drive sits on</div>`:'')
+    + `<div class="dim" style="font-size:10px;margin-top:6px">port figures read without touching the drives' own logs: the SCT and Phy-counter reads that would give each drive's link error counts reset these ports when tried, so they are not asked for</div>`;
 }
 function tmDiskView(H){
   const D = _tmD || {};
@@ -31687,12 +31699,6 @@ function tmDiskView(H){
         `<table style="width:100%;font-size:11.5px;border-collapse:collapse;
            table-layout:fixed">${tmCols(DCOLS)}
           <tbody>${diskRows||'<tr><td class="dim" style="padding:6px">no traffic</td></tr>'}</tbody></table>`)
-    + tmSection('Storage controllers',
-        'which drive sits on which port, and what the port has done to it: resets and retried IO from the System log, '
-        + 'the driver\'s own worst waits and uncorrected errors, the drive\'s cable (CRC) and command-timeout counts, '
-        + 'and the SATA link each drive negotiated against what it supports. A worst write near 30 s is the storport '
-        + 'timeout that ends in a port reset.',
-        tmCtlTable(D.controllers||{}))
     + tmSection('Which file, and where it is going',
         'every job with a file open: the spindle it is reading from, the one it will be written back to, and what it is moving',
         `<table style="width:100%;font-size:11.5px;border-collapse:collapse;
@@ -31700,12 +31706,13 @@ function tmDiskView(H){
     + tmSection('The volumes', 'how full each pool disk and the cache is',
         `<table style="width:100%;font-size:11.5px;border-collapse:collapse;
            table-layout:fixed">${tmCols(VCOLS)}<tbody>${volScale}${volRows}</tbody></table>`)
-    + tmSection('Drive health',
-        'what each drive says about itself — an SSD\'s own endurance log, a hard disk\'s SMART table (the figures StableBit Scanner reads). '
-        + 'An SSD warns at '+((_dw&&_dw.warn_at)||80)+'% used; a hard disk warns at once on pending or uncorrectable sectors or a drop in helium, '
-        + 'and on reallocated sectors or cable errors only when they rise past what nuarr first saw. '
-        + 'Ignore quiets a drive until it gets worse.',
-        dwTable());
+    + tmSection('Drives and controllers',
+        'every drive under the controller and port it sits on. What the drive says about itself — an SSD\'s endurance log, a hard disk\'s SMART table — '
+        + 'beside what the port has done to it: the SATA link it negotiated, the driver\'s worst write and read wait (near 30 s is the storport timeout that ends in a port reset), '
+        + 'and retried IO from the System log; each controller\'s own resets on its line. An SSD warns at '+((_dw&&_dw.warn_at)||80)+'% used; a hard disk warns at once on pending or '
+        + 'uncorrectable sectors or a drop in helium, and on reallocated sectors or cable errors only when they rise past what nuarr first saw. '
+        + 'Click a drive to pin its card; click again or press Esc to let go.',
+        dwCtlTable(D.controllers||{}));
 }
 // ONE DRIVE, IN FULL - in the card the DrivePool panel opens, because a second
 // kind of hover card would be a second thing to learn. The row has room for
@@ -31742,6 +31749,23 @@ function dwPopHtml(key){
     rows.push(`<b>start/stops</b> ${fmt(d.starts||0)} · <b>spin retries</b> <span style="color:${d.spin_retry?'#d29922':'inherit'}">${fmt(d.spin_retry||0)}</span>`);
   }
   rows.push(`<b>temperature</b> ${d.temp_c!=null?d.temp_c+'°C':'—'}${d.temp_warn_c!=null?` <span class="dim">(warns at ${d.temp_warn_c}°C${d.temp_crit_c!=null?', limit '+d.temp_crit_c+'°C':''})</span>`:''} · <b>powered on</b> ${(d.power_hours/8766).toFixed(1)} years`+dim(fmt(d.power_hours)+' hours'));
+  // THE PORT SIDE, from the controller payload the Disk view holds.
+  const cs=((_tmD&&_tmD.controllers)||{}).controllers||[];
+  let pc=null, pq=null;
+  cs.forEach(c=>c.ports.forEach(q=>{ if(q.disk===d.disk){ pc=c; pq=q; } }));
+  if(pc&&pq){
+    const msF=v=>v==null?'—':v>=1000?`<span style="color:${v>=25000?'#e5534b':'#e8a33d'}">${(v/1000).toFixed(1)} s</span>`:Math.round(v)+' ms';
+    const p=pc.pcie||{};
+    rows.push(`<hr style="border:0;border-top:1px solid var(--line);margin:5px 0">`
+      +`<b>controller</b> ${esc(pc.model)} · port ${pq.port}${pc.raidports&&pc.raidports.length?' · RaidPort '+pc.raidports.join(','):''}`
+      +dim((p.onboard?'onboard':`PCIe ${p.gen}.0 x${p.lanes}`)+(pc.resets_30d?` · ${fmt(pc.resets_24h)} reset(s) in 24 h, ${fmt(pc.resets_30d)} in 30 d, last ${ago(pc.last_reset)}`:' · no port resets in 30 d')));
+    if(pq.link_gbps!=null) rows.push(`<b>SATA link</b> <span style="color:${pq.link_down?'#e5534b':'inherit'}">${pq.link_gbps} Gb/s</span>`+dim(pq.link_down?`the drive supports ${pq.link_max_gbps} — a cable or port holding it back`:`the fastest the drive supports`));
+    rows.push(`<b>worst wait</b> write ${msF(pq.wr_max_ms)} · read ${msF(pq.rd_max_ms)} · flush ${msF(pq.flush_max_ms)}`+dim('the driver\'s own maximums since boot — about 30 s is the timeout that ends in a port reset'));
+    rows.push(`<b>retried IO</b> <span style="color:${pq.retried_24h?'#e5534b':pq.retried_30d?'#e8a33d':'inherit'}">${fmt(pq.retried_24h)}</span> in 24 h · ${fmt(pq.retried_30d)} in 30 d`+(pq.last_retried?dim('last '+ago(pq.last_retried)):''));
+    if(pq.rd_unc!=null||pq.wr_unc!=null) rows.push(`<b>uncorrected</b> ${fmt(pq.rd_unc||0)} read · ${fmt(pq.wr_unc||0)} write`+dim('errors the driver could not correct'));
+    if(d.timeouts!=null) rows.push(`<b>command timeouts</b> <span style="color:${d.timeouts?'#d29922':'inherit'}">${fmt(d.timeouts)}</span>`+dim('the drive\'s own count (SMART 188)'));
+  }
+  if(_jpopPinned===('health:'+key)) rows.push(`<span class="dim" style="font-size:10px">pinned — click the row again or press Esc to let go</span>`);
   const status = d.ignored ? 'Warning ignored — it comes back '+(d.rearm_at?'at '+d.rearm_at+'%':'when something new appears')+'.'
     : (d.problems||[]).length ? d.problems.join('; ')
     : d.warn ? 'Past the '+((_dw&&_dw.warn_at)||80)+'% line.'
@@ -31758,39 +31782,43 @@ function dwPopHtml(key){
     <div style="font-size:11px;margin-top:6px;color:${d.warn?'#e3b341':watch?'#d29922':'inherit'}">${esc(status)}</div>
     <div class="dim" style="font-size:10.5px;margin-top:5px;line-height:1.45">${esc(why)}</div>`;
 }
-function dwTable(){
+function dwCtlTable(C){
   const ds=(_dw&&_dw.drives)||null;
   if(!ds) return '<div class="dim" style="font-size:11.5px">reading the drives…</div>';
   if(!ds.length) return '<div class="dim" style="font-size:11.5px">no drive answered</div>';
-  // TWO TABLES, BECAUSE THEY ARE TWO KINDS OF THING. One table gave the hard
-  // disks three columns of dashes - written, per day, to 100% - which read as
-  // missing data. A spinning disk does not count what is written to it; what
-  // it counts is its surface, its cable, its helium and its mechanics, and
-  // those get columns of their own. Each table is sorted by name.
   const TB=b=>b>=1e13?(b/1e12).toFixed(0)+' TB':(b/1e12).toFixed(1)+' TB';
   const yrs=h=>h>=8766?(h/8766).toFixed(1)+' y':fmt(Math.round(h/24))+' d';
+  const ms=v=>v==null?'—':v>=1000?`<span style="color:${v>=25000?'#e5534b':'#e8a33d'}">${(v/1000).toFixed(1)} s</span>`:`${Math.round(v)} ms`;
   const look=d=>{ const watch=!d.raw_warn&&(d.notes||[]).length;
     return {watch, col:d.warn?'#e3b341':d.ignored?'#8b949e':watch?'#d29922':'#3fb950'}; };
   const status=d=>(d.problems&&d.problems.length&&!d.ignored)?d.problems.join('; ')
       : d.ignored?(d.rearm_at?'ignored until '+d.rearm_at+'%':'ignored until something new')
       : d.warn?'past the '+((_dw&&_dw.warn_at)||80)+'% line'
       : (d.notes||[]).length?d.notes.join(' · ') : 'healthy';
-  const nameCell=(c,d)=>{ const L=look(d), sub=(d.labels||[]).filter(l=>l&&l!==d.name).join(' · ');
-    return tmCell(c, `<b style="color:${L.col}">${esc(d.name)}</b> <span class="mono" style="font-size:10.5px">${esc(d.model||'')}</span>`
+  const nameCell=(c,d,q)=>{ const L=look(d), sub=(d.labels||[]).filter(l=>l&&l!==d.name).join(' · ');
+    return tmCell(c, (q?`<span class="dim mono" style="font-size:10px">port ${q.port}</span> `:'')
+      + `<b style="color:${L.col}">${esc(d.name)}</b> <span class="mono" style="font-size:10.5px">${esc(d.model||'')}</span>`
       + (sub?`<span class="dim" style="font-size:10px"> ${esc(sub)}</span>`:'')
       + `<div style="font-size:10px;color:${d.warn?'#e3b341':L.watch?'#d29922':'var(--dim,#8a97a6)'}">${esc(status(d))}</div>`); };
-  const btn=d=>d.raw_warn?`<button class="rmb" style="font-size:10.5px" onmousedown="dwIgnore('${jsq(d.key)}',${d.ignored?0:1},this)"
+  const btn=d=>d.raw_warn?`<button class="rmb" style="font-size:10.5px" onmousedown="event.stopPropagation();dwIgnore('${jsq(d.key)}',${d.ignored?0:1},this)"
         title="${d.ignored?'Warn about this drive again now':'Stop warning about this drive until it gets worse'}">${d.ignored?'Un-ignore':'Ignore'}</button>`:'';
   const num=(v,bad)=>`<span class="mono" style="color:${v?bad:'inherit'}">${fmt(v||0)}</span>`;
-  const tr=(d,cells)=>`<tr style="border-top:1px solid var(--line)" data-dpop="health" data-ddisk="${esc(d.key)}">${cells}</tr>`;
-  const table=(C,rows)=>`<table style="width:100%;font-size:11.5px;border-collapse:collapse;table-layout:fixed">${tmCols(C)}<tbody>${rows}</tbody></table>`;
+  // THE PORT SIDE, three cells shared by both kinds of drive.
+  const linkCell=(c,d,q)=>tmCell(c, !q ? '—'
+      : q.link_gbps!=null ? `<span class="mono" style="color:${q.link_down?'#e5534b':'inherit'}">${q.link_gbps} Gb/s</span>${q.link_down?`<span class="dim" style="font-size:10px"> of ${q.link_max_gbps}</span>`:''}`
+      : d.type==='ssd' ? '<span class="dim">PCIe</span>' : '—');
+  const waitCell=(c,q)=>tmCell(c, q?`<span class="mono">${ms(q.wr_max_ms)} · ${ms(q.rd_max_ms)}</span>`:'—');
+  const retryCell=(c,q)=>tmCell(c, q?`<span class="mono" style="color:${q.retried_24h?'#e5534b':q.retried_30d?'#e8a33d':'inherit'}">${fmt(q.retried_24h)} · ${fmt(q.retried_30d)}</span>${q.last_retried?`<span class="dim" style="font-size:10px"> ${ago(q.last_retried)}</span>`:''}`:'—');
+  const tr=(d,cells)=>`<tr style="border-top:1px solid var(--line);cursor:pointer" data-dpop="health" data-ddisk="${esc(d.key)}" title="click to pin this drive's card">${cells}</tr>`;
+  const table=(cols,rows)=>`<table style="width:100%;font-size:11.5px;border-collapse:collapse;table-layout:fixed">${tmCols(cols)}<tbody>${rows}</tbody></table>`;
 
-  const S=[{t:'NVMe / SSD',w:'auto',a:'left'},{t:'type',w:'5%'},{t:'life used',w:'16%',a:'left'},
-           {t:'written',w:'7%'},{t:'per day',w:'7%'},{t:'to 100%',w:'7%'},{t:'spare',w:'6%'},
-           {t:'temp',w:'6%'},{t:'powered',w:'7%'},{t:'errors',w:'8%'},{t:'',w:'8%'}];
-  const ssd=ds.filter(d=>d.type==='ssd').map(d=>{ const L=look(d); return tr(d,
-      nameCell(S[0],d)
-    + tmCell(S[1], `<span class="dim" style="font-size:10.5px">${esc(d.bus||'NVMe')}</span>`)
+  const S=[{t:'NVMe / SSD',w:'auto',a:'left'},{t:'link',w:'5%'},{t:'life used',w:'11%',a:'left'},
+           {t:'written',w:'6%'},{t:'per day',w:'6%'},{t:'to 100%',w:'6%'},{t:'spare',w:'5%'},
+           {t:'temp',w:'6%'},{t:'worst write · read',w:'10%'},{t:'retried IO 24h · 30d',w:'9%'},
+           {t:'powered',w:'6%'},{t:'errors',w:'6%'},{t:'',w:'6%'}];
+  const ssdRow=(d,q)=>{ const L=look(d); return tr(d,
+      nameCell(S[0],d,q)
+    + linkCell(S[1],d,q)
     + tmCell(S[2], `<div style="display:flex;align-items:center;gap:6px">${tmBar(d.used_pct, L.col, 8)}<span class="mono" style="color:${L.col}">${d.used_pct}%</span></div>`
         + (d.used_pct===0&&d.written>5e13?'<div class="dim" style="font-size:9.5px">this firmware reports 0% — go by the written total</div>':''))
     + tmCell(S[3], `<span class="mono">${TB(d.written)}</span>`)
@@ -31798,30 +31826,55 @@ function dwTable(){
     + tmCell(S[5], `<span class="mono" style="color:${d.days_left!=null&&d.days_left<90?'#e3b341':'inherit'}" title="${d.days_left==null?'the drive reports no percentage to project from':''}">${d.days_left!=null?'~'+fmt(d.days_left)+' d':'n/a'}</span>`)
     + tmCell(S[6], `<span class="mono" title="the drive warns at ${d.spare_thr}%" style="color:${d.spare<=d.spare_thr?'#e0575b':'inherit'}">${d.spare}%</span>`)
     + tmCell(S[7], `<span class="mono" title="${esc(d.temp_limit_src||'no limit stated by this drive')}${d.temp_crit_c!=null?' · critical at '+d.temp_crit_c+'°C':''}">${tmTempLim(d.temp_c, d.temp_warn_c, d.temp_crit_c, d.temp_limit_src)}</span>`)
-    + tmCell(S[8], `<span class="mono" title="${fmt(d.power_hours)} hours">${yrs(d.power_hours)}</span>`)
-    + tmCell(S[9], `<span class="mono" title="media errors / unsafe shutdowns" style="color:${d.media_errors?'#e0575b':'inherit'}">${fmt(d.media_errors)} / ${fmt(d.unsafe)}</span>`)
-    + tmCell(S[10], btn(d))); }).join('');
+    + waitCell(S[8],q) + retryCell(S[9],q)
+    + tmCell(S[10], `<span class="mono" title="${fmt(d.power_hours)} hours">${yrs(d.power_hours)}</span>`)
+    + tmCell(S[11], `<span class="mono" title="media errors / unsafe shutdowns" style="color:${d.media_errors?'#e0575b':'inherit'}">${fmt(d.media_errors)} / ${fmt(d.unsafe)}</span>`)
+    + tmCell(S[12], btn(d))); };
 
-  const Hc=[{t:'hard disk',w:'auto',a:'left'},{t:'type',w:'5%'},{t:'reallocated',w:'8%'},{t:'pending',w:'7%'},
-           {t:'uncorrectable',w:'9%'},{t:'cable errors',w:'8%'},{t:'helium',w:'6%'},{t:'load cycles',w:'8%'},
-           {t:'start / stops',w:'8%'},{t:'temp',w:'6%'},{t:'powered',w:'7%'},{t:'',w:'8%'}];
-  const hdd=ds.filter(d=>d.type==='hdd').map(d=>tr(d,
-      nameCell(Hc[0],d)
-    + tmCell(Hc[1], `<span class="dim" style="font-size:10.5px">${esc(d.bus||'SATA')}</span>`)
+  const Hc=[{t:'hard disk',w:'auto',a:'left'},{t:'link',w:'5%'},{t:'reallocated',w:'7%'},{t:'pending',w:'6%'},
+           {t:'uncorrectable',w:'8%'},{t:'cable · timeouts',w:'8%'},{t:'helium',w:'5%'},{t:'load cycles',w:'7%'},
+           {t:'start / stops',w:'7%'},{t:'temp',w:'6%'},{t:'worst write · read',w:'10%'},{t:'retried IO 24h · 30d',w:'9%'},
+           {t:'powered',w:'6%'},{t:'',w:'6%'}];
+  const hddRow=(d,q)=>tr(d,
+      nameCell(Hc[0],d,q)
+    + linkCell(Hc[1],d,q)
     + tmCell(Hc[2], num(d.realloc,'#d29922'))
     + tmCell(Hc[3], num(d.pending,'#e0575b'))
     + tmCell(Hc[4], num(d.uncorr,'#e0575b'))
-    + tmCell(Hc[5], num(d.crc,'#d29922'))
+    + tmCell(Hc[5], num(d.crc,'#d29922')+' · '+(d.timeouts==null?'<span class="dim">—</span>':num(d.timeouts,'#d29922')))
     + tmCell(Hc[6], `<span class="mono" style="color:${d.helium!=null&&d.helium<100?'#e0575b':'inherit'}">${d.helium!=null?d.helium+'%':'—'}</span>`)
     + tmCell(Hc[7], `<span class="mono">${fmt(d.load_cycles||0)}</span>`)
     + tmCell(Hc[8], `<span class="mono">${fmt(d.starts||0)}</span>`)
     + tmCell(Hc[9], `<span class="mono" title="${esc(d.temp_limit_src||'no limit stated by this drive')}${d.temp_crit_c!=null?' · limit '+d.temp_crit_c+'°C':''}">${tmTempLim(d.temp_c, d.temp_warn_c, d.temp_crit_c, d.temp_limit_src)}</span>`)
-    + tmCell(Hc[10], `<span class="mono" title="${fmt(d.power_hours)} hours" style="color:${d.age?'#d29922':'inherit'}">${yrs(d.power_hours)}</span>`)
-    + tmCell(Hc[11], btn(d)))).join('');
+    + waitCell(Hc[10],q) + retryCell(Hc[11],q)
+    + tmCell(Hc[12], `<span class="mono" title="${fmt(d.power_hours)} hours" style="color:${d.age?'#d29922':'inherit'}">${yrs(d.power_hours)}</span>`)
+    + tmCell(Hc[13], btn(d)));
 
-  return (ssd?table(S,ssd):'')
-    + (hdd?`<div style="height:12px"></div>`+table(Hc,hdd)
-        +`<div class="dim" style="font-size:10.5px;margin-top:5px">A hard disk keeps no count of what is written to it, so there is no "written" or "to 100%" here — its wear shows as surface damage (reallocated, pending, uncorrectable), a leaking seal (helium) and age.</div>`:'');
+  const group=(drives, port)=>{
+    const ssd=drives.filter(d=>d.type==='ssd').sort((a,b)=>(port(a)||{}).port-(port(b)||{}).port||a.name.localeCompare(b.name)).map(d=>ssdRow(d,port(d))).join('');
+    const hdd=drives.filter(d=>d.type==='hdd').sort((a,b)=>(port(a)||{}).port-(port(b)||{}).port||a.name.localeCompare(b.name)).map(d=>hddRow(d,port(d))).join('');
+    return (ssd?table(S,ssd):'')+(ssd&&hdd?'<div style="height:6px"></div>':'')+(hdd?table(Hc,hdd):'');
+  };
+
+  // BY CONTROLLER when the controllers are known; one flat list until then.
+  const cs=(C&&C.controllers)||[];
+  if(!cs.length){
+    return group(ds, ()=>null)
+      + `<div class="dim" style="font-size:10.5px;margin-top:5px">${C&&C.building?'reading the controllers…':(C&&C.why)||''}</div>`;
+  }
+  const byDisk={}; cs.forEach(c=>c.ports.forEach(q=>{ byDisk[q.disk]={q, c}; }));
+  const placed=new Set();
+  let html='';
+  cs.forEach(c=>{
+    const mine=ds.filter(d=>byDisk[d.disk]&&byDisk[d.disk].c===c);
+    mine.forEach(d=>placed.add(d.key));
+    html+=tmCtlHead(c, C)+(mine.length?group(mine, d=>byDisk[d.disk].q):`<div class="dim" style="font-size:11px;padding:2px 6px 4px">no drives on this controller</div>`);
+  });
+  const rest=ds.filter(d=>!placed.has(d.key));
+  if(rest.length) html+=`<div style="margin:12px 0 3px"><b>not placed on a controller</b></div>`+group(rest, ()=>null);
+  return html
+    + `<div class="dim" style="font-size:10.5px;margin-top:5px">A hard disk keeps no count of what is written to it, so there is no "written" or "to 100%" for one — its wear shows as surface damage (reallocated, pending, uncorrectable), a leaking seal (helium) and age. "cable · timeouts" are the drive's own counts: CRC errors on the SATA link, and commands it saw time out.</div>`
+    + tmCtlFoot(C);
 }
 async function dwIgnore(key,on,btn){
   if(btn) btn.disabled=true;
