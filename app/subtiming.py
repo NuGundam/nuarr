@@ -18,6 +18,9 @@ WHAT IT DOES WITH THE ANSWER
   ok       in step - recorded, not looked at again until the file changes
   offset   every line early or late by the same amount
   drift    a frame-rate mismatch - further out each minute
+  piecewise timed to another cut - one offset per stretch of the episode,
+           found by hearing the whole file (subtiming_worker.pw_stage) and
+           applied by rewriting the cue times (fix_piecewise)
            both are FIXED in auto: mkvmerge --sync moves (and stretches) that
            track's timestamps; nothing is converted, the track keeps its
            codec, its title, its flags. The rebuilt file is measured again and
@@ -32,6 +35,7 @@ are skipped - they are not meant to follow the dialogue.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import subprocess
@@ -360,6 +364,229 @@ def fix(file_id: int, path: str, tracks: list) -> dict:
     return {"ok": True, "mtime": mt, "after": chk.get("tracks")}
 
 
+# ------------------------------------------------------- piecewise fix ----
+def _mkv_tracks(path: str) -> list:
+    """Every track in file order with mkvmerge's own id and the subtitle
+    flags the rebuilt track has to carry."""
+    from .subembed import _mkvmerge
+    r = subprocess.run([_mkvmerge(), "-J", path], capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=180, creationflags=NO_WINDOW, startupinfo=hidden_si())
+    d = json.loads(r.stdout or "{}")
+    out, n = [], 0
+    for t in d.get("tracks") or []:
+        p = t.get("properties") or {}
+        row = {"id": t.get("id"), "type": t.get("type"), "ord": None}
+        if t.get("type") == "subtitles":
+            row.update(ord=n, lang=p.get("language") or "und", name=p.get("track_name") or "",
+                       default=bool(p.get("default_track")), forced=bool(p.get("forced_track")),
+                       hi=bool(p.get("flag_hearing_impaired")), codec=str(p.get("codec_id") or ""))
+            n += 1
+        out.append(row)
+    return out
+
+
+def _pw_piece(t: float, pieces: list) -> dict:
+    """The piece a cue belongs to - by its START; its end goes with it, or a
+    line across a break would be stretched or folded."""
+    return next((p for p in pieces if p["to"] is None or t < p["to"]), pieces[-1])
+
+
+def _retime_text(txt: str, ass: bool, pieces: list, drops: list) -> tuple[str, int, int]:
+    """The subtitle file with every cue moved by the piece its start falls
+    in; cues in `drops` (by original start) left out. A cue that would start
+    before the one ahead of it ends is held back to just after it - the same
+    rule the worker proved the map with. Returns (text, moved, dropped)."""
+    dset = {round(float(x), 3) for x in drops or []}
+    moved = dropped = 0
+    prev_end = [-1e9]
+
+    def _map(a: float, b: float):
+        p = _pw_piece(a, pieces)
+        na, nb = a * p["k"] + p["d"], b * p["k"] + p["d"]
+        if na < prev_end[0] + 0.001:
+            na = prev_end[0] + 0.001
+        nb = max(nb, na + 0.3)
+        prev_end[0] = nb
+        return max(0.0, na), max(0.0, nb)
+
+    if ass:
+        def _ts(s):
+            h, m, rest = s.strip().split(":")
+            return int(h) * 3600 + int(m) * 60 + float(rest)
+
+        def _fmt(t):
+            h, t = divmod(max(0.0, t), 3600)
+            m, s = divmod(t, 60)
+            return f"{int(h)}:{int(m):02d}:{s:05.2f}"
+        out, fmt = [], None
+        for line in txt.split("\n"):
+            raw = line.rstrip("\r")
+            if raw.startswith("Format:") and "Start" in raw and "End" in raw:
+                fmt = [x.strip().lower() for x in raw[7:].split(",")]
+            if fmt and (raw.startswith("Dialogue:") or raw.startswith("Comment:")):
+                head, body = raw.split(":", 1)
+                parts = body.split(",", len(fmt) - 1)
+                if len(parts) == len(fmt):
+                    si, ei = fmt.index("start"), fmt.index("end")
+                    try:
+                        a, b = _ts(parts[si]), _ts(parts[ei])
+                    except ValueError:
+                        out.append(line)
+                        continue
+                    if round(a, 3) in dset:
+                        dropped += 1
+                        continue
+                    na, nb = _map(a, b)
+                    parts[si], parts[ei] = _fmt(na), _fmt(nb)
+                    moved += 1
+                    out.append(head + ":" + ",".join(parts) + ("\r" if line.endswith("\r") else ""))
+                    continue
+            out.append(line)
+        return "\n".join(out), moved, dropped
+    # SRT
+    import re as _re
+    tre = _re.compile(r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)(.*)$")
+
+    def _fmt(t):
+        ms = int(round(max(0.0, t) * 1000))
+        h, ms = divmod(ms, 3600000)
+        m, ms = divmod(ms, 60000)
+        s, ms = divmod(ms, 1000)
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+    blocks, out = _re.split(r"(\r?\n\s*\r?\n)", txt), []
+    for blk in blocks:
+        lines = blk.split("\n")
+        hit = next((i for i, l in enumerate(lines[:3]) if tre.match(l.strip())), None)
+        if hit is None:
+            out.append(blk)
+            continue
+        m = tre.match(lines[hit].strip())
+        g = m.groups()
+        a = int(g[0]) * 3600 + int(g[1]) * 60 + int(g[2]) + int(g[3]) / (1000 if len(g[3]) == 3 else 100)
+        b = int(g[4]) * 3600 + int(g[5]) * 60 + int(g[6]) + int(g[7]) / (1000 if len(g[7]) == 3 else 100)
+        if round(a, 3) in dset:
+            dropped += 1
+            # the separator that followed this block goes too, or two stack up
+            if out and _re.fullmatch(r"\r?\n\s*\r?\n", out[-1]):
+                out.pop()
+            continue
+        na, nb = _map(a, b)
+        lines[hit] = f"{_fmt(na)} --> {_fmt(nb)}{g[8]}" + ("\r" if lines[hit].endswith("\r") else "")
+        moved += 1
+        out.append("\n".join(lines))
+    return "".join(out), moved, dropped
+
+
+def fix_piecewise(file_id: int, path: str, tracks: list) -> dict:
+    """Rewrite each named track's cue times with its piecewise map (a plain
+    offset/rate is a one-piece map), remux the file with the retimed tracks
+    in their original places and flags, measure the result, and replace the
+    original only when every one is now in step.
+    tracks: [{"ord", "pieces": [{"to","k","d"}], "drops": [starts]}]"""
+    from . import fileops
+    from .subembed import _mkvmerge, have_mkvmerge, _run_reporting, _plain, _size
+    from .jobs import _ffmpeg_exe
+    if os.path.splitext(path)[1].lower() != ".mkv":
+        return {"ok": False, "why": "not a Matroska file - mkvmerge cannot rewrite it in place"}
+    if not have_mkvmerge():
+        return {"ok": False, "why": "mkvmerge is not installed"}
+    if fileops.is_locked(path):
+        return {"ok": False, "why": "the file is in use"}
+    live = _mkv_tracks(path)
+    subs = {t["ord"]: t for t in live if t["type"] == "subtitles"}
+    for t in tracks:
+        if t["ord"] not in subs:
+            return {"ok": False, "why": f"subtitle track {t['ord'] + 1} is not where it was measured"}
+    ok_room, why_room = fileops.cache_room(_size(path))
+    if not ok_room:
+        return {"ok": False, "why": why_room}
+    st, key = _st(), _key()
+    from . import outside as _out
+    tmp = fileops.cache_temp(".mkv", "subtiming")
+    side: list = []
+    try:
+        with fileops.cache_reserve(_size(path)):
+            # 1. each track out of the container as it is (codec copy keeps the
+            #    ASS styles), retimed, written beside the temp file
+            st.update(stage="rewriting the cue times", pct=40)
+            ff = _ffmpeg_exe()
+            for i, t in enumerate(tracks):
+                m = subs[t["ord"]]
+                ass = "ASS" in m["codec"].upper() or "SSA" in m["codec"].upper()
+                srt = "UTF8" in m["codec"].upper() or "SRT" in m["codec"].upper()
+                ext = "ass" if ass else "srt"
+                raw = tmp[:-4] + f".t{i}.{ext}"
+                side.append(raw)
+                r = _plain([ff, "-v", "error", "-nostdin", "-y", "-i", path, "-map", f"0:s:{t['ord']}",
+                            "-c:s", "copy" if (ass or srt) else "srt", "-f", ext, raw], 900)
+                if r[0] != 0 or not os.path.exists(raw):
+                    return {"ok": False, "why": f"could not read track {t['ord'] + 1} out: {(r[2] or '').strip()[:200]}"}
+                txt = io.open(raw, encoding="utf-8", errors="replace").read()
+                pieces = t.get("pieces") or [{"to": None, "k": float(t.get("rate", 1.0)), "d": float(t.get("offset", 0.0))}]
+                new, moved, dropped = _retime_text(txt, ass, pieces, t.get("drops") or [])
+                if moved < 10:
+                    return {"ok": False, "why": f"track {t['ord'] + 1}: only {moved} cues could be retimed - not touched"}
+                io.open(raw, "w", encoding="utf-8", newline="").write(new)
+                t["moved"], t["dropped"] = moved, dropped
+            # 2. the container again: everything as it was, less those tracks,
+            #    plus the retimed files - put back in the same order with the
+            #    same language, name and flags, so nothing else moves
+            drop_ids = [str(subs[t["ord"]]["id"]) for t in tracks]
+            cmd = [_mkvmerge(), "-o", tmp, "--subtitle-tracks", "!" + ",".join(drop_ids), path]
+            order = []
+            for row in live:
+                hit = next((i for i, t in enumerate(tracks) if row["type"] == "subtitles" and t["ord"] == row["ord"]), None)
+                if hit is None:
+                    order.append(f"0:{row['id']}")
+                else:
+                    order.append(f"{hit + 1}:0")
+            for i, t in enumerate(tracks):
+                m = subs[t["ord"]]
+                cmd += ["--language", f"0:{m['lang']}", "--track-name", f"0:{m['name']}",
+                        "--default-track-flag", f"0:{'yes' if m['default'] else 'no'}",
+                        "--forced-display-flag", f"0:{'yes' if m['forced'] else 'no'}",
+                        "--hearing-impaired-flag", f"0:{'yes' if m['hi'] else 'no'}", side[i]]
+            cmd += ["--track-order", ",".join(order)]
+
+            def _rep(p):
+                st["pct"] = 45 + 0.35 * float(p or 0)
+            st["stage"] = "rebuilding the file"
+            r = _run_reporting(cmd, _rep, on_pid=lambda pid: _out.set_pid(key, pid))
+            if r.returncode >= 2 or not os.path.exists(tmp):
+                return {"ok": False, "why": (r.stderr or r.stdout or "mkvmerge failed").strip()[:300]}
+            # 3. EXIT 0 IS NOT PROOF: measure the rebuilt file the same way
+            st.update(stage="measuring the result", pct=82)
+            chk = _measure(tmp, ",".join(str(t["ord"]) for t in tracks), check_only=True)
+            bad = [t for t in (chk.get("tracks") or []) if t.get("verdict") != "ok"]
+            if not chk.get("ok") or bad or len(chk.get("tracks") or []) != len(tracks):
+                why = "; ".join(f"track {t['ord'] + 1}: {t.get('why', '')}" for t in bad) or chk.get("why") or "the check failed"
+                return {"ok": False, "why": "the corrected file still is not in step - nothing was changed (" + why + ")"}
+            st.update(stage="putting it back", pct=90)
+            from .jobs import outside_commit as _oc
+            res = fileops.safe_replace(path, tmp, **_oc(path, "subtiming"))
+            if not getattr(res, "ok", False):
+                return {"ok": False, "why": f"could not put the rebuilt file in place: {getattr(res, 'why', '')}"}
+    finally:
+        fileops._quiet_remove(tmp)
+        for s in side:
+            fileops._quiet_remove(s)
+    try:
+        from . import jobs as _jobs
+        _r = _plain([_jobs._ffprobe_exe(), "-v", "quiet", "-print_format", "json", "-show_streams",
+                     "-show_format", path], 180)
+        _d = json.loads(_r[1] or "{}")
+        if _d.get("streams"):
+            _jobs.cache_probe(int(file_id), _d)
+    except Exception:                                            # noqa: BLE001
+        pass
+    mt = os.path.getmtime(path)
+    with cursor() as cur:
+        cur.execute("UPDATE files SET size=?, mtime=?, updated_at=? WHERE id=?",
+                    (_size(path), mt, time.time(), int(file_id)))
+    return {"ok": True, "mtime": mt, "after": chk.get("tracks"),
+            "moved": {t["ord"]: (t.get("moved", 0), t.get("dropped", 0)) for t in tracks}}
+
+
 # ----------------------------------------------------------------- one file --
 def check_one(row: dict, act: bool | None = None, w=None) -> dict:
     """Measure one file, fix what can be fixed (auto), record it.
@@ -410,12 +637,22 @@ def check_one(row: dict, act: bool | None = None, w=None) -> dict:
             verdict, action, note = "failed", "not measured", res.get("why") or ""
         else:
             kinds = [t.get("verdict") for t in tracks]
-            fixable = [t for t in tracks if t.get("verdict") in ("offset", "drift")]
-            verdict = ("drift" if "drift" in kinds else "offset" if "offset" in kinds else "messy" if "messy" in kinds
+            fixable = [t for t in tracks if t.get("verdict") in ("offset", "drift", "piecewise")]
+            verdict = ("piecewise" if "piecewise" in kinds else "drift" if "drift" in kinds
+                       else "offset" if "offset" in kinds else "messy" if "messy" in kinds
                        else "ok" if "ok" in kinds else "unsure" if "unsure" in kinds else "skipped")
             if fixable and act:
-                f = fix(fid, path, [{"ord": t["ord"], "offset": float(t["offset"]), "rate": float(t["rate"])}
-                                    for t in fixable])
+                # ONE REMUX. A piecewise track needs its cue times rewritten;
+                # when there is one, every fixable track goes that way (an
+                # offset or a rate is a one-piece map). Otherwise mkvmerge's
+                # --sync does the whole job without touching the text.
+                if any(t.get("pieces") for t in fixable):
+                    f = fix_piecewise(fid, path, [{"ord": t["ord"], "pieces": t.get("pieces"), "drops": t.get("drops"),
+                                                   "offset": float(t.get("offset") or 0.0),
+                                                   "rate": float(t.get("rate") or 1.0)} for t in fixable])
+                else:
+                    f = fix(fid, path, [{"ord": t["ord"], "offset": float(t["offset"]), "rate": float(t["rate"])}
+                                        for t in fixable])
                 if f.get("ok"):
                     action = f"fixed {len(fixable)} track(s)"
                     row["mtime"] = f["mtime"]
@@ -423,6 +660,8 @@ def check_one(row: dict, act: bool | None = None, w=None) -> dict:
                     for t in fixable:
                         t["fixed"] = True
                         t["check"] = (after.get(t["ord"]) or {}).get("before") or []
+                        if t["ord"] in (f.get("moved") or {}):
+                            t["moved"], t["dropped"] = f["moved"][t["ord"]]
                     joblog.log(f"subtitle timing: fixed {len(fixable)} track(s) in {_label(path)} - "
                                + "; ".join(f"track {t['ord'] + 1} {t['why']}" for t in fixable), "ok")
                 else:

@@ -23,8 +23,11 @@ So every known rate is tried with every offset over the whole file, the best
 is kept, and then the episode is cut into five-minute slices and each slice
 is lined up again on its own: BEFORE (as it is) and AFTER (with the
 correction). Only a correction that brings every slice into step counts as a
-fix; anything else - a different cut, a missing scene, a re-edit - is a
-subtitle this cannot straighten and is reported as such.
+fix. What is left over - a different cut, a missing scene, a re-edit -
+gets one more look: the file heard end to end and the track cut into
+stretches with one offset each (pw_stage, "piecewise"). Only when that map
+brings every slice into step is it offered; otherwise the track is reported
+as one this cannot straighten.
 
 --check-only measures as the file is (no model search); it is what the
 caller runs on the rebuilt file to prove the fix took.
@@ -481,6 +484,236 @@ def judge(m: dict) -> tuple[str, str]:
                      "(another cut of the episode, a missing scene) - left alone")
 
 
+# ------------------------------------------------------------ piecewise ----
+# TIMED TO ANOTHER CUT. A track that is early for ten minutes, in step for
+# ten and late for the rest was made for a copy with a different edit - an
+# extra recap, a scene cut short, an ad break removed. No one shift or rate
+# fits it, so until now it was "messy" and left alone. Here the file is heard
+# END TO END (not in samples), a 90-second slice at a time, the slices are
+# grouped into stretches of one offset each, every stretch gets its own
+# shift (and rate, when it is long enough to show one), each break between
+# two stretches is placed where the subtitles themselves have a gap, and the
+# whole map is proved against the speech before it is offered. The fixer
+# rewrites the cue times with that map (mkvmerge's --sync is one line only).
+PW_WIN = 90.0                # a slice for the close look
+PW_JUMP = 0.35               # neighbours this far apart are different stretches
+PW_MAX_DUR = 5400.0          # hear the whole file only up to 90 minutes
+
+
+def pw_windows(dur: float) -> list:
+    w, t = [], 0.0
+    while t < dur - 30:
+        w.append((t, min(dur, t + PW_WIN)))
+        t += PW_WIN
+    return w
+
+
+def _pw_good(sl: list) -> list:
+    return [s for s in sl if s["late"] is not None and s["r"] >= 0.2
+            and (s.get("margin", 1) >= 0.03 or s["r"] >= 0.45) and not s.get("edge")]
+
+
+def pw_segments(sl: list) -> list:
+    """The good slices grouped into stretches of one offset each. A slice that
+    disagrees with its stretch starts a new one only when the next good slice
+    agrees with it; alone, it is noise and is skipped."""
+    good = _pw_good(sl)
+    segs: list = []
+    for i, s in enumerate(good):
+        if segs and abs(s["late"] - float(np.median([x["late"] for x in segs[-1][-3:]]))) <= PW_JUMP:
+            segs[-1].append(s)
+            continue
+        nxt = good[i + 1] if i + 1 < len(good) else None
+        strong = s["r"] >= 0.45 and s.get("margin", 0) >= 0.15
+        if not segs or (nxt is not None and abs(nxt["late"] - s["late"]) <= 0.3) or (nxt is None and strong):
+            segs.append([s])
+    # A STRETCH OF ONE SLICE stands only at the very start or the very end -
+    # the last 90 s of Blue Skies S01E02 were 1.5 s late with nothing after
+    # them to agree - and only when its match is unmistakable.
+    return [g for g in segs if len(g) >= 2 or (g[0]["r"] >= 0.45 and g[0].get("margin", 0) >= 0.15)]
+
+
+def pw_fit(seg: list) -> tuple[float, float]:
+    """(k, d) so that cue time x k + d is in step for this stretch: a plain
+    shift, or a shift and a rate when the stretch is long and a line through
+    its slices fits clearly better than a flat one."""
+    t = np.array([s["t"] * 60 + s.get("len", 1.5) * 30 for s in seg])
+    y = np.array([s["late"] for s in seg])
+    w = np.array([s["r"] for s in seg])
+    k, d = 1.0, -float(np.median(y))
+    if len(seg) >= 4:
+        A = np.vstack([np.ones_like(t), t]).T * w[:, None]
+        try:
+            (a, b), *_ = np.linalg.lstsq(A, y * w, rcond=None)
+        except Exception:                                        # noqa: BLE001
+            return k, d
+        flat = float(np.median(np.abs(y - np.median(y))))
+        line = float(np.median(np.abs(y - (a + b * t))))
+        if 2e-5 <= abs(b) <= 0.06 and line < flat * 0.7:
+            k, d = 1.0 - b, -float(a)
+    return k, round(d, 3)
+
+
+def _pear(x: np.ndarray, y: np.ndarray) -> float:
+    x, y = x - x.mean(), y - y.mean()
+    d = np.linalg.norm(x) * np.linalg.norm(y)
+    return float(np.dot(x, y) / d) if d else 0.0
+
+
+def pw_break(sp: np.ndarray, cs: list, lo: float, hi: float, pa: dict, pb: dict) -> float:
+    """Where stretch A ends and B begins (in subtitle time), between lo and
+    hi: the point that lines the cues up best when A's map is used before it
+    and B's after - then snapped to the nearest gap in the lines, since a cut
+    falls between two lines, not inside one."""
+    n = len(sp)
+    a0, a1 = max(0, int((lo - 10) / STEP)), min(n, int((hi + 10) / STEP))
+    x = sp[a0:a1]
+    near = [(a, b) for a, b in cs if lo - 40 < a < hi + 40]
+    best, bt = -2.0, (lo + hi) / 2
+    for T in np.arange(lo, hi + 1e-6, 2.0):
+        s = np.zeros(a1 - a0, np.float32)
+        for a, b in near:
+            p = pa if a < T else pb
+            i, j = int((a * p["k"] + p["d"]) / STEP) - a0, int((b * p["k"] + p["d"]) / STEP) - a0
+            if j > 0 and i < len(s):
+                s[max(0, i):min(len(s), j)] = 1
+        r = _pear(x, s) if x.any() and s.any() else -1.0
+        if r > best:
+            best, bt = r, float(T)
+    gaps = [((c0[1] + c1[0]) / 2, c1[0] - c0[1]) for c0, c1 in zip(cs, cs[1:])
+            if c1[0] - c0[1] >= 1.0 and abs((c0[1] + c1[0]) / 2 - bt) <= 12]
+    if gaps:
+        bt = max(gaps, key=lambda g: g[1])[0]
+    return round(bt, 2)
+
+
+def pw_apply(cs: list, pieces: list) -> list:
+    """Every cue moved by the piece its start falls in; a cue that would then
+    start before the one ahead of it ends (a step the other way) is held back
+    to just after it."""
+    out, prev_end = [], -1e9
+    for a, b in cs:
+        p = next(p for p in pieces if p["to"] is None or a < p["to"])
+        na, nb = a * p["k"] + p["d"], b * p["k"] + p["d"]
+        if na < prev_end + 0.001:
+            na = prev_end + 0.001
+        nb = max(nb, na + 0.3)
+        out.append((na, nb))
+        prev_end = nb
+    return out
+
+
+def pw_orphans(sp: np.ndarray, mapped: list, cs: list, bounds: list) -> list:
+    """Starts (original time) of lines nobody says: a run of six or more cues
+    over at least 20 s with no speech within a second of any of them, next
+    to a break - a scene this cut does not have. Anything less is left."""
+    n = len(sp)
+    silent = []
+    for a, b in mapped:
+        i, j = max(0, int((a - 1.0) / STEP)), min(n, int((b + 1.0) / STEP))
+        silent.append(not sp[i:j].any())
+    drop: list = []
+    i = 0
+    while i < len(silent):
+        if not silent[i]:
+            i += 1
+            continue
+        j = i
+        while j < len(silent) and silent[j]:
+            j += 1
+        span = mapped[j - 1][1] - mapped[i][0]
+        if j - i >= 6 and span >= 20 and any(abs(T - cs[i][0]) < 60 or abs(T - cs[j - 1][1]) < 60 for T in bounds):
+            drop.extend(round(cs[k][0], 3) for k in range(i, j))
+        i = j
+    return drop
+
+
+def _mmss(t: float) -> str:
+    return f"{int(t // 60)}:{int(t % 60):02d}"
+
+
+def pw_measure(sp: np.ndarray, cs: list, dur: float) -> dict | None:
+    """The piecewise map for one track, proved, or None when the slices do
+    not fall into two or more stretches or the map does not bring them into
+    step. WINDOWS/MASK must already be the dense, whole-file ones."""
+    before = slices(sp, cs, 1.0, 0.0, dur)
+    segs = pw_segments(before)
+    if len(segs) < 2:
+        return None
+    fits = [pw_fit(g) for g in segs]
+    pieces, bounds = [], []
+    for i in range(len(segs) - 1):
+        last, first = segs[i][-1], segs[i + 1][0]
+        lo = last["t"] * 60 + last.get("len", 1.5) * 60 - PW_WIN / 2
+        hi = first["t"] * 60 + PW_WIN / 2
+        pa = {"k": fits[i][0], "d": fits[i][1]}
+        pb = {"k": fits[i + 1][0], "d": fits[i + 1][1]}
+        T = pw_break(sp, cs, max(0.0, lo), min(dur, hi), pa, pb)
+        if bounds and T <= bounds[-1]:
+            T = bounds[-1] + 1.0
+        bounds.append(T)
+    for i, (k, d) in enumerate(fits):
+        pieces.append({"from": bounds[i - 1] if i else 0.0, "to": bounds[i] if i < len(bounds) else None,
+                       "k": round(k, 7), "d": d})
+    mapped = pw_apply(cs, pieces)
+    drops = pw_orphans(sp, mapped, cs, bounds)
+    if drops:
+        dset = set(drops)
+        mapped = [m for m, c in zip(mapped, cs) if round(c[0], 3) not in dset]
+    after = slices(sp, mapped, 1.0, 0.0, dur)
+    bs, as_ = _sum(before), _sum(after)
+    heard = sum(1 for x in before if x["late"] is not None)
+    r0, r1 = _r(sp, _raster(cs, 1.0, 0.0, len(sp), STEP)), _r(sp, _raster(mapped, 1.0, 0.0, len(sp), STEP))
+    ok = (as_.get("n", 0) >= max(2, int(0.6 * heard)) and as_["median_abs"] is not None and as_["median_abs"] <= 0.2
+          and as_["within"] >= 0.75 and r1 >= r0 + 0.01
+          and (bs["median_abs"] is None or as_["median_abs"] <= max(0.1, bs["median_abs"] * 0.6)))
+    words = ", ".join(f"{_mmss(p['from'])}-{_mmss(p['to']) if p['to'] is not None else 'end'} "
+                      f"{'moved ' + ('%+.2f' % p['d']) + 's' if p['k'] == 1.0 else 'x %.6f %+.2fs' % (p['k'], p['d'])}"
+                      for p in pieces)
+    why = (f"timed to another cut - {len(pieces)} stretches: {words}"
+           + (f"; {len(drops)} lines nobody says dropped" if drops else "")
+           + (f"; corrected every slice is within {as_['median_abs']:.2f}s" if ok
+              else f"; even so {int((1 - as_.get('within', 0)) * 100)}% of slices stay out - left alone"))
+    return {"ok": ok, "pieces": pieces, "drops": drops, "before": before, "after": after,
+            "before_sum": bs, "after_sum": as_, "r_before": round(r0, 3), "r_after": round(r1, 3), "why": why}
+
+
+def pw_stage(src: str, dur: float, tracks: list, sps: list, allc: dict, sampled: bool) -> None:
+    """Give every still-messy track the close look. A sampled file is heard
+    again end to end (once, for every track at once) first."""
+    global WINDOWS, MASK
+    if sampled:
+        a_ords = sorted({t["audio_ord"] for t in tracks})
+        lgs = {i: lg for i, lg, _ in sps}
+        print(f"PROG 0/1 hearing the whole file for a closer look", file=sys.stderr, flush=True)
+        spd, cues = read_all(src, dur, [(0.0, dur)], [(i, lgs.get(i, "und")) for i in a_ords], tracks)
+    else:
+        spd = {i: s for i, _, s in sps}
+        cues = allc
+    WINDOWS = pw_windows(dur)
+    MASK = np.ones(int(dur / STEP) + 2, np.float32)
+    for t in tracks:
+        sp, cs = spd.get(t["audio_ord"]), cues.get(t["ord"]) or []
+        if sp is None or len(cs) < MIN_CUES:
+            continue
+        try:
+            m = pw_measure(sp, cs, dur)
+        except Exception as e:                                   # noqa: BLE001
+            t["pw_error"] = f"{type(e).__name__}: {e}"[:200]
+            continue
+        if m is None:
+            continue
+        t["pw_why"] = m["why"]
+        if not m["ok"]:
+            continue
+        t.update(verdict="piecewise", why=m["why"], pieces=m["pieces"], drops=m["drops"],
+                 before=m["before"], after=m["after"], before_sum=m["before_sum"], after_sum=m["after_sum"],
+                 r_before=m["r_before"], r_after=m["r_after"], slice_s=PW_WIN)
+        t.pop("rate", None)
+        t.pop("rate_name", None)
+        t.pop("offset", None)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True)
@@ -579,6 +812,12 @@ def main() -> int:
                 for k_ in [k_ for k_ in list(t) if k_ not in ("ord", "codec", "lang", "title", "forced")]:
                     t.pop(k_)
                 measure(t)
+    # TIMED TO ANOTHER CUT: whatever is still messy gets the close look
+    # (pw_stage above) - heard end to end, one offset per stretch.
+    if not a.check_only and dur <= PW_MAX_DUR:
+        again = [t for t in todo if t.get("verdict") == "messy" and "audio_ord" in t]
+        if again:
+            pw_stage(a.src, dur, again, sps, allc, sampled)
     print(json.dumps({"ok": True, "duration": dur, "speech_min": round(float(sp.sum()) * STEP / 60, 1),
                       "audio": [lg for _, lg in a_list], "sampled": sampled,
                       "heard_min": round(sum(b - a for a, b in WINDOWS) / 60, 1), "tracks": tracks}))

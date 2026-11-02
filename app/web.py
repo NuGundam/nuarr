@@ -39156,9 +39156,10 @@ async function loadSubai(){
 }
 // ---- subtitle timing (subtiming.py) ----
 let _stm=null, _stmOpen=null, _stmMsg=null, _stmTimer=null;
-const STM_V={ok:['#3fb950','in step'],offset:['#e3b341','offset'],drift:['#e3b341','drift'],messy:['#e0575b','out of step'],
+const STM_V={ok:['#3fb950','in step'],offset:['#e3b341','offset'],drift:['#e3b341','drift'],piecewise:['#e3b341','another cut'],messy:['#e0575b','out of step'],
   unsure:['#8b949e','unsure'],skipped:['#8b949e','skipped'],failed:['#e0575b','failed'],off:['#e0575b','still off']};
 function stmWord(v){ const c=STM_V[v]||['#8b949e',v||'-']; return `<span style="color:${c[0]}">${esc(c[1])}</span>`; }
+function stmMmss(t){ return Math.floor(t/60)+':'+String(Math.floor(t%60)).padStart(2,'0'); }
 async function stmLoad(){
   try{ _stm=await (await fetch('/api/subtiming')).json(); }catch(e){ return; }
   stmPaint();
@@ -39180,7 +39181,7 @@ function stmPaint(){
     <div class="lkindhead"><b style="color:#6ee7f7">Subtitle timing</b>
       <span class="dim" style="font-size:11px">${v.running?'at work':v.last_run?'last check '+ago(v.last_run):'has not run yet'}</span>
       <span style="margin-left:auto;display:flex;gap:6px;align-items:center;font-size:11px">
-        <select onchange="stmMode(this.value)" style="font-size:11px" title="off: never runs. advise: measures and lists, changes nothing. auto: corrects a fixed offset or a frame-rate drift in place, after proving the result is in step.">
+        <select onchange="stmMode(this.value)" style="font-size:11px" title="off: never runs. advise: measures and lists, changes nothing. auto: corrects a fixed offset, a frame-rate drift or a track timed to another cut (one offset per stretch) in place, after proving the result is in step.">
           ${[['off','off'],['advise','advise only'],['auto','auto - fix in place']].map(([k,w])=>`<option value="${k}" ${v.mode===k?'selected':''}>${w}</option>`).join('')}</select>
         <input id="stmN" type="number" min="1" max="600" value="${v.per_hour}" style="width:62px;box-sizing:border-box;font-size:11px" oninput="stmNLabel(this.value)" onchange="stmBudget(this.value)">/hour
         <span class="dim" title="set on the Concurrency page - Subtitle timing checks at once">${v.workers||1} at once</span>
@@ -39203,7 +39204,8 @@ function stmPaint(){
       `<div class="dim" style="font-size:11px;margin:0 0 4px">${v.mode==='off'?'switched off - nothing runs':v.paused?'paused on the Concurrency page':v.waiting>0?`idle - next pass ${v.next_run&&v.next_run>Date.now()/1000?'in '+Math.max(1,Math.round((v.next_run-Date.now()/1000)/60))+' min':'within 2 minutes'}`:'idle - every file has been checked'}${v.last_result?' · last: '+esc(v.last_result):''}</div>`}
     <div class="dim" style="font-size:11px;margin:4px 0 2px">Checks every text subtitle once against where the audio has speech, newest files first. A track that is <b>late or early by a fixed amount</b>,
       or that <b>drifts</b> because it was timed for another frame rate, is shifted in place with mkvmerge and measured again before the file is replaced.
-      A track off in any other way is listed and left alone. The numbers per row are seconds late (+) or early (−), five minutes at a time.</div>
+      A track off in neither of those ways gets a closer look: the whole file is heard, 90 s at a time, and when the lines fall into <b>stretches with one offset each</b> - a track timed to another cut of the episode -
+      each stretch is moved on its own, the breaks placed in gaps between lines, and the cue times rewritten; that too is measured again before the file is replaced. What even that cannot straighten is listed and left alone. The numbers per row are seconds late (+) or early (−), five minutes at a time.</div>
     <div style="display:flex;gap:6px;align-items:center;margin:6px 0;font-size:11px">check one file:
       <input id="stmPath" placeholder="full path of a file in the library" style="font-size:11px;flex:1;max-width:520px">
       <button class="rmb" onclick="stmOne(this)">Check</button></div>
@@ -39223,7 +39225,8 @@ function stmPaint(){
               <div class="mono" style="font-size:10.5px;margin-top:2px"><span class="dim" style="display:inline-block;width:92px">as it was</span>${stmSlices(t.before)}</div>
               ${t.after&&t.verdict!=='ok'?`<div class="mono" style="font-size:10.5px"><span class="dim" style="display:inline-block;width:92px">${t.fixed?'corrected':'if corrected'}</span>${stmSlices(t.after)}</div>`:''}
               ${t.check&&t.check.length?`<div class="mono" style="font-size:10.5px"><span class="dim" style="display:inline-block;width:92px">measured after</span>${stmSlices(t.check)}</div>`:''}
-              ${t.verdict!=='ok'&&t.rate?`<div class="dim" style="font-size:10.5px">correction: ${t.rate!==1?'× '+t.rate.toFixed(6)+' ('+esc(t.rate_name)+')':''}${t.offset?' shift '+(t.offset>0?'+':'')+t.offset.toFixed(2)+'s':''}</div>`:''}</div>`).join('')}
+              ${t.verdict!=='ok'&&t.rate?`<div class="dim" style="font-size:10.5px">correction: ${t.rate!==1?'× '+t.rate.toFixed(6)+' ('+esc(t.rate_name)+')':''}${t.offset?' shift '+(t.offset>0?'+':'')+t.offset.toFixed(2)+'s':''}</div>`:''}
+              ${t.pieces?`<div class="dim" style="font-size:10.5px">correction, one stretch at a time${t.slice_s?' (slices of '+Math.round(t.slice_s)+' s)':''}: ${t.pieces.map(p=>`${stmMmss(p.from)}-${p.to==null?'end':stmMmss(p.to)} ${p.k!==1?'× '+p.k.toFixed(6)+' ':''}${p.d>0?'+':''}${p.d.toFixed(2)}s`).join(' · ')}${t.drops&&t.drops.length?' · '+t.drops.length+' lines nobody says dropped':''}${t.moved?' · '+t.moved+' cues moved':''}</div>`:''}</div>`).join('')}
             <div class="dim">took ${r.secs}s</div></td></tr>`:''}`; }).join('')}
       </tbody></table></div>`:`<div class="dim" style="font-size:11px">Nothing out of step found yet${v.total?` in ${fmt(v.total)} checked`:''}.</div>`}
   </div>`;
