@@ -31296,10 +31296,12 @@ function tmCpuView(H, cores){
     // somewhere unrelated.
     (T.c!=null
       ? tmFig('temperature',
-              `<span style="color:${tmTempColour(T.c)}">${Math.round(T.c)}°C</span>`,
+              `<span style="color:${tmTempColour(T.c,T.tjmax!=null?T.tjmax-10:null,T.tjmax)}">${Math.round(T.c)}°C</span>`
+              + (T.tjmax!=null?`<span class="dim" style="font-size:10.5px" title="TjMax, read from the chip: the hottest core plus its own distance to the limit"> / ${Math.round(T.tjmax)}°</span>`:''),
               (T.max!=null?`hottest core ${Math.round(T.max)}° · avg ${Math.round(T.avg||0)}°`
                           :esc(T.what||''))
-              + (T.tjmax_margin!=null?` · ${Math.round(T.tjmax_margin)}° to TjMax`:'')
+              + (T.tjmax!=null?` · TjMax ${Math.round(T.tjmax)}°, ${Math.round(T.tjmax_margin)}° left`
+                 :T.tjmax_margin!=null?` · ${Math.round(T.tjmax_margin)}° to TjMax`:'')
               + `<span title="${esc((T.what||'')+(T.chip?' on '+T.chip:'')+' · '+(T.source||''))}"></span>`)
       : T.opening
       ? tmFig('temperature', '<span class="dim">…</span>', 'opening the sensor driver')
@@ -31331,7 +31333,7 @@ function tmCpuView(H, cores){
     const tc = perThread ? perCore[Math.floor(i / perThread)] : null;
     return `<div class="lkind" style="padding:6px 8px">
       <div style="display:flex;justify-content:space-between;font-size:10.5px">
-        <span class="dim">core ${i}${tc!=null?` <span style="color:${tmTempColour(tc)}">${Math.round(tc)}°</span>`:''}</span>
+        <span class="dim">core ${i}${tc!=null?` <span style="color:${tmTempColour(tc,T.tjmax!=null?T.tjmax-10:null,T.tjmax)}">${Math.round(tc)}°</span>`:''}</span>
         <b class="mono" style="color:${v>90?'#f0883e':v>60?'#e8a33d':'inherit'}">${Math.round(v)}%</b>
       </div>${tmBar(v, null, 5)}
       ${tmSpark(R.map(r=>r.pct[i]), '#58a6ff', 100)}</div>`;}).join('');
@@ -31414,8 +31416,12 @@ function tmGpuView(H){
     tmFig('clocks', tmHz(c.clock_sm), c.clock_sm_max?`of ${tmHz(c.clock_sm_max)}`:''),
     tmFig('power', c.power!=null?`${Math.round(c.power)} W`:'—',
           c.power_limit?`of ${Math.round(c.power_limit)} W`:''),
-    tmFig('temperature', c.temp_c!=null?`${Math.round(c.temp_c)}°C`:'—',
-          c.fan!=null?`fan ${Math.round(c.fan)}%`:''),
+    tmFig('temperature', tmTempLim(c.temp_c, c.temp_max_op, c.temp_slowdown,
+                                   'the card\'s max operating temperature, from its driver'),
+          (c.fan!=null?`fan ${Math.round(c.fan)}%`:'')
+          + (c.temp_slowdown!=null&&c.temp_c!=null
+             ?` · slows at ${Math.round(c.temp_slowdown)}°, ${Math.round(c.temp_slowdown-c.temp_c)}° left`
+              +(c.temp_shutdown!=null?` · off at ${Math.round(c.temp_shutdown)}°`:''):'')),
     tmFig('encode sessions', c.sessions!=null?fmt(c.sessions):'—',
           c.session_fps?`${Math.round(c.session_fps)} fps · ${Math.round(c.session_latency||0)} µs`:''),
   ];
@@ -31680,7 +31686,7 @@ function dwPopHtml(key){
     rows.push(`<b>load cycles</b> ${fmt(d.load_cycles||0)}`+dim('times the heads have parked'));
     rows.push(`<b>start/stops</b> ${fmt(d.starts||0)} · <b>spin retries</b> <span style="color:${d.spin_retry?'#d29922':'inherit'}">${fmt(d.spin_retry||0)}</span>`);
   }
-  rows.push(`<b>temperature</b> ${d.temp_c!=null?d.temp_c+'°C':'—'} · <b>powered on</b> ${(d.power_hours/8766).toFixed(1)} years`+dim(fmt(d.power_hours)+' hours'));
+  rows.push(`<b>temperature</b> ${d.temp_c!=null?d.temp_c+'°C':'—'}${d.temp_warn_c!=null?` <span class="dim">(warns at ${d.temp_warn_c}°C${d.temp_crit_c!=null?', limit '+d.temp_crit_c+'°C':''})</span>`:''} · <b>powered on</b> ${(d.power_hours/8766).toFixed(1)} years`+dim(fmt(d.power_hours)+' hours'));
   const status = d.ignored ? 'Warning ignored — it comes back '+(d.rearm_at?'at '+d.rearm_at+'%':'when something new appears')+'.'
     : (d.problems||[]).length ? d.problems.join('; ')
     : d.warn ? 'Past the '+((_dw&&_dw.warn_at)||80)+'% line.'
@@ -31736,7 +31742,7 @@ function dwTable(){
     + tmCell(S[4], `<span class="mono" title="${esc(d.rate_basis||'')}">${d.per_day?TB(d.per_day):'—'}</span>`)
     + tmCell(S[5], `<span class="mono" style="color:${d.days_left!=null&&d.days_left<90?'#e3b341':'inherit'}" title="${d.days_left==null?'the drive reports no percentage to project from':''}">${d.days_left!=null?'~'+fmt(d.days_left)+' d':'n/a'}</span>`)
     + tmCell(S[6], `<span class="mono" title="the drive warns at ${d.spare_thr}%" style="color:${d.spare<=d.spare_thr?'#e0575b':'inherit'}">${d.spare}%</span>`)
-    + tmCell(S[7], `<span class="mono">${d.temp_c!=null?d.temp_c+'°C':'—'}</span>`)
+    + tmCell(S[7], `<span class="mono" title="${esc(d.temp_limit_src||'no limit stated by this drive')}${d.temp_crit_c!=null?' · critical at '+d.temp_crit_c+'°C':''}">${tmTempLim(d.temp_c, d.temp_warn_c, d.temp_crit_c, d.temp_limit_src)}</span>`)
     + tmCell(S[8], `<span class="mono" title="${fmt(d.power_hours)} hours">${yrs(d.power_hours)}</span>`)
     + tmCell(S[9], `<span class="mono" title="media errors / unsafe shutdowns" style="color:${d.media_errors?'#e0575b':'inherit'}">${fmt(d.media_errors)} / ${fmt(d.unsafe)}</span>`)
     + tmCell(S[10], btn(d))); }).join('');
@@ -31754,7 +31760,7 @@ function dwTable(){
     + tmCell(Hc[6], `<span class="mono" style="color:${d.helium!=null&&d.helium<100?'#e0575b':'inherit'}">${d.helium!=null?d.helium+'%':'—'}</span>`)
     + tmCell(Hc[7], `<span class="mono">${fmt(d.load_cycles||0)}</span>`)
     + tmCell(Hc[8], `<span class="mono">${fmt(d.starts||0)}</span>`)
-    + tmCell(Hc[9], `<span class="mono">${d.temp_c!=null?d.temp_c+'°C':'—'}</span>`)
+    + tmCell(Hc[9], `<span class="mono" title="${esc(d.temp_limit_src||'no limit stated by this drive')}${d.temp_crit_c!=null?' · limit '+d.temp_crit_c+'°C':''}">${tmTempLim(d.temp_c, d.temp_warn_c, d.temp_crit_c, d.temp_limit_src)}</span>`)
     + tmCell(Hc[10], `<span class="mono" title="${fmt(d.power_hours)} hours" style="color:${d.age?'#d29922':'inherit'}">${yrs(d.power_hours)}</span>`)
     + tmCell(Hc[11], btn(d)))).join('');
 
@@ -31805,8 +31811,34 @@ function tmGpuProcs(procs){
         margin-top:3px">${rest.map(row).join('')}</table></details>`:''}`;
 }
 // The same three steps the card uses for its own temperature.
-function tmTempColour(c){
-  return c>=85 ? '#f0883e' : c>=70 ? '#e8a33d' : 'inherit';
+// AGAINST THE DEVICE'S OWN LINE. warn = where it warns (or throttles),
+// crit = where it gives up. At or past warn is orange, within 10 degrees of
+// it amber; with no stated limit the old 70/85 rule stands.
+// FIVE LEVELS, MEASURED FROM THE DEVICE'S OWN WARNING LINE (w):
+//   cool   more than 25 below w   green
+//   warm   25-15 below            yellow-green
+//   hot    15-5 below             amber
+//   near   within 5 of w          orange
+//   over   at or past w           red (past the critical line too)
+// A device that states no limit is measured against 85 as its line.
+const TM_TEMP_LEVELS = [['#7fd4a3','cool'],['#c7d36b','warm'],['#e8a33d','hot'],['#f0883e','near its limit'],['#e5534b','at or past its limit']];
+function tmTempLevel(c, warn, crit){
+  if(c==null) return -1;
+  const w = warn!=null ? warn : crit!=null ? crit-5 : 85;
+  const d = w - c;
+  return d<=0 ? 4 : d<=5 ? 3 : d<=15 ? 2 : d<=25 ? 1 : 0;
+}
+function tmTempColour(c, warn, crit){
+  const L = tmTempLevel(c, warn, crit);
+  return L<0 ? 'inherit' : TM_TEMP_LEVELS[L][0];
+}
+function tmTempLim(c, warn, crit, word){
+  if(c==null) return '—';
+  const L = tmTempLevel(c, warn, crit);
+  const shown = `<span style="color:${tmTempColour(c,warn,crit)};font-weight:${L>=3?700:600}" title="${L>=0?TM_TEMP_LEVELS[L][1]:''}">${Math.round(c)}°C</span>`;
+  if(warn==null && crit==null) return shown;
+  const lim = warn!=null ? warn : crit;
+  return shown+`<span class="dim" style="font-size:10.5px" title="${esc(word||'')}"> / ${Math.round(lim)}°</span>`;
 }
 function tmThrottle(v){
   const t = (v||'').trim();

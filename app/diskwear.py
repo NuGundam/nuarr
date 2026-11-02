@@ -60,6 +60,9 @@ KV_BASE = "diskwear.base"           # {key: {"realloc", "crc"}} first counts see
 
 _IOCTL_QUERY = 0x002D1400
 _IOCTL_SMART_RCV = 0x0007C088
+_IOCTL_SMART_SEND = 0x0007C084
+_IDENTIFY = 1                     # NVMeDataTypeIdentify; CNS 1 = controller
+_LIMITS: dict = {}                # key -> {"warn_c", "crit_c", "src"}, once per process
 _IOCTL_VOL_EXTENTS = 0x00560000
 _PROTO_PROP, _DEVICE_PROP = 50, 0
 _NVME, _LOGPAGE, _HEALTH = 3, 2, 2
@@ -130,6 +133,43 @@ def _nvme(h) -> dict | None:
             "written": le(log[48:64]) * 512000, "read": le(log[32:48]) * 512000,
             "power_hours": le(log[128:144]), "unsafe": le(log[144:160]),
             "media_errors": le(log[160:176])}
+
+
+def _nvme_limits(h) -> dict:
+    """WCTEMP / CCTEMP from Identify Controller (bytes 266-269, kelvin): the
+    composite temperature where the drive warns, and where it is critical."""
+    spsd = struct.pack("<IIIIIIIIII", _NVME, _IDENTIFY, 1, 0, 40, 4096, 0, 0, 0, 0)
+    raw = _ioctl(h, _IOCTL_QUERY, struct.pack("<II", _PROTO_PROP, 0) + spsd, 8 + 40 + 4096)
+    if not raw or len(raw) < 8 + 40:
+        return {}
+    off = struct.unpack_from("<I", raw, 8 + 16)[0]
+    idc = raw[8 + off: 8 + off + 4096]
+    if len(idc) < 270:
+        return {}
+    w, c = struct.unpack_from("<HH", idc, 266)
+    return {"warn_c": (w - 273) if w else None, "crit_c": (c - 273) if c else None,
+            "src": "the drive's own warning / critical temperature (WCTEMP / CCTEMP)"}
+
+
+def _sct_limits(h) -> dict:
+    """The SCT temperature table a SATA drive keeps: its recommended maximum
+    and its absolute limit. Asking for it is SMART WRITE LOG E0 with the SCT
+    'read data table 2' command, then READ LOG E1 - what smartctl -l scttemp
+    does; the drive only copies its table into the log."""
+    cmd = struct.pack("<HHH", 5, 1, 2) + b"\0" * 506
+    regs = bytes([0xD6, 1, 0xE0, 0x4F, 0xC2, 0xA0, 0xB0, 0])
+    if _ioctl(h, _IOCTL_SMART_SEND, struct.pack("<I", 512) + regs + b"\0" * 20 + cmd, 16 + 512) is None:
+        return {}
+    regs = bytes([0xD5, 1, 0xE1, 0x4F, 0xC2, 0xA0, 0xB0, 0])
+    raw = _ioctl(h, _IOCTL_SMART_RCV, struct.pack("<I", 512) + regs + b"\0" * 21, 4096)
+    if not raw or len(raw) < 16 + 16:
+        return {}
+    t = raw[16:16 + 512]
+    if struct.unpack_from("<H", t, 0)[0] not in (2, 3):         # table format version
+        return {}
+    mx, over = struct.unpack_from("<bb", t, 6)
+    return {"warn_c": mx or None, "crit_c": over or None,
+            "src": "the drive's own SCT table: recommended maximum / limit"}
 
 
 def _smart(h) -> dict | None:
@@ -241,6 +281,12 @@ def read(fresh: bool = False) -> list:
             if not hl and not sm:
                 continue                   # virtual disk (the pool), or no log
             model = _model(h)
+            lk = f"{model}#{n}"
+            if lk not in _LIMITS:
+                try:
+                    _LIMITS[lk] = _nvme_limits(h) if hl else _sct_limits(h)
+                except Exception:                            # noqa: BLE001
+                    _LIMITS[lk] = {}
         finally:
             _k32.CloseHandle(h)
         # AND BY NAME, BECAUSE UNDER THE SERVICE IT DOES ANSWER: run as nuarr,
@@ -313,6 +359,9 @@ def read(fresh: bool = False) -> list:
         ig = ign_all.get(key)
         ignored = bool(ig and raw_warn and d.get("used_pct", 0) < int(ig.get("pct", 0)) + STEP
                        and set(bad) <= set(ig.get("problems") or []))
+        lim = _LIMITS.get(key) or {}
+        d.update(temp_warn_c=lim.get("warn_c"), temp_crit_c=lim.get("crit_c"),
+                 temp_limit_src=lim.get("src") or "")
         d.update(problems=bad, notes=notes, raw_warn=raw_warn, ignored=ignored,
                  ignored_at=(ig or {}).get("at") if ignored else None,
                  rearm_at=(int(ig.get("pct", 0)) + STEP) if ignored and d["type"] == "ssd" else None,

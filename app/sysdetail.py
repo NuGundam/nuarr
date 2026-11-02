@@ -120,6 +120,7 @@ def _cpu_temp() -> dict:
                    "cores": [round(float(v)) for v in (t.get("cores") or [])],
                    "max": t.get("max"), "avg": t.get("avg"),
                    "tjmax_margin": t.get("tjmax_margin"),
+                   "tjmax": t.get("tjmax"),
                    "chip": t.get("chip") or ""}
             # A DRIVER READ IS FRESHER THAN A WMI ONE, so it is not held
             # for the full ten seconds - cputemp paces itself.
@@ -324,6 +325,38 @@ _GPU_D: tuple = (0.0, {})
 _GPU_D_TTL = 2.0
 
 
+_GPU_LIM: dict = {}
+
+
+def _gpu_limits(exe: str) -> dict:
+    """The card's temperature limits, as its driver states them. Fixed by
+    the board, so asked once per process."""
+    if _GPU_LIM.get("done"):
+        return _GPU_LIM
+    try:
+        r = subprocess.run([exe, "-q", "-d", "TEMPERATURE"], capture_output=True, timeout=8,
+                           creationflags=NO_WINDOW, startupinfo=hidden_si())
+        for ln in r.stdout.decode("utf-8", "replace").splitlines():
+            k, _, v = ln.partition(":")
+            k = k.strip().lower()
+            try:
+                c = float(v.strip().split()[0])
+            except (ValueError, IndexError):
+                continue
+            if k == "gpu shutdown temp":
+                _GPU_LIM["shutdown"] = c
+            elif k == "gpu slowdown temp":
+                _GPU_LIM["slowdown"] = c
+            elif k == "gpu max operating temp":
+                _GPU_LIM["max_op"] = c
+            elif k == "gpu target temperature specification":
+                _GPU_LIM["target"] = c
+        _GPU_LIM["done"] = True
+    except Exception:                                        # noqa: BLE001
+        pass
+    return _GPU_LIM
+
+
 def gpu() -> dict:
     """The card in full: clocks, power, both video engines, and its sessions.
 
@@ -342,6 +375,7 @@ def gpu() -> dict:
         out["why"] = "nvidia-smi is not on this machine"
         _GPU_D = (now, out)
         return out
+    lim = _gpu_limits(exe)
     fields = ["name", "driver_version", "pstate", "temperature.gpu",
               "utilization.gpu", "utilization.encoder", "utilization.decoder",
               "utilization.memory", "memory.used", "memory.total",
@@ -375,6 +409,10 @@ def gpu() -> dict:
             "sessions": num(17), "session_fps": num(18),
             "session_latency": num(19),
             "throttle": (vals[20] if len(vals) > 20 else ""),
+            # THE CARD'S OWN LINES: max operating, where it starts slowing
+            # its clocks, and where it shuts down.
+            "temp_max_op": lim.get("max_op"), "temp_slowdown": lim.get("slowdown"),
+            "temp_shutdown": lim.get("shutdown"), "temp_target": lim.get("target"),
         }
     except Exception as e:                                   # noqa: BLE001
         out["why"] = f"could not read the card: {type(e).__name__}"

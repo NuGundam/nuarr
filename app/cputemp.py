@@ -140,6 +140,11 @@ def _read_now() -> dict:
         out["max"] = max(out["cores"])
     if out["avg"] is None and out["cores"]:
         out["avg"] = round(sum(out["cores"]) / len(out["cores"]), 1)
+    # TJMAX ITSELF, from the chip: the hottest core plus its own distance to
+    # the limit. Read live rather than looked up, so it is right for whatever
+    # chip is in the socket (and for one with a lowered TjMax offset).
+    out["tjmax"] = (round(out["max"] + out["tjmax_margin"])
+                    if out["max"] is not None and out["tjmax_margin"] is not None else None)
     return out
 
 
