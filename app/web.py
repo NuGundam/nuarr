@@ -31796,10 +31796,15 @@ function dwCtlTable(C){
       : d.warn?'past the '+((_dw&&_dw.warn_at)||80)+'% line'
       : (d.notes||[]).length?d.notes.join(' · ') : 'healthy';
   const nameCell=(c,d,q)=>{ const L=look(d), sub=(d.labels||[]).filter(l=>l&&l!==d.name).join(' · ');
-    return tmCell(c, (q?`<span class="dim mono" style="font-size:10px">port ${q.port}</span> `:'')
-      + `<b style="color:${L.col}">${esc(d.name)}</b> <span class="mono" style="font-size:10.5px">${esc(d.model||'')}</span>`
+    // NOT tmCell: that one forbids wrapping, and this cell carries three lines
+    // - name, the full model, the status - none of which may be clipped.
+    return `<td style="text-align:left;padding:3px 6px;white-space:normal;overflow:hidden;line-height:1.3">`
+      + (q?`<span class="dim mono" style="font-size:10px">port ${q.port}</span> `:'')
+      + `<b style="color:${diskColor(d.name)}">${esc(d.name)}</b>`
       + (sub?`<span class="dim" style="font-size:10px"> ${esc(sub)}</span>`:'')
-      + `<div style="font-size:10px;color:${d.warn?'#e3b341':L.watch?'#d29922':'var(--dim,#8a97a6)'}">${esc(status(d))}</div>`); };
+      + `<span style="width:7px;height:7px;border-radius:50%;display:inline-block;margin-left:6px;background:${L.col}" title="${esc(status(d))}"></span>`
+      + `<div class="mono" style="font-size:10.5px;color:var(--dim,#8a97a6)">${esc(d.model||'')}</div>`
+      + `<div style="font-size:10px;color:${d.warn?'#e3b341':L.watch?'#d29922':'var(--dim,#8a97a6)'}">${esc(status(d))}</div></td>`; };
   const btn=d=>d.raw_warn?`<button class="rmb" style="font-size:10.5px" onmousedown="event.stopPropagation();dwIgnore('${jsq(d.key)}',${d.ignored?0:1},this)"
         title="${d.ignored?'Warn about this drive again now':'Stop warning about this drive until it gets worse'}">${d.ignored?'Un-ignore':'Ignore'}</button>`:'';
   const num=(v,bad)=>`<span class="mono" style="color:${v?bad:'inherit'}">${fmt(v||0)}</span>`;
@@ -31812,10 +31817,10 @@ function dwCtlTable(C){
   const tr=(d,cells)=>`<tr style="border-top:1px solid var(--line);cursor:pointer" data-dpop="health" data-ddisk="${esc(d.key)}" title="click to pin this drive's card">${cells}</tr>`;
   const table=(cols,rows)=>`<table style="width:100%;font-size:11.5px;border-collapse:collapse;table-layout:fixed">${tmCols(cols)}<tbody>${rows}</tbody></table>`;
 
-  const S=[{t:'NVMe / SSD',w:'auto',a:'left'},{t:'link',w:'5%'},{t:'life used',w:'11%',a:'left'},
+  const S=[{t:'NVMe / SSD',w:'auto',a:'left'},{t:'link',w:'4%'},{t:'life used',w:'10%',a:'left'},
            {t:'written',w:'6%'},{t:'per day',w:'6%'},{t:'to 100%',w:'6%'},{t:'spare',w:'5%'},
-           {t:'temp',w:'6%'},{t:'worst write · read',w:'10%'},{t:'retried IO 24h · 30d',w:'9%'},
-           {t:'powered',w:'6%'},{t:'errors',w:'6%'},{t:'',w:'6%'}];
+           {t:'temp',w:'6%'},{t:'worst write · read',w:'9%'},{t:'retried 24h · 30d',w:'8%'},
+           {t:'powered',w:'5%'},{t:'errors',w:'6%'},{t:'',w:'5%'}];
   const ssdRow=(d,q)=>{ const L=look(d); return tr(d,
       nameCell(S[0],d,q)
     + linkCell(S[1],d,q)
@@ -31831,10 +31836,10 @@ function dwCtlTable(C){
     + tmCell(S[11], `<span class="mono" title="media errors / unsafe shutdowns" style="color:${d.media_errors?'#e0575b':'inherit'}">${fmt(d.media_errors)} / ${fmt(d.unsafe)}</span>`)
     + tmCell(S[12], btn(d))); };
 
-  const Hc=[{t:'hard disk',w:'auto',a:'left'},{t:'link',w:'5%'},{t:'reallocated',w:'7%'},{t:'pending',w:'6%'},
-           {t:'uncorrectable',w:'8%'},{t:'cable · timeouts',w:'8%'},{t:'helium',w:'5%'},{t:'load cycles',w:'7%'},
-           {t:'start / stops',w:'7%'},{t:'temp',w:'6%'},{t:'worst write · read',w:'10%'},{t:'retried IO 24h · 30d',w:'9%'},
-           {t:'powered',w:'6%'},{t:'',w:'6%'}];
+  const Hc=[{t:'hard disk',w:'auto',a:'left'},{t:'link',w:'4%'},{t:'reallocated',w:'6%'},{t:'pending',w:'5%'},
+           {t:'uncorrectable',w:'7%'},{t:'cable · timeouts',w:'7%'},{t:'helium',w:'5%'},{t:'load cycles',w:'6%'},
+           {t:'start / stops',w:'6%'},{t:'temp',w:'6%'},{t:'worst write · read',w:'9%'},{t:'retried 24h · 30d',w:'8%'},
+           {t:'powered',w:'5%'},{t:'',w:'5%'}];
   const hddRow=(d,q)=>tr(d,
       nameCell(Hc[0],d,q)
     + linkCell(Hc[1],d,q)
