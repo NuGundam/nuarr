@@ -641,6 +641,14 @@ def pw_measure(sp: np.ndarray, cs: list, dur: float) -> dict | None:
     if len(segs) < 2:
         return None
     fits = [pw_fit(g) for g in segs]
+    # A STRETCH IS ONE OFFSET, OR IT IS NOTHING. Sonic Underground S01E37's
+    # slices went 0, +0.6, 0, +1.0, 0, +0.4 - a scattered track, not two
+    # cuts - yet grouped into two stretches whose medians hid the scatter.
+    # A stretch whose slices sit more than 0.25 s from their own fit is noise.
+    for g, (k, d) in zip(segs, fits):
+        res = [abs(s["late"] - (s["t"] * 60 + s.get("len", 1.5) * 30) * (1 - k) + d) for s in g]
+        if len(g) >= 2 and float(np.median(res)) > 0.25:
+            return {"ok": False, "scatter": True}
     pieces, bounds = [], []
     for i in range(len(segs) - 1):
         last, first = segs[i][-1], segs[i + 1][0]
@@ -665,7 +673,7 @@ def pw_measure(sp: np.ndarray, cs: list, dur: float) -> dict | None:
     heard = sum(1 for x in before if x["late"] is not None)
     r0, r1 = _r(sp, _raster(cs, 1.0, 0.0, len(sp), STEP)), _r(sp, _raster(mapped, 1.0, 0.0, len(sp), STEP))
     ok = (as_.get("n", 0) >= max(2, int(0.6 * heard)) and as_["median_abs"] is not None and as_["median_abs"] <= 0.2
-          and as_["within"] >= 0.75 and r1 >= r0 + 0.01
+          and as_["within"] >= 0.85 and abs(as_.get("worst") or 0) <= 0.6 and r1 >= r0 + 0.01
           and (bs["median_abs"] is None or as_["median_abs"] <= max(0.1, bs["median_abs"] * 0.6)))
     words = ", ".join(f"{_mmss(p['from'])}-{_mmss(p['to']) if p['to'] is not None else 'end'} "
                       f"{'moved ' + ('%+.2f' % p['d']) + 's' if p['k'] == 1.0 else 'x %.6f %+.2fs' % (p['k'], p['d'])}"
@@ -702,6 +710,9 @@ def pw_stage(src: str, dur: float, tracks: list, sps: list, allc: dict, sampled:
             t["pw_error"] = f"{type(e).__name__}: {e}"[:200]
             continue
         if m is None:
+            continue
+        if m.get("scatter"):
+            t["pw_why"] = "the slices scatter within a stretch - not timed to another cut, just uneven"
             continue
         t["pw_why"] = m["why"]
         if not m["ok"]:
