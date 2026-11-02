@@ -31824,8 +31824,8 @@ function dwCtlTable(C){
   const ssdRow=(d,q)=>{ const L=look(d); return tr(d,
       nameCell(S[0],d,q)
     + linkCell(S[1],d,q)
-    + tmCell(S[2], `<div style="display:flex;align-items:center;gap:6px">${tmBar(d.used_pct, L.col, 8)}<span class="mono" style="color:${L.col}">${d.used_pct}%</span></div>`
-        + (d.used_pct===0&&d.written>5e13?'<div class="dim" style="font-size:9.5px">this firmware reports 0% — go by the written total</div>':''))
+    + `<td style="text-align:left;padding:3px 6px;white-space:normal;overflow:hidden;line-height:1.25"><div style="display:flex;align-items:center;gap:6px">${tmBar(d.used_pct, L.col, 8)}<span class="mono" style="color:${L.col}">${d.used_pct}%</span></div>`
+        + (d.used_pct===0&&d.written>5e13?'<div class="dim" style="font-size:9.5px">firmware reports 0% — go by the written total</div>':'')+'</td>'
     + tmCell(S[3], `<span class="mono">${TB(d.written)}</span>`)
     + tmCell(S[4], `<span class="mono" title="${esc(d.rate_basis||'')}">${d.per_day?TB(d.per_day):'—'}</span>`)
     + tmCell(S[5], `<span class="mono" style="color:${d.days_left!=null&&d.days_left<90?'#e3b341':'inherit'}" title="${d.days_left==null?'the drive reports no percentage to project from':''}">${d.days_left!=null?'~'+fmt(d.days_left)+' d':'n/a'}</span>`)
