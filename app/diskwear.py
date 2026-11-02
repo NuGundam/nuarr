@@ -172,6 +172,14 @@ def _sct_limits(h) -> dict:
             "src": "the drive's own SCT table: recommended maximum / limit"}
 
 
+def _hdd_limits(h) -> dict:
+    """A hard disk's stated operating limits, read-only. Filled in once the
+    Device Statistics log (READ LOG EXT 04h page 5) is proven harmless on
+    these controllers; until then no limit, and the page falls back to the
+    fixed line."""
+    return {}
+
+
 def _smart(h) -> dict | None:
     """ATA SMART READ DATA: {attribute id: raw value}."""
     regs = bytes([0xD0, 1, 1, 0x4F, 0xC2, 0xA0, 0xB0, 0])
@@ -284,7 +292,13 @@ def read(fresh: bool = False) -> list:
             lk = f"{model}#{n}"
             if lk not in _LIMITS:
                 try:
-                    _LIMITS[lk] = _nvme_limits(h) if hl else _sct_limits(h)
+                    # NVMe ONLY. The SATA SCT table needs SMART WRITE LOG, and
+                    # through the ASM1166 controllers that command stalled the
+                    # port for 30 s and storahci reset it: 116 "Reset to device"
+                    # events and 32 retried IOs on 2026-11-01, all from the
+                    # afternoon this was being tried, none in the 29 days before.
+                    # Never issued again - see _hdd_limits for the read-only way.
+                    _LIMITS[lk] = _nvme_limits(h) if hl else _hdd_limits(h)
                 except Exception:                            # noqa: BLE001
                     _LIMITS[lk] = {}
         finally:
