@@ -6670,6 +6670,17 @@ def _health_build():
         add("svcnurse", "Are Prowlarr, its proxy and Docker up?", "indexers", 0,
             f"check unavailable: {type(e).__name__}", warn=True)
 
+    # THE CONTROLLERS. Port resets in the last day, a PnP problem, a card
+    # below its PCIe link, a drive negotiated below its SATA speed - all
+    # hardware, all for a person. See satactl.py.
+    try:
+        from . import satactl as _sc
+        _n, _line = _sc.summary()
+        add("satactl", "Storage controllers", "tmdisk", _n, _line, warn=bool(_n))
+    except Exception as e:                                   # noqa: BLE001
+        add("satactl", "Storage controllers", "tmdisk", 0,
+            f"check unavailable: {type(e).__name__}", warn=True)
+
     # SSD WEAR. The NVMe drives' own "Percentage Used" and bytes written,
     # read from their health logs - the figure StableBit Scanner shows. Amber
     # at diskwear.WARN_AT%, or on a drive's own critical flag / spare / media
@@ -31531,6 +31542,44 @@ function tmGpuView(H){
           : '<div class="dim" style="font-size:11.5px">nothing is holding a context</div>');
 }
 // ---- disk ------------------------------------------------------------------
+// THE CONTROLLERS, one block each: the card on its own line, its ports under
+// it. Colour says what needs looking at - a reset in the last day, a link
+// below what the drive can do, a wait that reached the timeout.
+function tmCtlTable(C){
+  const cs = C.controllers||[];
+  if(!cs.length) return `<div class="dim" style="font-size:11.5px">${C.building?'reading the controllers…':esc(C.why||'no controllers found')}</div>`;
+  const when = t=>t?ago(t):'—';
+  const ms = v=>v==null?'—':v>=1000?`<span style="color:${v>=25000?'#e5534b':'#e8a33d'}">${(v/1000).toFixed(1)} s</span>`:`${Math.round(v)} ms`;
+  const CC = [{t:'port · drive', w:'auto', a:'left'}, {t:'link', w:'9%'}, {t:'worst write · read', w:'13%'},
+              {t:'retried IO 24h · 30d', w:'12%'}, {t:'uncorrected', w:'9%'}, {t:'CRC · timeouts', w:'10%'}];
+  return cs.map(c=>{
+    const p = c.pcie||{};
+    const pcie = p.onboard ? 'onboard' : `PCIe ${p.gen}.0 x${p.lanes}${c.pcie_down?` <span class="warn">of the x${p.lanes_max} it has</span>`:c.pcie_slower?` <span class="dim">(gen${p.gen_max} card in a gen${p.gen} slot)</span>`:''}`
+                 + (p.mbps?` <span class="dim">· ~${p.mbps>=1000?(p.mbps/1000).toFixed(1)+' GB/s':p.mbps+' MB/s'}${c.ports.length>1?' for '+c.ports.length+' drives':''}</span>`:'');
+    const resets = c.resets_30d
+      ? `<span style="color:${c.resets_24h?'#e5534b':c.resets_7d?'#e8a33d':'inherit'}">${fmt(c.resets_24h)} · ${fmt(c.resets_7d)} · ${fmt(c.resets_30d)}</span> <span class="dim">resets 24h · 7d · 30d, last ${when(c.last_reset)}</span>`
+      : `<span style="color:var(--ok)">no port resets in ${C.days||30} d</span>`;
+    const head = `<div style="display:flex;gap:14px;align-items:baseline;flex-wrap:wrap;margin:10px 0 3px">
+        <b style="color:${c.problem?'#e5534b':c.resets_24h?'#f0883e':'inherit'}">${esc(c.model)}</b>
+        <span class="dim" style="font-size:10.5px">${esc(c.slot||'')}${c.ports_total?` · ${c.ports.length} of ${c.ports_total} ports`:` · ${c.ports.length} drive${c.ports.length===1?'':'s'}`}${c.raidports&&c.raidports.length?` · RaidPort ${c.raidports.join(',')}`:''} · driver ${esc(c.driver||'?')}</span>
+        <span style="font-size:10.5px">${pcie}</span>
+        <span style="font-size:10.5px">${resets}</span>
+        ${c.problem?`<span class="warn" style="font-size:10.5px">PnP problem code ${c.problem}</span>`:''}
+      </div>`;
+    const rows = c.ports.map(q=>`<tr style="border-top:1px solid var(--line)">
+        ${tmCell(CC[0], `<span class="dim mono" style="font-size:10px">port ${q.port}</span> <b style="color:${diskColor(q.label)}">${esc(q.label)}</b> <span class="dim" style="font-size:10px">${esc(q.model||'')}</span>${q.warn_drive?' <span class="warn" style="font-size:10px">drive warns</span>':''}`)}
+        ${tmCell(CC[1], q.link_gbps!=null?`<span class="mono" style="color:${q.link_down?'#e5534b':'inherit'}">${q.link_gbps} Gb/s</span>${q.link_down?`<span class="dim" style="font-size:10px"> of ${q.link_max_gbps}</span>`:''}`:(c.bus==='NVMe'?`<span class="dim">PCIe</span>`:'—'))}
+        ${tmCell(CC[2], `<span class="mono">${ms(q.wr_max_ms)} · ${ms(q.rd_max_ms)}</span>`)}
+        ${tmCell(CC[3], `<span class="mono" style="color:${q.retried_24h?'#e5534b':q.retried_30d?'#e8a33d':'inherit'}">${fmt(q.retried_24h)} · ${fmt(q.retried_30d)}</span>${q.last_retried?`<span class="dim" style="font-size:10px"> ${when(q.last_retried)}</span>`:''}`)}
+        ${tmCell(CC[4], `<span class="mono" style="color:${(q.rd_unc||q.wr_unc)?'#e5534b':'inherit'}">${q.rd_unc==null&&q.wr_unc==null?'—':fmt(q.rd_unc||0)+' r · '+fmt(q.wr_unc||0)+' w'}</span>`)}
+        ${tmCell(CC[5], `<span class="mono" style="color:${q.crc?'#e8a33d':'inherit'}">${q.crc==null?'—':fmt(q.crc)}</span> · <span class="mono" style="color:${q.timeouts?'#e8a33d':'inherit'}">${q.timeouts==null?'—':fmt(q.timeouts)}</span>`)}
+      </tr>`).join('') || `<tr><td colspan="6" class="dim" style="padding:4px 6px">no drives on this controller</td></tr>`;
+    const other = (c.other_30d||[]).length
+      ? `<div class="dim" style="font-size:10.5px;margin:2px 0 0 6px">also in the log: ${c.other_30d.slice(0,4).map(o=>esc(o.what)+(o.disk!=null?' on disk '+o.disk:'')+' '+when(o.t)).join(' · ')}</div>` : '';
+    return head + `<table style="width:100%;font-size:11.5px;border-collapse:collapse;table-layout:fixed">${tmCols(CC)}<tbody>${rows}</tbody></table>` + other;
+  }).join('') + (C.stray_resets_30d?`<div class="dim" style="font-size:10.5px;margin-top:6px">${fmt(C.stray_resets_30d)} reset(s) in the log on a port no listed drive sits on</div>`:'')
+    + `<div class="dim" style="font-size:10px;margin-top:6px">read without touching the drives' logs: the SCT and Phy-counter reads that would give the drives' own link error counts reset these ports when tried, so they are not asked for</div>`;
+}
 function tmDiskView(H){
   const D = _tmD || {};
   const by = D.by_disk || [], rows = D.rows || [], vols = D.volumes || [];
@@ -31638,6 +31687,12 @@ function tmDiskView(H){
         `<table style="width:100%;font-size:11.5px;border-collapse:collapse;
            table-layout:fixed">${tmCols(DCOLS)}
           <tbody>${diskRows||'<tr><td class="dim" style="padding:6px">no traffic</td></tr>'}</tbody></table>`)
+    + tmSection('Storage controllers',
+        'which drive sits on which port, and what the port has done to it: resets and retried IO from the System log, '
+        + 'the driver\'s own worst waits and uncorrected errors, the drive\'s cable (CRC) and command-timeout counts, '
+        + 'and the SATA link each drive negotiated against what it supports. A worst write near 30 s is the storport '
+        + 'timeout that ends in a port reset.',
+        tmCtlTable(D.controllers||{}))
     + tmSection('Which file, and where it is going',
         'every job with a file open: the spindle it is reading from, the one it will be written back to, and what it is moving',
         `<table style="width:100%;font-size:11.5px;border-collapse:collapse;

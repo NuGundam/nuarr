@@ -527,6 +527,11 @@ def disk() -> dict:
     out["volumes"] = _volumes()
     out["files"] = _files_in_flight()
     out["top"] = _top_procs("read_bps", 12, extra="write_bps")
+    try:
+        from . import satactl
+        out["controllers"] = satactl.snapshot()          # never waits
+    except Exception as e:                                   # noqa: BLE001
+        out["controllers"] = {"why": f"{type(e).__name__}", "controllers": []}
     return out
 
 

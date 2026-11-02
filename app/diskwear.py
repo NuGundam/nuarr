@@ -172,11 +172,27 @@ def _sct_limits(h) -> dict:
             "src": "the drive's own SCT table: recommended maximum / limit"}
 
 
+KV_HDD_LIMITS = "diskwear.hdd_limits"   # {model prefix: {"warn_c", "crit_c", "src"}}
+
+
 def _hdd_limits(h) -> dict:
-    """A hard disk's stated operating limits, read-only. Filled in once the
-    Device Statistics log (READ LOG EXT 04h page 5) is proven harmless on
-    these controllers; until then no limit, and the page falls back to the
-    fixed line."""
+    """A hard disk's stated operating limits, WITHOUT asking the drive.
+
+    The drive does state them - in its SCT temperature table - but reading
+    that table needs SMART WRITE LOG, and READ LOG EXT is no better: both
+    stalled a port on the ASM1166 controllers for 30 s and storahci reset it
+    (2026-11-01). So the figures are kept per model in the kv store, seeded
+    from the one reading taken that day (every WD here: 65 C recommended
+    maximum, 70 C limit), and a model not in the table has no line until
+    somebody adds it - which the page says, rather than inventing one."""
+    try:
+        model = _model(h)
+        table = _kv(KV_HDD_LIMITS)
+        for prefix, lim in table.items():
+            if model.upper().startswith(prefix.upper()):
+                return dict(lim)
+    except Exception:                                        # noqa: BLE001
+        pass
     return {}
 
 
@@ -366,6 +382,9 @@ def read(fresh: bool = False) -> list:
             raw_warn = bool(bad)
             d.update(type="hdd", realloc=realloc, pending=pending, uncorr=uncorr, crc=crc,
                      power_hours=hours, temp_c=(sm.get(194, 0) & 0xFF) or None,
+                     # attribute 188: commands the drive saw time out - the
+                     # drive's own count of what the controller page shows
+                     timeouts=(sm.get(188) & 0xFFFF) if 188 in sm else None,
                      starts=sm.get(4, 0), spin_retry=sm.get(10, 0), used_pct=0, written=0, age=age,
                      helium=helium, load_cycles=sm.get(193, 0),
                      bus="SATA", base_realloc=b.get("realloc", 0), base_crc=b.get("crc", 0),
