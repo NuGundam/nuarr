@@ -85,6 +85,11 @@ NOTHING_LEFT = "no files found are eligible for import"
 # the arr never takes that release again and goes looking for another.
 EXEC_EXT = (".exe", ".scr", ".bat", ".cmd", ".com", ".pif", ".msi", ".lnk",
             ".vbs", ".js", ".jse", ".wsf", ".ps1", ".hta", ".jar", ".dll")
+# DISK IMAGES DRESSED AS AN EPISODE. Erik, 2026-11-02: six "1080p WEB H264"
+# releases (EZTV, MeGusta, CAKES via LimeTorrents), each one ~1 GB .iso. No
+# WEB episode ships as a disk image, and the arr just parks them "unable to
+# parse". Treated exactly like the programs above: removed and blocklisted.
+EXEC_EXT = EXEC_EXT + (".iso", ".img", ".dmg", ".vhd", ".vhdx", ".wim")
 EXEC_SAYS = ("found executable file", "potentially dangerous file")
 
 STATS: dict = {"last_run": 0.0, "last_result": "", "next_run": 0.0,
@@ -960,7 +965,7 @@ def _pass() -> str:
     STATS.update(removed=STATS["removed"] + removed, swept=STATS["swept"] + swept, kept=kept)
     bits = []
     if malware:
-        bits.append(f"{malware} executable(s) posing as video removed and blocklisted")
+        bits.append(f"{malware} program(s) or disk image(s) posing as video removed and blocklisted")
     if stalls:
         bits.append(f"{stalls} stalled download(s) removed and blocklisted, searched again")
     if removed - malware - stalls:

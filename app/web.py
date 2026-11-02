@@ -49066,7 +49066,7 @@ async function loadArrsTab(refresh){
         +'settings, so a client you switch to is a client this sweeps. Anything still '
         +'downloading, or with a warning it does not recognise, is left for you. '
         +'One exception to that: a download whose file is a program (.exe, .scr, '
-        +'.bat, .msi and the like) posing as an episode or movie is removed the '
+        +'.bat, .msi and the like) or a disk image (.iso, .img) posing as an episode or movie is removed the '
         +'moment its file list is known, even mid-download, and blocklisted so the '
         +'arr goes looking for a real release instead. And a finished download the arr cannot place - "Unable to parse release", an unknown series or film - has its name read by Qwen, and is imported when that reading matches exactly one film or episode here and the arr offers the file for it; anything else stays for you. A download Sonarr refuses for its shape - a single episode where a two-episode file sits on disk, or a name its parser reads differently from its own grab - is imported when it beats every file it would replace (higher quality in the profile, or the same quality and a higher score), and removed when it beats none of them.',
         d.toggles.queue_janitor, qjst,
