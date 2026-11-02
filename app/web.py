@@ -13489,11 +13489,30 @@ def api_browse_list(path: str | None = None, library: str | None = None):
         batch = [e.path for e in media[i:i + 400]]
         ph = ",".join("?" * len(batch))
         for r in _rows(
-                "SELECT path, title, season, episode, size, state, state_reason, "
+                "SELECT id, path, title, season, episode, size, state, state_reason, "
                 "       processed_at, video_codec, audio_codecs, height, duration, "
                 "       bitrate, pool_disk "
                 f"FROM files WHERE path IN ({ph})", tuple(batch)):
             detail[os.path.normcase(r["path"])] = r
+
+    # WHAT THE ENCODE SETTLED ON. The quality search writes one vmaf_log row
+    # per file it searched - the CQ it chose, the VMAF that CQ reached and the
+    # banding (CAMBI) of the result - keyed by file id, which survives the
+    # rename the encode ends with. The group scorecard's banding measure is
+    # the source file's own figure, shown when no encode has been searched.
+    # Latest row per file wins; a re-run replaces the number, not adds to it.
+    enc: dict = {}
+    srcband: dict = {}
+    ids = [r["id"] for r in detail.values() if r.get("id")]
+    for i in range(0, len(ids), 400):
+        batch = ids[i:i + 400]
+        ph = ",".join("?" * len(batch))
+        for r in _rows("SELECT file_id, cq_chosen, vmaf, cambi, note FROM vmaf_log "
+                       f"WHERE file_id IN ({ph}) ORDER BY id", tuple(batch)):
+            enc[r["file_id"]] = r
+        for r in _rows("SELECT file_id, banding FROM group_measure "
+                       f"WHERE file_id IN ({ph}) AND banding IS NOT NULL", tuple(batch)):
+            srcband[r["file_id"]] = r["banding"]
 
     files = []
     for e in media:
@@ -13512,6 +13531,11 @@ def api_browse_list(path: str | None = None, library: str | None = None):
                 "duration": r.get("duration"), "bitrate": r.get("bitrate"),
                 "disk": r.get("pool_disk"),
                 "probed": bool(r.get("video_codec")),
+                "cq": (enc.get(r.get("id")) or {}).get("cq_chosen"),
+                "vmaf": (enc.get(r.get("id")) or {}).get("vmaf"),
+                "cambi": (enc.get(r.get("id")) or {}).get("cambi"),
+                "enc_note": (enc.get(r.get("id")) or {}).get("note"),
+                "src_banding": srcband.get(r.get("id")),
             })
         except OSError:
             continue
@@ -15056,8 +15080,8 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
    seen for real, so this is the starting guess rather than a promise. */
 .brow{display:grid;grid-template-columns:1fr auto 74px;gap:12px;
       align-items:center;padding:5px 14px;font-size:12px;
-      border-bottom:1px solid #1b2027;
-      content-visibility:auto;contain-intrinsic-size:auto 39px}
+      border-bottom:1px solid #1b2027}
+.blist.big .bdir{content-visibility:auto;contain-intrinsic-size:auto 39px}
 .brow:last-child{border-bottom:none}
 .bdir{cursor:pointer}
 .bdir:hover{background:rgba(88,166,255,.07)}
@@ -15082,7 +15106,9 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
 .mtext{color:var(--ok);border-color:#1f4426}
 .bname{overflow-wrap:anywhere}
 .bmeta{display:flex;gap:9px;align-items:center;font-size:11px;white-space:nowrap}
-.binfo{font-variant-numeric:tabular-nums}
+.binfo{font-variant-numeric:tabular-nums;line-height:1.35}
+.benc{font-size:11px;color:var(--fg)}
+.benc b{font-weight:600}
 .bsize{text-align:right;font-variant-numeric:tabular-nums;font-size:11px}
 /* File rows get real columns so state, media info, disk and size align
    vertically. Folders keep the 3-column shape - their middle cell is a
@@ -21597,6 +21623,9 @@ async function loadLibs(){
     } else ns.innerHTML='';
   }
   saveBrowseScroll();          // the next line destroys the open listing
+  const keepTr=browseLib ? document.getElementById(browseId(browseLib)) : null;
+  const bodyH=document.body.style.minHeight;
+  if(keepTr){ document.body.style.minHeight=document.documentElement.scrollHeight+'px'; keepTr.remove(); }
   document.getElementById('libs').innerHTML='<table class="fixed"><tr><th>Library</th>'
     +'<th class="num" style="width:80px">Files</th><th class="num" style="width:90px">Size</th>'
     +'<th style="width:170px"></th></tr>'
@@ -21658,8 +21687,15 @@ async function loadLibs(){
       + `</div>` : '');
   // Put an open browser back after the table is rebuilt, or it vanishes every
   // 15 s - and every 2 s during a scan, which is exactly when you are most
-  // likely to be watching a folder fill up.
-  restoreBrowse();
+  // likely to be watching a folder fill up. The same node goes back when it
+  // can: the expanded track list and the scroll offset come with it.
+  const backRow=keepTr && browseLib ? browseRow(browseLib) : null;
+  if(backRow){
+    backRow.after(keepTr);
+    const list=keepTr.querySelector('.blist');
+    if(list && browseScroll) list.scrollTop=browseScroll;
+  } else restoreBrowse();
+  if(keepTr) document.body.style.minHeight=bodyH;
   if(busy) setTimeout(loadLibs,2000);
 }
 async function rescan(lib){
@@ -21886,6 +21922,21 @@ function renderBrowse(d){
         + (f.bitrate?` · ${Math.round(f.bitrate/1000)} kbps`:'')
         + (f.duration?` · ${Math.round(f.duration/60)} min`:'')
       : '<span class="dim">not probed</span>';
+    // The encode's own report card: the CQ the quality search chose, the
+    // VMAF it reached, the banding of the result. A file nuarr never searched
+    // shows the source's banding from the group scorecard when it has one.
+    let encv='';
+    if(f.cq!=null){
+      const tip=`quality search: CQ ${f.cq} reached VMAF ${f.vmaf??'?'}`
+        +(f.cambi!=null?`, banding (CAMBI) ${f.cambi} - under 5 is not visible`:'')
+        +(f.enc_note?` - ${f.enc_note}`:'');
+      encv=`<span class="benc" title="${esc(tip)}">CQ <b>${f.cq}</b>`
+        +(f.vmaf!=null?` · VMAF <b>${f.vmaf}</b>`:'')
+        +(f.cambi!=null?` · band <b style="color:${f.cambi>=5?'var(--warn)':'inherit'}">${f.cambi}</b>`:'')
+        +`</span>`;
+    } else if(f.src_banding!=null){
+      encv=`<span class="benc dim" title="banding (CAMBI) measured on this file by the release-group scorecard - under 5 is not visible">band ${f.src_banding}</span>`;
+    }
     // Clicking a file expands its full track list underneath - the thing you
     // would otherwise open MediaInfo for.
     const key=btoa(unescape(encodeURIComponent(f.path))).replace(/=+$/,'');
@@ -21897,7 +21948,7 @@ function renderBrowse(d){
                  data-fk="${key}" data-fp="${esc(f.path)}">
         <span class="bname" title="${esc(f.path)}">${esc(f.name)}</span>
         <span class="bstate ${st[1]}">${esc(st[0])}</span>
-        <span class="dim binfo">${info}</span>
+        <span class="dim binfo">${info}${encv?'<br>'+encv:''}</span>
         <span class="bdisk mono" style="color:${f.disk?diskColor(f.disk)
           :'var(--dim)'}">${f.disk?esc(f.disk):''}</span>
         <span class="bsize dim">${gb(f.size)}</span></div>`;
@@ -21905,7 +21956,8 @@ function renderBrowse(d){
 
   const body = (folders+files) ||
     '<div class="dim" style="padding:12px">nothing here</div>';
-  return head + `<div class="blist">${body}</div>`;
+  const big=(d.folders||[]).length>150;
+  return head + `<div class="blist${big?' big':''}">${body}</div>`;
 }
 
 // ---- per-file media info -------------------------------------------------
