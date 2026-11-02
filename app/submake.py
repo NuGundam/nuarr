@@ -465,10 +465,12 @@ async def _runner() -> None:
             try:
                 from . import jobs as _jobs
                 who = _jobs.busy_with(int(job["file_id"]))
+                held = "" if who else _jobs.held_for_person(int(job["file_id"]))
             except Exception:                                    # noqa: BLE001
-                who = ""
-            if who:
-                STATE["waiting_for"] = f"{who} has this file - the maker waits for it"
+                who = held = ""
+            if who or held:
+                STATE["waiting_for"] = (f"{who} has this file - the maker waits for it" if who
+                                        else f"{held} - the maker waits for your answer")
                 if len(q) > 1:
                     _save_queue(q[1:] + [job])
                 await asyncio.sleep(60)

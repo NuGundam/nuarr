@@ -213,6 +213,13 @@ def candidates(limit: int = 20, skip_disks: set | None = None) -> list:
     like = " OR ".join(["p.json LIKE ?"] * len(TEXT_LIKE))
     skip = sorted(d for d in (skip_disks or set()) if d)
     skip_sql = f"AND COALESCE(f.pool_disk,'') NOT IN ({','.join('?' * len(skip))}) " if skip else ""
+    try:
+        from .jobs import held_files
+        held = held_files()
+    except Exception:                                            # noqa: BLE001
+        held = frozenset()
+    if held:                        # waiting on you - see jobs.held_for_person
+        skip_sql += f"AND f.id NOT IN ({','.join(str(int(i)) for i in held)}) "
     with cursor() as cur:
         rows = cur.execute(
             f"SELECT f.id, f.path, f.mtime, f.pool_disk, f.duration FROM files f JOIN file_probes p ON p.file_id=f.id "

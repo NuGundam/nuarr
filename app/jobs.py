@@ -2841,6 +2841,29 @@ def busy_with(file_id: int) -> str:
     return ""
 
 
+# Checks that only read the file, and are how a question gets asked again.
+HELD_OK_KINDS = ("listen", "decode", "verify")
+
+
+def held_for_person(file_id: int) -> str:
+    """Why nothing should work on this file until a person answers - '' when
+    nothing is waiting. See hold.py; the read-only checks (HELD_OK_KINDS)
+    still run."""
+    try:
+        from . import hold
+        return hold.why(file_id)
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def held_files() -> frozenset:
+    try:
+        from . import hold
+        return hold.files()
+    except Exception:                                            # noqa: BLE001
+        return frozenset()
+
+
 def _outside_files() -> set:
     """Files the systems outside the queue are rewriting this moment: the
     Subtitle maker (a sidecar, then an embed) and the timing fixer (mkvmerge
@@ -2920,6 +2943,12 @@ def _claim(pool: str) -> Job | None:
         if live_files:
             base += ("AND (j.file_id IS NULL OR j.file_id NOT IN ("
                      + ",".join(str(int(i)) for i in live_files) + ")) ")
+        # AND NOT A FILE WAITING ON A PERSON - see held_for_person().
+        held = held_files()
+        if held:
+            base += ("AND (j.file_id IS NULL OR j.kind IN ("
+                     + ",".join(f"'{k}'" for k in HELD_OK_KINDS) + ") OR j.file_id NOT IN ("
+                     + ",".join(str(int(i)) for i in held) + ")) ")
         # PICK THE LEAST-LOADED SPINDLE, THEN QUEUE ORDER.
         #
         # The old shape was two queries: "anything not on a busy disk" and, if

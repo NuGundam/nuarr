@@ -200,6 +200,12 @@ def candidates(limit: int = 100000) -> list[dict]:
                             "kinds": ["an empty track"]})
     except Exception:                                            # noqa: BLE001
         pass
+    try:                            # waiting on you - see jobs.held_for_person
+        from .jobs import held_files
+        held = held_files()
+        out = [x for x in out if int(x["file_id"]) not in held]
+    except Exception:                                            # noqa: BLE001
+        pass
     return out
 
 

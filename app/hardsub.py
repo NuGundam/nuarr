@@ -2513,6 +2513,18 @@ def untested() -> int:
 
 
 def _candidates(limit: int) -> list:
+    """_candidates_all less the files waiting on you (jobs.held_for_person)."""
+    out = _candidates_all(limit)
+    try:
+        from .jobs import held_files
+        held = held_files()
+        out = [r for r in out if int(r["file_id"]) not in held]
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out
+
+
+def _candidates_all(limit: int) -> list:
     r"""Files with no subtitle track that have not been looked at.
 
     ONLY THE ONES CLAIMING TO HAVE NONE. A file with a subtitle track already

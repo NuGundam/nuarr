@@ -2631,6 +2631,33 @@ _MM: dict = {}
 
 def mismatches_expire() -> None:
     _MM.clear()
+    _AW["at"] = 0.0
+    try:
+        from . import hold
+        hold.expire()
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+# FILES WAITING ON YOU. Every file the panel is asking about - tagged one
+# language, heard another, not yet corrected, left or replaced. The rest of
+# nuarr keeps its hands off these (hold.py): an answer of
+# "replace" throws away whatever was done to the file in the meantime.
+_AW: dict = {"at": 0.0, "ids": frozenset()}
+
+
+def awaiting() -> frozenset:
+    """File ids with a mismatch still on the panel - read at most once a minute
+    (the walk is ~1 s), and at once after any answer or correction."""
+    now = time.time()
+    if now - _AW["at"] < 60:
+        return _AW["ids"]
+    try:
+        ids = frozenset(int(r["file_id"]) for r in mismatches(2000))
+    except Exception:                                            # noqa: BLE001
+        ids = _AW["ids"]
+    _AW.update(at=now, ids=ids)
+    return ids
 
 
 def mismatches(limit: int = 200, floor: float | None = None,

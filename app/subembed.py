@@ -1417,6 +1417,12 @@ def candidates(limit: int = 200, force: bool = False,
                 " WHERE state IN ('queued','running')")}
     except Exception:                                            # noqa: BLE001
         pass
+    # waiting on you - see jobs.held_for_person
+    try:
+        from .jobs import held_files
+        _held = held_files()
+    except Exception:                                            # noqa: BLE001
+        _held = frozenset()
     _bad = bad_sidecars()
     out = []
     total = len(rows)
@@ -1437,7 +1443,7 @@ def candidates(limit: int = 200, force: bool = False,
         # A REBUILD ALREADY QUEUED WILL CARRY THEM. Doing it here as well
         # means the same container copied twice, so the queue wins: it was
         # going to open the file anyway.
-        if r["id"] in _queued:
+        if r["id"] in _queued or r["id"] in _held:
             continue
         p = plan_one(r["id"], force=force)
         # ALREADY ASKED AND ANSWERED. A sidecar that failed on its own merits
