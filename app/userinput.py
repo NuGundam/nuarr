@@ -35,6 +35,7 @@ def _subtitle_input() -> dict | None:
     shown = {int(r.get("file_id") or 0) for r in rows}
     asks = 0
     sample = [r for r in rows if r.get("action") and not r.get("done") and not r.get("unread")
+              and not subkind._noread(r)
               and not (f.get("mode") == "auto" and r.get("auto") == "act")]
     for q in subqueue.asking(500):
         for a in q.get("asks") or []:

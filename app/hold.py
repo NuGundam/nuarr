@@ -77,6 +77,7 @@ def _collect() -> dict:
             # the rows userinput counts as yours: an action, not done, read,
             # and not one auto is about to take itself
             if (r.get("action") and not r.get("done") and not r.get("unread")
+                    and not subkind._noread(r)
                     and not (auto and r.get("auto") == "act")):
                 put(r.get("file_id"), "Subtitle User Input is waiting on you for this file")
     except Exception:                                            # noqa: BLE001

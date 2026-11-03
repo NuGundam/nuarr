@@ -853,6 +853,11 @@ def scoring() -> dict:
     }
 
 
+def _noread(r: dict) -> bool:
+    """A raw-check row with no reading behind it - the picture reader's turn."""
+    return r.get("source") == RAW and not r.get("read")
+
+
 def findings(limit: int = 600, want_done: bool = True,
              want_unread: bool = True) -> dict:
     r"""Everything, least certain first, with the counts the header needs.
@@ -950,8 +955,13 @@ def findings(limit: int = 600, want_done: bool = True,
             "noread": sum(1 for r in rows
                           if r.get("source") == RAW and not r.get("read")),
             "unread": sum(1 for r in rows if r["unread"]),
+            # A ROW NOTHING HAS READ IS WAITING ON THE READER, NOT ON YOU.
+            # 2026-11-03: the dashboard said "1 waiting in Subtitle User
+            # Input" and held the file, while the panel kept that row behind
+            # "also show the 1 nothing has read yet". The same rule for both:
+            # until a picture is sampled it is nobody's question.
             "band": sum(1 for r in rows if r["auto"] == "ask"
-                        and not r["unread"] and not r["done"]),
+                        and not r["unread"] and not r["done"] and not _noread(r)),
             "done": sum(1 for r in rows if r["done"]),
             # Of the answered ones, how many are answered but not yet carried
             # out. "already marked" and "waiting for the queue to get to it"
@@ -962,7 +972,7 @@ def findings(limit: int = 600, want_done: bool = True,
             # auto mode is nuarr's to carry out; counting it put "2 to answer"
             # over a footer that said "nothing still to answer".
             "actionable": sum(1 for r in rows if r["action"] and not r["done"]
-                              and not r["unread"]
+                              and not r["unread"] and not _noread(r)
                               and not (mode() == "auto" and r.get("auto") == "act")),
         },
         "picture": hs,
