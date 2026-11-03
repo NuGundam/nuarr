@@ -25513,8 +25513,13 @@ function poolColor(pool){
        : pool==='groups'      ? '#d4b8ff'         // soft violet - the group measurer
        : 'var(--ok)';
 }
+// LETTERED DRIVES GET THEIR OWN COLOURS, none of them in DISK_COLORS: the
+// name hash put D: and P: on NU-DRIVE-6's pink and F: on NU-DRIVE-8's green.
+const LETTER_COLORS = {C:'#e6edf3', D:'#b5e550', E:'#c08457', F:'#ff5ccd', P:'#6e7bff'};
 function diskColor(name){
   const s=String(name||'');
+  const lt=s.match(/^([A-Z]):/);
+  if(lt) return LETTER_COLORS[lt[1]] || `hsl(${Math.round((lt[1].charCodeAt(0)*97) % 360)} 45% 72%)`;
   const m=s.match(/(\d+)\s*$/);            // NU-DRIVE-7 -> 7
   let i;
   if(m){
