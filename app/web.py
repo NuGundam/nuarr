@@ -31729,15 +31729,22 @@ function tmDiskView(H){
     // nuarr's own disks keep the colour every other panel gives them; the
     // rest are grey, because a colour that means nothing elsewhere would
     // read as if it did.
-    const col = (d.mine && typeof diskColor==='function') ? diskColor(d.label) : '#8b949e';
+    // ...and a lettered drive (C: OS, F: STAGING DRIVE) wears the colour the
+    // drive health table gives it, keyed on the letter, with the letter in
+    // its bold name rather than the grey note.
+    const lm = !d.mine && String(d.note||'').match(/^([A-Z]:)\s*(?:·\s*)?/);
+    const col = typeof diskColor!=='function' ? '#8b949e'
+              : d.mine ? diskColor(d.label) : lm ? diskColor(lm[1]) : '#8b949e';
+    const nm = lm ? lm[1]+' '+(d.label||d.name) : (d.label||d.name);
+    const nt = lm ? String(d.note).slice(lm[0].length) : (d.note||'');
     // READ IS BLUE AND WRITE IS ORANGE EVERYWHERE ELSE ON THIS PAGE, so the
     // average and the operation counts wear the same two colours rather than
     // being a grey pair you have to read the heading to decode.
     const rw = (a,b,fa,fb)=>`<span style="color:${a?'#58a6ff':'var(--dim,#8a97a6)'}">${fa}</span>`
       + `<span class="dim"> / </span><span style="color:${b?'#f0883e':'var(--dim,#8a97a6)'}">${fb}</span>`;
     return `<tr style="border-top:1px solid var(--line)">
-      ${tmCell(DCOLS[0], `<b style="color:${col}">${esc(d.label||d.name)}</b>`
-        + (d.note?`<span class="dim" style="font-size:10px"> ${esc(d.note)}</span>`:'') + wornTag(d))}
+      ${tmCell(DCOLS[0], `<b style="color:${col}">${esc(nm)}</b>`
+        + (nt?`<span class="dim" style="font-size:10px"> ${esc(nt)}</span>`:'') + wornTag(d))}
       ${tmCell(DCOLS[1], tmSpark(series, col))}
       ${tmCell(DCOLS[2], `<span class="mono" style="color:${d.read_bps?'#58a6ff':'var(--dim,#8a97a6)'}">${tmBps(d.read_bps)}</span>`)}
       ${tmCell(DCOLS[3], `<span class="mono" style="color:${d.write_bps?'#f0883e':'var(--dim,#8a97a6)'}">${tmBps(d.write_bps)}</span>`)}
