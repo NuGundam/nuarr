@@ -1064,6 +1064,16 @@ def select_targets(probe: dict, library: str | None = None) -> list[dict]:
     return out
 
 
+def _pgsrip_new() -> bool:
+    """pgsrip 0.2 or later - the one with the "rip" subcommand."""
+    try:
+        from importlib import metadata
+        v = [int(x) for x in re.findall(r"\d+", metadata.version("pgsrip"))[:2]]
+        return v >= [0, 2]
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _env() -> dict:
     r"""PATH with Tesseract on it - the reason OCR never once worked.
 
@@ -1270,10 +1280,14 @@ def ocr(sup: str, tick=None, base: float = 0.0, span: float = 1.0,
     try:
         # Through the wrapper, not `-m pgsrip` - see pgsrip_hidden.py. It is
         # what stops mkvextract and tesseract flashing consoles per cue.
+        # PGSRIP 0.2+ HAS SUBCOMMANDS: "rip" in front, and the engine named,
+        # because its default "auto" would reach for rapidocr where Tesseract
+        # cannot read a language. 0.1.x takes the path straight.
+        args = (["rip", "--language", "en", "--force", "--engine", "tesseract", sup]
+                if _pgsrip_new() else ["--language", "en", "--force", sup])
         rc, err = _run([_python(),
                         os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                     "pgsrip_hidden.py"),
-                        "--language", "en", "--force", sup])
+                                     "pgsrip_hidden.py")] + args)
     finally:
         stop.set()
         th.join(timeout=1)

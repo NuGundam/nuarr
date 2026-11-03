@@ -94,10 +94,32 @@ def read_sup(path: str, limit: int = 0):
     OCR pass passes no limit and decodes the lot as before.
     """
     import numpy as np
+    data = open(path, "rb").read()
+    # PGSRIP 0.2+ moved the parser to pgsrip.formats.pgs and groups the
+    # display sets into cues itself (read_items: start, end, position, and the
+    # same 0-ink / 255-background picture the old PgsImage.data gave). The old
+    # walk below stays for 0.1.x.
+    try:
+        from pgsrip.formats import pgs as _p
+    except ImportError:
+        _p = None
+    if _p is not None:
+        name = os.path.basename(path)
+        sets = list(_p.read_display_sets(data, name))
+        vw = next((ds.pcs.width for ds in sets if ds.pcs.width), 1920) or 1920
+        vh = next((ds.pcs.height for ds in sets if ds.pcs.height), 1080) or 1080
+        out = []
+        for it in _p.read_items(sets, name):
+            arr = _p.decode_rle_image(it.image.rle_data, it.image.palette)
+            if arr.size == 0:
+                continue
+            out.append([arr, int(it.start), int(it.end), it.x_offset or 0, it.y_offset or 0, vw, vh])
+            if limit and len(out) >= limit:
+                break
+        return out
     from pgsrip.media_path import MediaPath
     from pgsrip.pgs import PgsImage, PgsReader
 
-    data = open(path, "rb").read()
     mp = MediaPath(path)
     out = []
     pending = None
