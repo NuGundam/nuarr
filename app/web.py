@@ -3758,12 +3758,15 @@ def _summary_impl():
     # specials, bonus features) and are normal; large ones usually mean a failed
     # or never-completed import, which is the thing worth acting on.
     cut = SETTINGS.min_orphan_size_mb * 1024 * 1024
+    # ...and a regular episode is never an extra, whatever it weighs
+    # (adopter.EPISODE_SQL - Chibi Devi! S01E10, 33 MB, lost by Sonarr).
+    from .adopter import EPISODE_SQL as _EP
     orphans = _rows("SELECT COUNT(*) n, SUM(size) bytes FROM files "
                     "WHERE arr_file_id IS NULL AND state NOT IN ('duplicate','deleted') "
-                    "AND COALESCE(size,0) >= ?", (cut,))[0]
+                    f"AND (COALESCE(size,0) >= ? OR {_EP})", (cut,))[0]
     extras = _rows("SELECT COUNT(*) n, SUM(size) bytes FROM files "
                    "WHERE arr_file_id IS NULL AND state NOT IN ('duplicate','deleted') "
-                   "AND COALESCE(size,0) < ?", (cut,))[0]
+                   f"AND COALESCE(size,0) < ? AND NOT {_EP}", (cut,))[0]
     # FILES NO ARR TRACKS, COUNTED RATHER THAN INFERRED. The header used to
     # derive this by subtracting the arrs' total from nuarr's own - which made
     # it a fact about two numbers taken at different moments rather than about
@@ -9884,12 +9887,13 @@ def api_files(state: str | None = None, library: str | None = None,
         where.append("arr_file_id IS NOT NULL")
     if errors:
         where.append("state IN ('error','blocked')")
+    from .adopter import EPISODE_SQL as _EP     # an episode is never an extra
     if unmanaged:
         where.append("arr_file_id IS NULL AND state NOT IN ('duplicate','deleted') "
-                     "AND COALESCE(size,0) >= ?"); params.append(cut)
+                     f"AND (COALESCE(size,0) >= ? OR {_EP})"); params.append(cut)
     if extras:
         where.append("arr_file_id IS NULL AND state NOT IN ('duplicate','deleted') "
-                     "AND COALESCE(size,0) < ?"); params.append(cut)
+                     f"AND COALESCE(size,0) < ? AND NOT {_EP}"); params.append(cut)
     if state:
         # A COMMA LIST, because one tile now covers two states. Held and
         # eligible were separate tiles and separate lists, and the split did

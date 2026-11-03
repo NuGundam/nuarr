@@ -72,6 +72,13 @@ _CMD_TIMEOUT_S = 90
 # meant to manage them. Chasing those would mean rescanning every series
 # forever over files nobody wants imported.
 MIN_SIZE_B = 100 * 1024 * 1024
+# A REGULAR EPISODE IS NEVER AN EXTRA, whatever it weighs. Chibi Devi!
+# S01E10 (2026-11-02) is a five-minute episode, 33 MB: Sonarr lost it, the
+# 100 MB floor kept it out of adoption, and the dashboard filed it under
+# "Extras (kept) - OP/ED, specials, bonus". 737 tracked episodes here are
+# under 100 MB. Named S01-S99 + E = an episode; S00 specials stay extras.
+EPISODE_SQL = ("(path GLOB '*[Ss]0[1-9][Ee][0-9]*' "
+               "OR path GLOB '*[Ss][1-9][0-9][Ee][0-9]*')")
 
 STATS: dict = {"last_run": 0.0, "next_run": 0.0, "running": False,
                "checked": 0, "adopted": 0, "orphaned": 0, "no_folder": 0,
@@ -332,7 +339,7 @@ def _due(limit: int = 25) -> list[dict]:
             "adopt_state FROM files "
             " WHERE arr_file_id IS NULL "
             "   AND state NOT IN ('duplicate','deleted') "
-            "   AND COALESCE(size,0) >= ? "
+            f"   AND (COALESCE(size,0) >= ? OR {EPISODE_SQL}) "
             "   AND COALESCE(adopt_state,'') NOT IN "
             "       ('orphan','no_folder','duplicate') "
             "   AND COALESCE(adopt_attempts,0) < ? "
@@ -648,7 +655,7 @@ def counts() -> dict:
             "          THEN 1 ELSE 0 END) no_folder "
             " FROM files WHERE arr_file_id IS NULL "
             "   AND state NOT IN ('duplicate','deleted') "
-            "   AND COALESCE(size,0) >= ?", (MIN_SIZE_B,)).fetchone()
+            f"   AND (COALESCE(size,0) >= ? OR {EPISODE_SQL})", (MIN_SIZE_B,)).fetchone()
     return {"confirmed": int(r["confirmed"] or 0),
             "checking": int(r["checking"] or 0),
             "no_folder": int(r["no_folder"] or 0)}
