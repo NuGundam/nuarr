@@ -260,9 +260,94 @@ def check_all_sync() -> dict:
     except Exception as e:                                       # noqa: BLE001
         rows.append(_row("driver", "NVIDIA driver", "", "", "check", "NVENC", error=str(e)[:120]))
     out = {"at": time.time(), "rows": rows}
+    libs_sync()
     try:
         from .db import kv_set
         kv_set(KV, json.dumps(out))
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out
+
+
+# ---- Python libraries -----------------------------------------------------
+# Erik, 2026-11-03: "add the library updates to the Updates page too". pip's
+# own outdated list, plus for each one WHICH installed package holds it back:
+# 2026-11-02's one-at-a-time upgrade took 64 of 80, and the rest are pinned
+# (paddlepaddle-gpu pins its CUDA wheels exactly, paddlex pins numpy/PyYAML,
+# tokenizers caps huggingface_hub). Showing the pin is the useful part - a
+# held library frees itself when its holder ships a looser release, and that
+# shows here as "free to upgrade".
+LIB_KV = "tools.libs"
+
+
+def _norm(n: str) -> str:
+    return re.sub(r"[-_.]+", "-", (n or "").lower())
+
+
+def _python() -> str:
+    import sys
+    return re.sub(r"pythonw\.exe$", "python.exe", sys.executable, flags=re.I)
+
+
+def _holders(name: str, latest: str) -> list:
+    """Installed packages whose requirement on `name` excludes `latest`."""
+    from importlib import metadata
+    from packaging.requirements import Requirement
+    from packaging.version import Version
+    want, out = _norm(name), []
+    try:
+        lv = Version(latest)
+    except Exception:                                            # noqa: BLE001
+        return out
+    for d in metadata.distributions():
+        for r in d.requires or []:
+            try:
+                q = Requirement(r)
+            except Exception:                                    # noqa: BLE001
+                continue
+            if _norm(q.name) != want:
+                continue
+            try:
+                if q.marker and not q.marker.evaluate({"extra": ""}):
+                    continue
+            except Exception:                                    # noqa: BLE001
+                continue
+            if q.specifier and not q.specifier.contains(lv, prereleases=True):
+                out.append({"by": d.metadata["Name"], "by_version": d.version,
+                            "needs": str(q.specifier)})
+    return out
+
+
+def libs_sync() -> dict:
+    """pip's outdated list with the holder of each - ~15 s, on a thread."""
+    try:
+        r = subprocess.run([_python(), "-m", "pip", "list", "--outdated", "--format=json",
+                            "--disable-pip-version-check"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=300,
+                           creationflags=NO_WINDOW, startupinfo=hidden_si())
+        txt = r.stdout or ""
+        rows = json.loads(txt[txt.index("["):]) if "[" in txt else []
+        err = "" if rows or r.returncode == 0 else (r.stderr or "")[-200:]
+    except Exception as e:                                       # noqa: BLE001
+        rows, err = [], str(e)[:200]
+    libs = []
+    for x in rows:
+        try:
+            held = _holders(x["name"], x["latest_version"])
+        except Exception:                                        # noqa: BLE001
+            held = []
+        libs.append({"name": x["name"], "installed": x["version"],
+                     "latest": x["latest_version"], "held": held})
+    libs.sort(key=lambda l: (bool(l["held"]), l["name"].lower()))
+    try:
+        from importlib import metadata
+        total = len({_norm(d.metadata["Name"]) for d in metadata.distributions()})
+    except Exception:                                            # noqa: BLE001
+        total = 0
+    out = {"at": time.time(), "libs": libs, "total": total, "error": err}
+    try:
+        from .db import kv_set
+        kv_set(LIB_KV, json.dumps(out))
     except Exception:                                            # noqa: BLE001
         pass
     return out
@@ -275,6 +360,11 @@ def state() -> dict:
     except Exception:                                            # noqa: BLE001
         out = {}
     out["mkv_install"] = dict(MKV_INSTALL)
+    try:
+        from .db import kv_get
+        out["libs"] = json.loads(kv_get(LIB_KV) or "{}")
+    except Exception:                                            # noqa: BLE001
+        out["libs"] = {}
     return out
 
 
@@ -284,7 +374,8 @@ async def watch() -> None:
     schedules.register(
         "toolsupd", "Tool updates", "System", 86400,
         what="Asks once a day whether nuarr, ffmpeg, MKVToolNix, the OCR engines, "
-             "Whisper, Ollama or the NVIDIA driver has a newer release. Lists them on "
+             "Whisper, Ollama, the NVIDIA driver or a Python library has a newer release "
+             "(and which package pins each held library). Lists them on "
              "the Updates page; installing is always your click there.")
     await asyncio.sleep(600)
     while True:

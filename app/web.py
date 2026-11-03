@@ -40032,9 +40032,44 @@ async function toolsUpdLoad(force){
       <b style="color:#6fb0ff">Tools</b>
       <span class="dim" style="font-size:11px">every program nuarr runs · checked ${_tu.at?ago(_tu.at):'never'}, then once a day${n?` · <b style="color:#e3b341">${n} update${n===1?'':'s'}</b>`:' · all current'}</span>
       <button style="margin-left:auto" onclick="this.disabled=true;this.textContent='checking…';toolsUpdLoad(true)">Check now</button></div>
-    <table style="width:100%;font-size:11.5px;border-collapse:collapse;margin-top:6px">${rows}</table>`;
+    <table style="width:100%;font-size:11.5px;border-collapse:collapse;margin-top:6px">${rows}</table>
+    ${toolsLibsHtml(_tu.libs||{})}`;
   clearTimeout(_tuT);
   if(mi.state==='installing') _tuT=setTimeout(()=>toolsUpdLoad(), 3000);
+}
+// PYTHON LIBRARIES: pip's outdated list, each with the package that pins it
+// (toolsupd.libs_sync). Held ones free themselves when the holder loosens.
+function toolsLibsHtml(L){
+  const libs=L.libs||[];
+  const held=libs.filter(l=>(l.held||[]).length), free=libs.filter(l=>!(l.held||[]).length);
+  const rows=libs.map(l=>{
+    const h=l.held||[];
+    const st=h.length
+      ? `<span class="dim">held by</span> ${h.map(x=>`<b>${esc(x.by)}</b> <span class="mono dim">${esc(x.needs)}</span>`).join(', ')}`
+      : `<b style="color:#e3b341">free to upgrade</b>`;
+    return `<tr style="border-top:1px solid var(--line)">
+      <td style="padding:3px 6px"><b>${esc(l.name)}</b></td>
+      <td class="mono" style="padding:3px 6px">${esc(l.installed)}</td>
+      <td class="mono" style="padding:3px 6px">${esc(l.latest)}</td>
+      <td style="padding:3px 6px">${st}</td></tr>`;
+  }).join('');
+  const sum = !L.at ? 'not checked yet'
+    : !libs.length ? '<span style="color:var(--ok)">every library current</span>'
+    : `${free.length?`<b style="color:#e3b341">${free.length} free to upgrade</b> · `:''}${held.length} held by a pin`;
+  return `<div style="margin-top:12px;padding-top:9px;border-top:1px solid var(--line)">
+    <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+      <b style="color:#6fb0ff">Python libraries</b>
+      <span class="dim" style="font-size:11px">${L.total?L.total+' installed · ':''}${sum} · checked ${L.at?ago(L.at):'never'}</span></div>
+    ${L.error?`<div class="err" style="font-size:11px">${esc(L.error)}</div>`:''}
+    ${libs.length?`<details style="margin-top:5px"${free.length?' open':''}>
+      <summary style="cursor:pointer;font-size:11.5px;color:#6fb0ff">${libs.length} with a newer release</summary>
+      <table style="width:100%;font-size:11.5px;border-collapse:collapse;margin-top:5px">
+        <tr class="dim" style="font-size:10.5px"><td style="padding:2px 6px">library</td><td style="padding:2px 6px">installed</td>
+          <td style="padding:2px 6px">latest</td><td style="padding:2px 6px">status</td></tr>${rows}</table>
+      <div class="dim" style="font-size:10.5px;margin-top:5px">A held library can't move until the package pinning it
+        releases a looser version - it then shows as free to upgrade. Upgrades go one at a time, each
+        smoke-tested first (last run 2026-11-02: 64 of 80).</div></details>`:''}
+  </div>`;
 }
 async function toolsMkvInstall(btn){
   if(btn){ btn.disabled=true; btn.textContent='installing…'; }
