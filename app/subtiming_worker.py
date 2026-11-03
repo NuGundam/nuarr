@@ -480,6 +480,15 @@ def judge(m: dict) -> tuple[str, str]:
                           f"moved, every slice is within {a['median_abs']:.2f}s")
     if not bad_before:
         return "ok", "close enough - no correction does better"
+    # EARLY IS FINE, LATE IS NOT. Erik, 2026-11-02, over the Vox Machina
+    # tracks: every line 0.1-0.6 s early by a different amount, which no
+    # shift fixes - "fine if they are a bit early, I just don't want them
+    # late". A track that never runs late (no slice past +0.25 s) and is never
+    # more than 1.2 s early is left as it is and counted in step.
+    heard_b = [x["late"] for x in (m.get("before") or []) if x["late"] is not None and (x.get("r") or 0) >= 0.2]
+    if len(heard_b) >= 2 and max(heard_b) <= 0.25 and min(heard_b) >= -1.2:
+        return "ok", (f"a bit early in places (up to {abs(min(heard_b)):.2f}s), never late - "
+                      "left as it is")
     return "messy", ("out of step in places but no single shift or frame-rate correction fixes it "
                      "(another cut of the episode, a missing scene) - left alone")
 
