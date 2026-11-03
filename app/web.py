@@ -3971,9 +3971,15 @@ def _summary_impl():
                         for x in proc)}
     except Exception:                                        # noqa: BLE001
         pass
+    held = {"n": 0}
+    try:                            # files waiting on your answer - see hold.py
+        from . import hold as _hold
+        held = {"n": len(_hold.files())}
+    except Exception:                                        # noqa: BLE001
+        pass
     return {"states": states, "disks": disks, "pool_trend": pool_trend, "libraries": libs,
             "health": health, "work": work,
-            "saved": saved, "attention": attention,
+            "saved": saved, "attention": attention, "held": held,
             "errors": errors, "error_kinds": err_kinds,
             "totals": totals, "orphans": orphans, "extras": extras,
             "extras_cutoff_mb": SETTINGS.min_orphan_size_mb,
@@ -12784,6 +12790,27 @@ def _attention(limit: int = 400, fresh: bool = False):
     except Exception:                                        # noqa: BLE001
         pass
 
+    # HELD FOR YOU - the same files as the questions above, seen from the
+    # other side: nothing works on these until the question is answered.
+    try:
+        from . import hold as _hold
+        from .db import label_for as _lf
+        why = _hold.reasons()
+        if why:
+            ids = sorted(why)[:limit]
+            got = {int(r["id"]): r for r in rows(
+                "SELECT id, path, title, season, episode FROM files WHERE id IN ("
+                + ",".join(str(int(i)) for i in ids) + ")")}
+            for fid in ids:
+                r = got.get(fid) or {}
+                out.append({"source": "held files", "id": fid,
+                            "title": _lf(r.get("title"), r.get("season"), r.get("episode"),
+                                         r.get("path"), fid) or f"file {fid}",
+                            "path": r.get("path") or "", "detail": why[fid],
+                            "goto": "", "act": "", "n_total": len(why), "note": ""})
+    except Exception:                                        # noqa: BLE001
+        pass
+
     by_source: dict[str, int] = {}
     for o in out:
         by_source[o["source"]] = by_source.get(o["source"], 0) + 1
@@ -18796,6 +18823,13 @@ async function loadAll(){
   // them, each row linking to the page that can act on it.
   add('Attention', fmt(attN), attTop,
       attN ? {attn:1, t:'Needs attention'} : null);
+  // HELD FOR YOU: files with an open question, which nothing else touches
+  // until it is answered (hold.py). The rows are in the attention panel.
+  const heldN=(s.held||{}).n||0;
+  add('Held for you', fmt(heldN),
+      heldN ? 'waiting on your answer - only read-only checks run'
+            : 'no file is waiting on an answer',
+      heldN ? {attn:1, t:'Needs attention'} : null);
   // MIRRORS THE OTHERS: a count, a one-line verdict, and a click-through. The
   // count is checks-that-found-something rather than items, because "3" here
   // means three SYSTEMS want a look - the items are counted on their own
@@ -20511,6 +20545,7 @@ const ATTN_STYLE={
   'banned terms':   ['#e0575b','a banned term also matches a show title'],
   'tvdb re-ids':    ['#e2b341','TheTVDB re-added a series and the repair could not match it'],
   'download leftovers': ['#e2b341','left in the download folder with video in it - import, delete or keep'],
+  'held files':     ['#a371f7','nothing works on these until you answer - only read-only checks run'],
 };
 
 function attnPaint(){
@@ -39027,7 +39062,7 @@ function vfyBlock(kind){
       const why=m?`it was ${m[1]}% sure; it acts at ${v.sure_at}%`:'the checks disagreed';
       return r.open
         ? `<span style="color:#e3b341">Your call</span> <span class="dim">- ${esc(why)}.</span> <a href="/settings#lang@skPanel" onclick="event.stopPropagation()" style="color:#79c0ff">Answer it →</a>`
-        : `<span class="dim">Your call (${esc(why)}) - since settled, nothing to do</span>`;
+        : `<span style="color:#3fb950">Done</span> <span class="dim">- settled since; it had been your call (${esc(why)})</span>`;
     }
     if(a.startsWith('failed')) return `<span style="color:#e0575b">Failed</span> <span class="dim">- ${esc(a.replace(/^failed:?\s*/,''))}</span>`;
     return `<span class="dim">${esc(a)}</span>`;
