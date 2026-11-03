@@ -39210,22 +39210,6 @@ async function vfyRun(btn){
   const tick=async()=>{ await vfyLoad(true); for(const k of ['whisper','qwen','ocr','subai']) lrnPaint(k); if(_vfy&&_vfy.running) setTimeout(tick,3000); };
   setTimeout(tick,1500);
 }
-function lrnStyles(kind,d){
-  const st=d.styles||[]; if(kind==='ocr') return '';
-  return `<div style="font-size:11.5px;font-weight:600;margin:12px 0 4px">The shows' own subtitle style
-    <span class="dim" style="font-weight:400">- read from their ASS tracks; with ${d.style_min_files}+ files agreeing the Subtitle maker matches it</span>
-    <label class="gsw" style="margin-left:10px;font-weight:400"><input type="checkbox" ${d.match_style?'checked':''} onchange="fetch('/api/learn/match_style?on='+(this.checked?1:0),{method:'POST'}).then(()=>lrnLoad('${kind}',true))"><span class="gname">match the show's style</span><span class="gstate ${d.match_style?'on':'off'}">${d.match_style?'on':'off'}</span></label></div>
-    ${st.length?`<div class="rowbox scrollbox" style="max-height:200px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
-      <colgroup><col style="width:auto"><col style="width:150px"><col style="width:50px"><col style="width:90px"><col style="width:60px"><col style="width:50px"><col style="width:auto"></colgroup>
-      <thead><tr class="dim" style="font-size:10.5px"><th class="l">SHOW</th><th class="l">FONT</th><th class="c">SIZE</th><th class="c">PLACEMENT</th><th class="c">MARGIN</th><th class="c">FILES</th><th class="l">SIGN STYLES</th></tr></thead><tbody>
-      ${st.map(s=>`<tr><td class="l" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(s.show)}"><b>${esc(s.label)}</b></td>
-        <td class="l">${esc(s.font)}${s.bold?' <span class="dim">bold</span>':''}</td><td class="c">${s.size}</td>
-        <td class="c dim">${({1:'bottom left',2:'bottom',3:'bottom right',4:'middle left',5:'middle',6:'middle right',7:'top left',8:'top',9:'top right'})[s.align]||s.align}</td>
-        <td class="c dim">${s.margin_v}</td><td class="c" style="color:${s.files>=d.style_min_files?'#3fb950':'var(--dim)'}">${s.files}</td>
-        <td class="l dim" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.sign_names||'-')}</td></tr>`).join('')}
-      </tbody></table></div>`:'<div class="dim" style="font-size:11px">No track read yet - the second opinion reads one each time it checks a text track.</div>'}`;
-}
-
 // ---- Subtitle AI: the maker, the second opinion and what the tools learn ----
 async function loadSubai(){
   if(!document.getElementById('subaiPane')) return;
@@ -39366,84 +39350,109 @@ async function lrnLoad(kind,force){
   lrnPaint(kind);
 }
 function lrnPaint(kind){
+  // ONE LEDGER. Erik, 2026-11-03: "a simplified section that keeps track of
+  // what the Sub AI system has learned". So: a summary line, one table of
+  // shows that have something learnt (names / corrections / style / answers),
+  // a row opening to the detail and its controls, the how-it-works folded
+  // away, and the "Lately" ledger. Shows with nothing learnt stay out.
   const el=lrnHost(kind), d=_lrn[kind]; if(!el||!d) return;
-  const shows=d.shows||[], fx=d.fixes||[];
+  const shows=d.shows||[], fx=d.fixes||[], styles=d.styles||[], answers=d.answers||[], events=d.events||[];
+  const isOcr=kind==='ocr';
+  const by={}; const row=k=>by[k]||(by[k]={show:k,label:'',names_on:0,fixes:[],style:null,ans:null,made:0,last:0});
+  shows.forEach(s=>{ const r=row(s.show); Object.assign(r,s); r.fixes=[]; });
+  fx.forEach((f,i)=>{ const r=row(f.show); r.label=r.label||f.label||''; r.fixes.push(Object.assign({i},f)); });
+  if(!isOcr){ styles.forEach(st=>{ const r=row(st.show); r.label=r.label||st.label||''; r.style=st; });
+    if(kind!=='whisper') answers.forEach(a=>{ const r=row(a.show); r.label=r.label||a.label||''; r.ans=a; }); }
+  events.forEach(e=>{ if(by[e.show]) by[e.show].last=Math.max(by[e.show].last,e.at||0); });
+  const every=by['*']; delete by['*'];
+  const rows=Object.values(by).filter(r=>(!isOcr&&r.names_on>0)||r.fixes.length||r.style||r.ans)
+    .sort((a,b)=>(b.last-a.last)||(b.names_on-a.names_on));
+  const quiet=shows.length-rows.filter(r=>shows.some(s=>s.show===r.show)).length;
   const active=fx.filter(f=>f.active).length, waiting=fx.filter(f=>f.on_&&!f.active).length;
-  const withNames=shows.filter(s=>s.names_on>0).length;
-  const showsTbl=(kind!=='ocr')?`
-    <div style="font-size:11.5px;font-weight:600;margin:10px 0 4px">Names, per show
-      <span class="dim" style="font-weight:400">- up to ${d.names_max} go to ${kind==='whisper'?'Whisper as its prompt':kind==='qwen'?'Qwen as spellings to keep':'Whisper as its prompt and to Qwen as spellings to keep'}</span></div>
-    ${shows.length?`<div class="rowbox scrollbox" style="max-height:300px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
-      <colgroup><col style="width:auto"><col style="width:80px"><col style="width:90px"><col style="width:150px"><col style="width:70px"><col style="width:90px"></colgroup>
-      <thead><tr class="dim" style="font-size:10.5px"><th class="l">SHOW</th><th class="c">NAMES</th><th class="c">CORRECTIONS</th>
-        <th class="c">NAMES FROM</th><th class="c">MADE</th><th class="r"></th></tr></thead><tbody>
-      ${shows.map((s,i)=>`<tr><td class="l" title="${esc(s.show)}"><b>${esc(s.label||s.show)}</b></td>
-        <td class="c">${fmt(s.names_on)}${s.names_all>s.names_on?`<span class="dim"> /${fmt(s.names_all)}</span>`:''}</td>
-        <td class="c">${fmt(s.fixes_on)}${s.applied?`<span class="dim" title="times applied"> · ${fmt(s.applied)}×</span>`:''}</td>
-        <td class="c dim" style="font-size:10.5px">${esc(s.names_from||'-')}${s.names_built_at?' · '+ago(s.names_built_at):''}</td>
-        <td class="c dim" title="subtitles nuarr made for this show, watched for your edits">${fmt(s.made||0)}</td>
-        <td class="r"><button class="rmb" onclick="lrnOpen('${kind}',${i})">${_lrnOpen[kind]===s.show?'Close':'Names…'}</button></td></tr>
-        ${_lrnOpen[kind]===s.show?`<tr><td colspan="6" style="background:rgba(255,255,255,.025);padding:6px 10px;white-space:normal">${lrnShowBody(kind,s)}</td></tr>`:''}`).join('')}
-      </tbody></table></div>`:`<div class="dim" style="font-size:11px">No show has been through the Subtitle maker or the OCR repair yet - names are gathered the first time one is.</div>`}`:'';
+  const nNames=shows.reduce((t,s)=>t+(s.names_on||0),0);
+  const chip=(n,w,c)=>`<span><b style="color:${c||'inherit'}">${fmt(n)}</b> <span class="dim">${w}</span></span>`;
+  const PL={1:'bottom left',2:'bottom',3:'bottom right',4:'middle left',5:'middle',6:'middle right',7:'top left',8:'top',9:'top right'};
+  const styleWord=st=>st?`${esc(st.font)}${st.bold?' bold':''} ${st.size} · ${PL[st.align]||st.align}`:'';
   const scopeOf={whisper:['whisper','any'],qwen:['qwen','ocr','any'],ocr:['ocr','any'],subai:['any','whisper','qwen','ocr']}[kind]||['any'];
-  const fxTbl=`
-    <div style="font-size:11.5px;font-weight:600;margin:12px 0 4px">${kind==='ocr'?'Correction memory':'Corrections'}
-      <span class="dim" style="font-weight:400">- wrong → right, whole words, for that show (or every show)</span></div>
-    ${fx.length?`<div class="rowbox scrollbox" style="max-height:280px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
-      <colgroup><col style="width:22%"><col style="width:auto"><col style="width:58px"><col style="width:74px"><col style="width:44px"><col style="width:44px"><col style="width:84px"><col style="width:118px"></colgroup>
-      <thead><tr class="dim" style="font-size:10.5px"><th class="l">SHOW</th><th class="l">WRONG → RIGHT</th><th class="c">FOR</th><th class="c">FROM</th>
-        <th class="c">SEEN</th><th class="c">USED</th><th class="c">STATE</th><th class="r"></th></tr></thead><tbody>
-      ${fx.map((f,i)=>`<tr><td class="l" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(f.show)}">${f.show==='*'?'<i>every show</i>':esc(f.label||f.show)}</td>
-        <td class="l mono" style="font-size:11px"><span style="color:#e0575b">${esc(f.wrong)}</span> → <span style="color:#3fb950">${esc(f.right)}</span></td>
-        <td class="c dim">${esc(f.scope)}</td><td class="c dim">${esc(LRN_SRC[f.source]||f.source)}</td>
-        <td class="c">${fmt(f.n)}</td><td class="c">${fmt(f.applied||0)}</td>
-        <td class="c" style="font-size:10.5px;color:${f.active?'#3fb950':f.on_?'#e3b341':'var(--dim)'}">${f.active?'in use':f.on_?`waiting (${f.n}/${d.qwen_adopt_n})`:'off'}</td>
-        <td class="r" style="white-space:nowrap"><button class="rmb" onclick="lrnFix('${kind}',${i},'${f.on_?'off':'on'}')">${f.on_?'Turn off':'Turn on'}</button>
-          <button class="rmb" onclick="lrnFix('${kind}',${i},'delete')">Delete</button></td></tr>`).join('')}
-      </tbody></table></div>`:`<div class="dim" style="font-size:11px">Nothing learnt yet.</div>`}
-    <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:6px;font-size:11px">
-      add: <select id="lrnShow-${kind}" style="font-size:11px;max-width:220px"><option value="*">every show</option>
-        ${shows.map(s=>`<option value="${esc(s.show)}">${esc(s.label||s.show)}</option>`).join('')}</select>
-      <input id="lrnW-${kind}" placeholder="wrong" style="font-size:11px;width:130px">
-      <span>→</span><input id="lrnR-${kind}" placeholder="right" style="font-size:11px;width:130px">
-      <select id="lrnS-${kind}" style="font-size:11px">${scopeOf.map(s=>`<option value="${s}">${s==='any'?'everywhere':s}</option>`).join('')}</select>
-      <button class="rmb" onclick="lrnAddFix('${kind}')">Add correction</button></div>`;
-  const answers=(kind==='qwen'||kind==='subai')?`
-    <div style="font-size:11.5px;font-weight:600;margin:12px 0 4px">Your answers Qwen learns from
-      <span class="dim" style="font-weight:400">- burned-in subtitle questions you answered; shown to Qwen as examples for the same show</span></div>
-    ${(d.answers||[]).length?`<div style="display:flex;flex-wrap:wrap;gap:4px 14px;font-size:11px">${(d.answers||[]).slice(0,30).map(a=>
-      `<span title="${esc(a.show)}">${esc(a.label)} <span class="dim">${a.yes} yes · ${a.no} no</span></span>`).join('')}</div>`:'<div class="dim" style="font-size:11px">none yet</div>'}`:'';
+  const addFix=(show,sfx)=>`<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:11px;margin-top:4px">
+      <span class="dim">teach it:</span><input id="lrnW-${kind}-${sfx}" placeholder="wrong" style="font-size:11px;width:120px">
+      <span>→</span><input id="lrnR-${kind}-${sfx}" placeholder="right" style="font-size:11px;width:120px">
+      <select id="lrnS-${kind}-${sfx}" style="font-size:11px">${scopeOf.map(x=>`<option value="${x}">${x==='any'?'everywhere':x}</option>`).join('')}</select>
+      <button class="rmb" onclick="lrnAddFix('${kind}','${esc(show).replace(/'/g,"\\'")}','${sfx}')">Add</button></div>`;
+  const fixList=list=>list.length?`<div style="font-size:11px">${list.map(f=>`<div style="display:flex;gap:8px;align-items:center;margin:1px 0">
+      <span class="mono"><span style="color:#e0575b">${esc(f.wrong)}</span> → <span style="color:#3fb950">${esc(f.right)}</span></span>
+      <span class="dim">${esc(f.scope==='any'?'everywhere':f.scope)} · ${esc(LRN_SRC[f.source]||f.source)} · seen ${fmt(f.n)}× · used ${fmt(f.applied||0)}×</span>
+      <span style="color:${f.active?'#3fb950':f.on_?'#e3b341':'var(--dim)'}">${f.active?'in use':f.on_?`waiting (${f.n}/${d.qwen_adopt_n})`:'off'}</span>
+      <span style="margin-left:auto;white-space:nowrap"><button class="rmb" onclick="lrnFix('${kind}',${f.i},'${f.on_?'off':'on'}')">${f.on_?'Turn off':'Turn on'}</button>
+        <button class="rmb" onclick="lrnFix('${kind}',${f.i},'delete')">Delete</button></span></div>`).join('')}</div>`:'';
+  const openKey=_lrnOpen[kind];
+  const detail=r=>`<tr onclick="event.stopPropagation()"><td colspan="7" style="background:rgba(255,255,255,.025);padding:7px 10px;white-space:normal">
+      ${!isOcr?`<div style="font-size:11px;font-weight:600;margin-bottom:2px">Names <span class="dim" style="font-weight:400">- ${esc(r.names_from||'none gathered yet')}${r.names_built_at?' · '+ago(r.names_built_at):''}</span></div>${lrnShowBody(kind,r)}`:''}
+      <div style="font-size:11px;font-weight:600;margin:8px 0 2px">Corrections${r.fixes.length?'':' <span class="dim" style="font-weight:400">- none for this show yet</span>'}</div>
+      ${fixList(r.fixes)}${addFix(r.show,'row')}
+      ${r.style?`<div style="font-size:11px;font-weight:600;margin:8px 0 2px">Subtitle style <span class="dim" style="font-weight:400">- read from ${r.style.files} ASS track(s)${r.style.files>=d.style_min_files?', the Subtitle maker matches it':`, matched once ${d.style_min_files} agree`}</span></div>
+        <div style="font-size:11px">${styleWord(r.style)} · margin ${r.style.margin_v}${r.style.sign_names?` · sign styles: ${esc(r.style.sign_names)}`:''}</div>`:''}
+      ${r.ans?`<div style="font-size:11px;font-weight:600;margin:8px 0 2px">Your answers <span class="dim" style="font-weight:400">- shown to Qwen as examples for this show</span></div>
+        <div style="font-size:11px">${r.ans.yes} yes · ${r.ans.no} no</div>`:''}
+    </td></tr>`;
+  const tbl=rows.length?`<div class="rowbox scrollbox" style="max-height:360px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <colgroup><col style="width:auto"><col style="width:70px"><col style="width:96px"><col style="width:190px"><col style="width:80px"><col style="width:70px"><col style="width:80px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px"><th class="l">SHOW</th><th class="c">NAMES</th><th class="c">CORRECTIONS</th><th class="l">STYLE</th><th class="c">ANSWERS</th><th class="c">MADE</th><th class="r">LEARNT</th></tr></thead><tbody>
+      ${every?`<tr style="cursor:pointer" onclick="lrnToggle('${kind}','*')"><td class="l"><i>every show</i></td><td class="c dim">-</td>
+        <td class="c">${fmt(every.fixes.filter(f=>f.on_).length)}</td><td class="l dim">-</td><td class="c dim">-</td><td class="c dim">-</td><td class="r dim" style="font-size:10.5px">${every.last?ago(every.last):''}</td></tr>
+        ${openKey==='*'?detail(every):''}`:''}
+      ${rows.map(r=>{ const open=openKey===r.show, fon=r.fixes.filter(f=>f.on_).length;
+        return `<tr style="cursor:pointer" onclick="lrnToggle('${kind}','${esc(r.show).replace(/'/g,"\\'")}')">
+          <td class="l" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.show)}"><b>${esc(r.label||r.show)}</b></td>
+          <td class="c">${isOcr?'<span class="dim">-</span>':r.names_on?fmt(r.names_on):'<span class="dim">-</span>'}</td>
+          <td class="c">${fon?fmt(fon)+(r.applied?`<span class="dim"> · ${fmt(r.applied)}×</span>`:''):'<span class="dim">-</span>'}</td>
+          <td class="l" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${r.style&&r.style.files>=d.style_min_files?'inherit':'var(--dim)'}">${r.style?styleWord(r.style):'<span class="dim">-</span>'}</td>
+          <td class="c">${r.ans?`<span style="color:#3fb950">${r.ans.yes}</span> / <span style="color:#e0575b">${r.ans.no}</span>`:'<span class="dim">-</span>'}</td>
+          <td class="c dim" title="subtitles nuarr made for this show, watched for your edits">${r.made?fmt(r.made):'-'}</td>
+          <td class="r dim" style="font-size:10.5px">${r.last?ago(r.last):(r.names_built_at?ago(r.names_built_at):'')}</td></tr>${open?detail(r):''}`; }).join('')}
+      </tbody></table></div>`:`<div class="dim" style="font-size:11px">Nothing learnt yet - names are gathered the first time a show goes through the Subtitle maker or the OCR repair.</div>`;
   el.innerHTML=vfyBlock(kind)+`<div class="lkind" style="margin-top:12px;padding:11px 12px">
-    <div class="lkindhead"><b style="color:#79c0ff">What it learns</b>
-      <span class="dim" style="font-size:11px">${fmt(withNames)} show(s) with names · ${fmt(active)} correction(s) in use${waiting?` · ${fmt(waiting)} waiting for a second sighting`:''}
-        · ${fmt(d.made_kept||0)} made subtitle(s) watched for your edits${d.made_ocr?` (${fmt(d.made_ocr)} OCR'd)`:''}${d.last_scan?` · last looked ${ago(d.last_scan)}`:''}</span>
-      <button class="rmb" style="margin-left:6px" onclick="lrnScan('${kind}',this)" title="Compare every subtitle nuarr made with the one on disk now; what you changed becomes corrections and names. Runs by itself once a day.">${d.scanning?'looking…':'Look for your edits now'}</button></div>
-    <div class="dim" style="font-size:11px;margin:4px 0 2px">${LRN_TXT[kind]}</div>
-    <div class="dim" style="font-size:11px">Your edits: change a subtitle nuarr made - the <span class="mono">.en.ass</span>/<span class="mono">.en.srt</span> beside a file or the "English (nuarr)" track inside it, or a text track the OCR converter made from a picture track (named as it was written) - in Subtitle Edit or any editor, and the changed words are learnt the next time it looks; an edit to an OCR'd track goes to the OCR correction memory.
-      ${d.last_scan_result?` <span>Last look: ${esc(d.last_scan_result)}.</span>`:''}</div>
-    ${showsTbl}${lrnStyles(kind,d)}${fxTbl}${answers}
-    ${(d.events||[]).length?`<div style="font-size:11.5px;font-weight:600;margin:12px 0 4px">Lately</div>
-      <div style="font-size:11px">${(d.events||[]).slice(0,10).map(e=>`<div><span class="dim">${ago(e.at)}</span> · <b>${esc(e.label||e.show||'')}</b> - ${esc(e.detail)}</div>`).join('')}</div>`:''}
+    <div class="lkindhead"><b style="color:#79c0ff">What it has learned</b>
+      <span class="dim" style="font-size:11px">${d.last_scan?`last looked for your edits ${ago(d.last_scan)}`:'has not looked for your edits yet'}${d.last_scan_result?' · '+esc(d.last_scan_result):''}</span>
+      <button class="rmb" style="margin-left:auto" onclick="lrnScan('${kind}',this)" title="Compare every subtitle nuarr made with the one on disk now; what you changed becomes corrections and names. Runs by itself once a day.">${d.scanning?'looking…':'Look for your edits now'}</button></div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px 18px;align-items:center;font-size:11.5px;margin:7px 0 8px">
+      ${!isOcr?chip(nNames,`name${nNames===1?'':'s'} across ${fmt(rows.filter(r=>r.names_on>0).length)} show${rows.filter(r=>r.names_on>0).length===1?'':'s'}`,'#79c0ff'):''}
+      ${chip(active,`correction${active===1?'':'s'} in use`,'#3fb950')}${waiting?chip(waiting,'waiting for a second sighting','#e3b341'):''}
+      ${!isOcr?chip(styles.length,`show style${styles.length===1?'':'s'} read`):''}
+      ${!isOcr&&kind!=='whisper'?chip(answers.reduce((t,a)=>t+a.yes+a.no,0),'answers of yours kept'):''}
+      ${chip(d.made_kept||0,`made subtitle${d.made_kept===1?'':'s'} watched for your edits`)}
+      ${!isOcr?`<label class="gsw" style="font-weight:400;margin-left:auto"><input type="checkbox" ${d.match_style?'checked':''} onchange="fetch('/api/learn/match_style?on='+(this.checked?1:0),{method:'POST'}).then(()=>lrnLoad('${kind}',true))"><span class="gname">match each show's style</span><span class="gstate ${d.match_style?'on':'off'}">${d.match_style?'on':'off'}</span></label>`:''}
+    </div>
+    ${tbl}
+    <div class="dim" style="font-size:10.5px;margin:4px 0 2px">${quiet>0?`${fmt(quiet)} more show${quiet===1?'':'s'} seen with nothing learnt yet · `:''}click a show for its names, corrections and style - and to teach it a correction${every?'':` · <a href="#" onclick="lrnToggle('${kind}','*');return false" style="color:#6fb0ff">a correction for every show</a>`}</div>
+    ${!every&&openKey==='*'?`<div style="background:rgba(255,255,255,.025);padding:7px 10px;font-size:11px"><b>Every show</b>${addFix('*','all')}</div>`:''}
+    ${events.length?`<div style="font-size:11.5px;font-weight:600;margin:12px 0 4px">Lately <span class="dim" style="font-weight:400">- each thing it learnt, newest first</span></div>
+      <div style="font-size:11px">${events.slice(0,_lrnMore[kind]?60:8).map(e=>`<div><span class="dim" style="display:inline-block;width:62px">${ago(e.at)}</span> <b>${esc(e.label||e.show||'')}</b> <span class="dim">- ${esc(e.detail)}</span></div>`).join('')}
+      ${events.length>8?`<a href="#" class="dim" style="font-size:10.5px" onclick="_lrnMore['${kind}']=!_lrnMore['${kind}'];lrnPaint('${kind}');return false">${_lrnMore[kind]?'fewer':`all ${events.length}`}</a>`:''}</div>`:''}
+    <details style="margin-top:10px"><summary class="dim" style="cursor:pointer;font-size:11px">How it learns</summary>
+      <div class="dim" style="font-size:11px;margin:4px 0 2px">${LRN_TXT[kind]}</div>
+      <div class="dim" style="font-size:11px">Your edits: change a subtitle nuarr made - the <span class="mono">.en.ass</span>/<span class="mono">.en.srt</span> beside a file or the "English (nuarr)" track inside it, or a text track the OCR converter made from a picture track (named as it was written) - in Subtitle Edit or any editor, and the changed words are learnt the next time it looks; an edit to an OCR'd track goes to the OCR correction memory.</div></details>
   </div>`;
+}
+let _lrnMore={};
+async function lrnToggle(kind,show){
+  if(_lrnOpen[kind]===show){ _lrnOpen[kind]=null; lrnPaint(kind); return; }
+  _lrnOpen[kind]=show; lrnPaint(kind);
+  if(show==='*') return;
+  try{ _lrnShow[show]=await (await fetch('/api/learn/show?show='+encodeURIComponent(show))).json(); }catch(e){}
+  lrnPaint(kind);
 }
 function lrnShowBody(kind,s){
   const det=_lrnShow[s.show];
-  if(!det) return '<span class="dim">loading…</span>';
+  if(!det) return '<span class="dim" style="font-size:11px">loading…</span>';
   const nm=det.names||[];
-  return `<div style="font-size:11px;margin-bottom:4px">${nm.length?nm.map((n,i)=>`<span onclick="lrnName('${kind}',${i},'${n.on_?'off':'on'}')" title="${esc(LRN_SRC[n.source]||n.source)} · seen ${n.n}× - click to turn ${n.on_?'off':'on'}"
+  return `<div style="font-size:11px;margin-bottom:4px">${nm.length?nm.map((n,i)=>`<span onclick="event.stopPropagation();lrnName('${kind}',${i},'${n.on_?'off':'on'}')" title="${esc(LRN_SRC[n.source]||n.source)} · seen ${n.n}× - click to turn ${n.on_?'off':'on'}"
       style="display:inline-block;margin:2px 3px;padding:0 6px;border:1px solid ${n.on_?'#3b6f99':'var(--line)'};border-radius:9px;cursor:pointer;${n.on_?'':'opacity:.45;text-decoration:line-through'}">${esc(n.name)}<span class="dim"> ${n.n}</span></span>`).join(''):'<span class="dim">no names yet</span>'}</div>
     <div style="display:flex;gap:6px;align-items:center;font-size:11px">
       <input id="lrnN-${kind}" placeholder="add a name" style="font-size:11px;width:160px">
       <button class="rmb" onclick="lrnAddName('${kind}')">Add</button>
       <button class="rmb" onclick="lrnRebuild('${kind}',this)" title="Read the English subtitles in this show's folder again">Gather again</button>
       <span class="dim">click a name to switch it off or on</span></div>`;
-}
-async function lrnOpen(kind,i){
-  const s=(_lrn[kind].shows||[])[i]; if(!s) return;
-  if(_lrnOpen[kind]===s.show){ _lrnOpen[kind]=null; lrnPaint(kind); return; }
-  _lrnOpen[kind]=s.show; lrnPaint(kind);
-  try{ _lrnShow[s.show]=await (await fetch('/api/learn/show?show='+encodeURIComponent(s.show))).json(); }catch(e){}
-  lrnPaint(kind);
 }
 async function lrnPost(url,body){
   try{ return await (await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json(); }catch(e){ return {}; }
@@ -39470,11 +39479,11 @@ async function lrnFix(kind,i,action){
   await lrnPost('/api/learn/fix',{show:f.show,wrong:f.wrong,right:f.right,scope:f.scope,action});
   lrnLoad(kind,true);
 }
-async function lrnAddFix(kind){
+async function lrnAddFix(kind,show,sfx){
   const g=id=>(document.getElementById(id)||{}).value||'';
-  const wrong=g('lrnW-'+kind).trim(), right=g('lrnR-'+kind).trim();
+  const wrong=g(`lrnW-${kind}-${sfx}`).trim(), right=g(`lrnR-${kind}-${sfx}`).trim();
   if(!wrong||!right) return;
-  await lrnPost('/api/learn/fix',{show:g('lrnShow-'+kind)||'*',wrong,right,scope:g('lrnS-'+kind)||'any',action:'add'});
+  await lrnPost('/api/learn/fix',{show:show||'*',wrong,right,scope:g(`lrnS-${kind}-${sfx}`)||'any',action:'add'});
   lrnLoad(kind,true);
 }
 async function lrnScan(kind,btn){
