@@ -19169,13 +19169,14 @@ document.addEventListener('mouseover', e=>{
   const chip=e.target.closest && e.target.closest('.trend[data-tdisk]');
   if(chip){ if(_tpopTimer) clearTimeout(_tpopTimer); tpopShow(chip); }
   const jd=e.target.closest && e.target.closest('[data-jdisk],[data-dpop],[data-wpop]');
-  if(jd){ if(_jpopTimer) clearTimeout(_jpopTimer); jpopShow(jd); }
+  // a drive row's card opens on click only (Erik: no hover there)
+  if(jd && jd.dataset.dpop!=='health'){ if(_jpopTimer) clearTimeout(_jpopTimer); jpopShow(jd); }
 });
 document.addEventListener('mouseout', e=>{
   const chip=e.target.closest && e.target.closest('.trend[data-tdisk]');
   if(chip && !(e.relatedTarget && _tpop && _tpop.contains(e.relatedTarget))) tpopHide();
   const jd=e.target.closest && e.target.closest('[data-jdisk],[data-dpop],[data-wpop]');
-  if(jd && !(e.relatedTarget && _jpop && _jpop.contains(e.relatedTarget))) jpopHide();
+  if(jd && jd.dataset.dpop!=='health' && !(e.relatedTarget && _jpop && _jpop.contains(e.relatedTarget))) jpopHide();
 });
 // WHERE THE POINTER IS, for the repaint check below. A row that is rebuilt
 // under the pointer does not fire mouseover again until the mouse moves, and
@@ -20662,11 +20663,15 @@ function runTileFeed(live){
   _runJobs=rows; _runPaintAt=Date.now();
   _runN=rows.length;
   if(!rows.length){ _runSub='nothing running'; runTilePaint(); return; }
-  // Name the furthest along, since that is the one about to change.
-  const lead=rows.slice().sort((a,b)=>(b.progress||0)-(a.progress||0))[0];
-  const pct=Math.round((lead.progress||0)*100);
-  const eta=lead.eta_s?` · ${lead.eta_est?'~':''}${hms(lead.eta_s)} left`:'';
-  _runSub=`${esc(lead.pool||lead.kind||'job')} ${pct}%${eta}`;
+  // ALL OF IT, NOT THE FRONT RUNNER. The jobs run side by side, so the whole
+  // set is done when the slowest one is - the longest time left, marked ~ if
+  // any of it is worked out from progress or a job has no estimate yet.
+  const etas=rows.map(r=>r.eta_s).filter(x=>x>0);
+  if(etas.length){
+    const rough=rows.some(r=>r.eta_est||!(r.eta_s>0));
+    _runSub=`all done in ${rough?'~':''}${hms(Math.max(...etas))}`
+      +(etas.length<rows.length?` <span class="dim">· ${rows.length-etas.length} still estimating</span>`:'');
+  }else _runSub='estimating time left…';
   runTilePaint();
 }
 function runTilePaint(){
@@ -31902,8 +31907,7 @@ function dwCtlTable(C){
     // - name, the full model, the status - none of which may be clipped.
     return `<td style="text-align:left;padding:3px 6px;white-space:normal;overflow:hidden;line-height:1.3">`
       + (q?`<span class="dim mono" style="font-size:10px">port ${q.port}</span> `:'')
-      + `<b style="color:${diskColor(d.name)}">${esc(d.name)}</b>`
-      + (sub?`<span class="dim" style="font-size:10px"> ${esc(sub)}</span>`:'')
+      + `<b style="color:${diskColor(d.name)}">${esc(d.name)}${sub?' '+esc(sub):''}</b>`
       + `<span style="width:7px;height:7px;border-radius:50%;display:inline-block;margin-left:6px;background:${L.col}" title="${esc(status(d))}"></span>`
       + `<div class="mono" style="font-size:10.5px;color:var(--dim,#8a97a6)">${esc(d.model||'')}</div>`
       + `<div style="font-size:10px;color:${d.warn?'#e3b341':L.watch?'#d29922':'var(--dim,#8a97a6)'}">${esc(status(d))}</div></td>`; };
@@ -31916,7 +31920,7 @@ function dwCtlTable(C){
       : d.type==='ssd' ? '<span class="dim">PCIe</span>' : '—');
   const waitCell=(c,q)=>tmCell(c, q?`<span class="mono">${ms(q.wr_max_ms)} · ${ms(q.rd_max_ms)}</span>`:'—');
   const retryCell=(c,q)=>tmCell(c, q?`<span class="mono" style="color:${q.retried_24h?'#e5534b':q.retried_30d?'#e8a33d':'inherit'}">${fmt(q.retried_24h)} · ${fmt(q.retried_30d)}</span>${q.last_retried?`<span class="dim" style="font-size:10px"> ${ago(q.last_retried)}</span>`:''}`:'—');
-  const tr=(d,cells)=>`<tr style="border-top:1px solid var(--line);cursor:pointer" data-dpop="health" data-ddisk="${esc(d.key)}" title="click to pin this drive's card">${cells}</tr>`;
+  const tr=(d,cells)=>`<tr style="border-top:1px solid var(--line);cursor:pointer" data-dpop="health" data-ddisk="${esc(d.key)}" title="click for this drive's card">${cells}</tr>`;
   const table=(cols,rows)=>`<table style="width:100%;font-size:11.5px;border-collapse:collapse;table-layout:fixed">${tmCols(cols)}<tbody>${rows}</tbody></table>`;
 
   const S=[{t:'NVMe / SSD',w:'auto',a:'left'},{t:'link',w:'4%'},{t:'life used',w:'10%',a:'left'},

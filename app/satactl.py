@@ -144,6 +144,7 @@ _KNOWN = {
     ("1000", "0097"): ("LSI SAS3008 HBA", "SAS", 8),
     ("15B7", "5002"): ("WD Black SN750 NVMe", "NVMe", 1),
     ("C0A9", "5427"): ("Crucial P310 NVMe", "NVMe", 1),
+    ("15B7", "5006"): ("WD Red SN700 NVMe", "NVMe", 1),
 }
 _LANE_MBPS = {1: 250, 2: 500, 3: 985, 4: 1969, 5: 3938}
 
@@ -210,6 +211,13 @@ def _inventory() -> dict:
     for c in ctls:
         c["raidports"] = sorted(c.get("raidports") or [])
         c["disks"].sort(key=lambda x: x["port"])
+        # AN NVMe DRIVE IS ITS OWN CONTROLLER, so one missing from _KNOWN is
+        # named after the drive rather than Windows' inbox driver: "Standard
+        # NVM Express Controller (15B7:5006)" was the WD Red SN700 F: drive.
+        if c["bus"] == "NVMe" and c["model"].startswith(c["name"] + " (") and len(c["disks"]) == 1:
+            dm = (c["disks"][0].get("model") or "").strip()
+            if dm:
+                c["model"] = f"{dm} NVMe" if "NVME" not in dm.upper() else dm
     # SATA first, by slot; NVMe after.
     ctls.sort(key=lambda c: (0 if c["bus"] == "SATA" else 1 if c["bus"] == "SAS" else 2, c["slot"]))
     return {"controllers": ctls}
