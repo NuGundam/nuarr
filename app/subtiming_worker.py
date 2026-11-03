@@ -509,6 +509,26 @@ PW_JUMP = 0.35               # neighbours this far apart are different stretches
 PW_MAX_DUR = 5400.0          # hear the whole file only up to 90 minutes
 
 
+def _pw_short(as_: dict, bs: dict, heard: int, r0: float, r1: float) -> str:
+    """Which acceptance test the corrected track failed, in words - "9% of
+    slices stay out" read as a pass when the miss was one slice 1.4 s out."""
+    out = []
+    if as_.get("n", 0) < max(2, int(0.6 * heard)):
+        out.append(f"only {as_.get('n', 0)} of {heard} slices could be judged after")
+    if as_.get("median_abs") is not None and as_["median_abs"] > 0.2:
+        out.append(f"the typical slice is still {as_['median_abs']:.2f}s out")
+    if as_.get("within", 0) < 0.85:
+        out.append(f"{int(round((1 - as_.get('within', 0)) * 100))}% of slices stay out")
+    if abs(as_.get("worst") or 0) > 0.6:
+        out.append(f"one slice is still {as_['worst']:+.1f}s out")
+    if r1 < r0 + 0.01:
+        out.append("it matches the speech no better than before")
+    if (not out and bs.get("median_abs") is not None and as_.get("median_abs") is not None
+            and as_["median_abs"] > max(0.1, bs["median_abs"] * 0.6)):
+        out.append(f"it only gets from {bs['median_abs']:.2f}s to {as_['median_abs']:.2f}s")
+    return ", ".join(out) or "it does not pass the check"
+
+
 def pw_windows(dur: float) -> list:
     w, t = [], 0.0
     while t < dur - 30:
@@ -690,7 +710,7 @@ def pw_measure(sp: np.ndarray, cs: list, dur: float) -> dict | None:
     why = (f"timed to another cut - {len(pieces)} stretches: {words}"
            + (f"; {len(drops)} lines nobody says dropped" if drops else "")
            + (f"; corrected every slice is within {as_['median_abs']:.2f}s" if ok
-              else f"; even so {int((1 - as_.get('within', 0)) * 100)}% of slices stay out - left alone"))
+              else "; even so " + _pw_short(as_, bs, heard, r0, r1) + " - left alone"))
     return {"ok": ok, "pieces": pieces, "drops": drops, "before": before, "after": after,
             "before_sum": bs, "after_sum": as_, "r_before": round(r0, 3), "r_after": round(r1, 3), "why": why}
 

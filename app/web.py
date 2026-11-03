@@ -39213,6 +39213,13 @@ async function loadSubai(){
 let _stm=null, _stmOpen=null, _stmMsg=null, _stmTimer=null;
 const STM_V={ok:['#3fb950','in step'],offset:['#e3b341','offset'],drift:['#e3b341','drift'],piecewise:['#e3b341','another cut'],messy:['#e0575b','out of step'],
   unsure:['#8b949e','unsure'],skipped:['#8b949e','skipped'],failed:['#e0575b','failed'],off:['#e0575b','still off']};
+// THE REAL REASON. A messy track that got the close look carries why that
+// failed in pw_why ("even so 32% of slices stay out"); the generic "no single
+// shift fixes it" sentence hid it.
+function stmWhy(t){
+  if(t.verdict==='messy' && t.pw_why) return 'the close look, a stretch at a time: '+t.pw_why;
+  return t.why||'';
+}
 function stmWord(v){ const c=STM_V[v]||['#8b949e',v||'-']; return `<span style="color:${c[0]}">${esc(c[1])}</span>`; }
 function stmMmss(t){ return Math.floor(t/60)+':'+String(Math.floor(t%60)).padStart(2,'0'); }
 async function stmLoad(){
@@ -39273,10 +39280,10 @@ function stmPaint(){
           <td class="l" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.path)}"><b>${esc(r.label)}</b>
             <div class="dim" style="font-size:10px">${tr.map(t=>`${t.ord+1}: ${esc(t.title||t.lang)}`).join(' · ')}</div></td>
           <td class="c">${stmWord(r.verdict)}</td>
-          <td class="l" style="font-size:10.5px;white-space:normal">${tr.filter(t=>t.verdict!=='ok').map(t=>esc(t.why||'')).slice(0,1).join('')||esc(r.note||'')}</td>
+          <td class="l" style="font-size:10.5px;white-space:normal">${esc(stmWhy(tr.find(t=>t.verdict!=='ok')||tr[0]||{})||r.note||'')}</td>
           <td class="l" style="font-size:10.5px;color:${r.action.startsWith('fixed')?'#3fb950':r.action.includes('fail')?'#e0575b':'var(--dim)'}">${esc(r.action)}${r.note&&r.action.includes('fail')?`<div class="dim" style="font-size:10px;white-space:normal">${esc(r.note)}</div>`:''}</td></tr>
           ${open?`<tr><td colspan="5" style="background:rgba(255,255,255,.025);padding:6px 10px;font-size:11px;white-space:normal">
-            ${tr.map(t=>`<div style="margin-bottom:6px"><b>Track ${t.ord+1}</b> ${esc(t.title||'')} <span class="dim">${esc(t.lang)} · ${esc(t.codec)} · ${t.cues||0} spoken lines${t.audio_lang?' · against the '+esc(t.audio_lang)+' audio':''}</span> - ${stmWord(t.verdict)} <span class="dim">${esc(t.why||'')}</span>
+            ${tr.map(t=>`<div style="margin-bottom:6px"><b>Track ${t.ord+1}</b> ${esc(t.title||'')} <span class="dim">${esc(t.lang)} · ${esc(t.codec)} · ${t.cues||0} spoken lines${t.audio_lang?' · against the '+esc(t.audio_lang)+' audio':''}</span> - ${stmWord(t.verdict)} <span class="dim">${esc(stmWhy(t))}</span>
               <div class="mono" style="font-size:10.5px;margin-top:2px"><span class="dim" style="display:inline-block;width:92px">as it was</span>${stmSlices(t.before)}</div>
               ${t.after&&t.verdict!=='ok'?`<div class="mono" style="font-size:10.5px"><span class="dim" style="display:inline-block;width:92px">${t.fixed?'corrected':'if corrected'}</span>${stmSlices(t.after)}</div>`:''}
               ${t.check&&t.check.length?`<div class="mono" style="font-size:10.5px"><span class="dim" style="display:inline-block;width:92px">measured after</span>${stmSlices(t.check)}</div>`:''}
