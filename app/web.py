@@ -962,6 +962,9 @@ async def _startup() -> None:
     asyncio.create_task(_subocr.watch())
     # Once a day: are there newer OCR engine builds - see updates_watch().
     asyncio.create_task(_subocr.updates_watch())
+    # ...and every other tool nuarr runs, listed on the Updates page.
+    from . import toolsupd as _tu
+    asyncio.create_task(_tu.watch())
     from . import schedules as _sch
     _sch.bind_loop(asyncio.get_running_loop())
     asyncio.create_task(arrhealth.watch())
@@ -7996,6 +7999,27 @@ def api_paddle_install(mode: str = Query("gpu")):
     """Install or update PaddleOCR - gpu, cpu, or update."""
     from . import subocr as _so
     return _so.paddle_install_start(mode)
+
+
+@app.get("/api/tools/updates")
+def api_tools_updates():
+    """Every outside tool: installed, latest, how it updates (toolsupd.py)."""
+    from . import toolsupd
+    return toolsupd.state()
+
+
+@app.post("/api/tools/updates/check")
+async def api_tools_updates_check():
+    from . import toolsupd
+    await asyncio.to_thread(toolsupd.check_all_sync)
+    return toolsupd.state()
+
+
+@app.post("/api/tools/mkvtoolnix/install")
+def api_tools_mkv_install():
+    """Verified silent install of the newest MKVToolNix."""
+    from . import toolsupd
+    return toolsupd.mkv_install_start()
 
 
 @app.get("/api/ocr/updates")
@@ -39897,7 +39921,10 @@ async function loadUpdates(force, quiet){
         ${extra?`<span class="dim" style="margin-left:6px">${esc(extra)}</span>`:''}</span>
     </div>`;
 
+  setTimeout(toolsUpdLoad, 0);
   el.innerHTML=`
+    <div class="lkind" id="toolsUpd" style="padding:11px 12px;margin-bottom:10px">
+      <div class="dim" style="font-size:11.5px">reading the tools…</div></div>
     <div class="lkind" style="padding:11px 12px;margin-bottom:10px">
       <div style="display:flex;justify-content:space-between;align-items:baseline;
                   flex-wrap:wrap;gap:8px">
@@ -39966,6 +39993,54 @@ async function loadUpdates(force, quiet){
     </div>`;
 }
 
+// EVERY TOOL NUARR RUNS, in one list (toolsupd.py): asked once a day, the
+// update button where nuarr can install it, a link to the page that can
+// where that page owns the install, and "check only" where it should not.
+let _tu=null, _tuT=null;
+async function toolsUpdLoad(force){
+  const el=document.getElementById('toolsUpd'); if(!el) return;
+  try{ _tu=await (await fetch('/api/tools/updates'+(force?'/check':''),force?{method:'POST'}:{})).json(); }
+  catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
+  if(!_tu.at && !force){ el.innerHTML='<span class="dim">checking every tool…</span>'; return toolsUpdLoad(true); }
+  const mi=_tu.mkv_install||{};
+  const vt=v=>(String(v||'').match(/\d+/g)||[]).slice(0,4).map(Number);
+  const older=(a,b)=>{ const x=vt(a), y=vt(b); for(let i=0;i<Math.max(x.length,y.length);i++){ if((x[i]||0)!==(y[i]||0)) return (x[i]||0)<(y[i]||0); } return false; };
+  const rows=(_tu.rows||[]).map(r=>{
+    const state = r.error && !r.latest ? `<span class="dim" title="${esc(r.error)}">could not check</span>`
+      : r.newer ? `<b style="color:#e3b341">${esc(r.latest)} available</b>`
+      : r.latest && older(r.latest, r.installed) ? `<span style="color:var(--ok)">up to date</span> <span class="dim">(newer than the feed's ${esc(r.latest)})</span>`
+      : `<span style="color:var(--ok)">up to date</span>`;
+    let act='';
+    if(r.newer){
+      if(r.how==='install') act = mi.state==='installing'
+          ? '<span class="dim">installing…</span>'
+          : `<button onclick="toolsMkvInstall(this)">Update</button>`;
+      else if(r.how==='page' && r.page) act=`<button onclick="wtab('${esc(r.page)}')">Update on its page →</button>`;
+      else if(r.how==='here') act='<span class="dim">below</span>';
+      else act='<span class="dim">yours to install</span>';
+    }
+    if(r.key==='mkvtoolnix' && mi.state==='error') act+=` <span class="err" style="font-size:11px">${esc(mi.error)}</span>`;
+    if(r.key==='mkvtoolnix' && mi.state==='done' && mi.version) act+=` <span class="dim" style="font-size:11px">${esc(mi.version)} installed</span>`;
+    return `<tr style="border-top:1px solid var(--line)">
+      <td style="padding:4px 6px"><b>${esc(r.name)}</b><div class="dim" style="font-size:10.5px">${esc(r.what||'')}</div></td>
+      <td class="mono" style="padding:4px 6px">${esc(r.installed||'—')}</td>
+      <td style="padding:4px 6px">${state}</td>
+      <td style="padding:4px 6px;text-align:right">${act}</td></tr>`;
+  }).join('');
+  const n=(_tu.rows||[]).filter(r=>r.newer).length;
+  el.innerHTML=`<div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+      <b style="color:#6fb0ff">Tools</b>
+      <span class="dim" style="font-size:11px">every program nuarr runs · checked ${_tu.at?ago(_tu.at):'never'}, then once a day${n?` · <b style="color:#e3b341">${n} update${n===1?'':'s'}</b>`:' · all current'}</span>
+      <button style="margin-left:auto" onclick="this.disabled=true;this.textContent='checking…';toolsUpdLoad(true)">Check now</button></div>
+    <table style="width:100%;font-size:11.5px;border-collapse:collapse;margin-top:6px">${rows}</table>`;
+  clearTimeout(_tuT);
+  if(mi.state==='installing') _tuT=setTimeout(()=>toolsUpdLoad(), 3000);
+}
+async function toolsMkvInstall(btn){
+  if(btn){ btn.disabled=true; btn.textContent='installing…'; }
+  try{ await fetch('/api/tools/mkvtoolnix/install',{method:'POST'}); }catch(e){}
+  setTimeout(()=>toolsUpdLoad(), 1500);
+}
 function updProgText(u){
   const a=u.apply||{};
   return a.state==='verifying' ? 'verifying…'
