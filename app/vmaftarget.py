@@ -845,7 +845,7 @@ def snapshot() -> dict:
     with cursor() as cur:
         rows = [dict(r) for r in cur.execute(
             "SELECT at,file_id,job_id,path,library,target,family,cq_fixed,cq_chosen,vmaf,vmaf_min,want,saved_pct,"
-            "probes,secs,note,cambi,final_vmaf,final_vmaf_min,final_cambi,final_note FROM vmaf_log ORDER BY id DESC LIMIT 40")]
+            "probes,secs,note,cambi,final_vmaf,final_vmaf_min,final_cambi,final_note FROM vmaf_log ORDER BY id DESC LIMIT 100")]
         # BEFORE AND AFTER. The job row has the real file sizes, and the plan
         # text the search wrote has the source's banding ("banding 1.2 (source
         # 0.9)") - so this works for files encoded before this table showed it.

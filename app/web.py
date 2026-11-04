@@ -35634,8 +35634,48 @@ function vmafSizes(r){
   if(r.job_state==='skipped') return `${b?humanBytes(b)+' ':''}<span class="dim">original kept</span>`;
   if(!b) return '—';
   if(!a) return `${humanBytes(b)} <span class="dim">→ encoding</span>`;
-  const pct=Math.round((1-a/b)*100);
-  return `${humanBytes(b)} → <b>${humanBytes(a)}</b> <span style="color:${pct>=0?'#7fd4a3':'#e2b341'}">${pct>=0?'-':'+'}${Math.abs(pct)}%</span>`;
+  const pct=Math.round((1-a/b)*100), g=vmGrade(a, b, false, 0);
+  return `${humanBytes(b)} → ${vmNum(humanBytes(a), g, true)} <span style="color:${_vmC[g]}">${pct>=0?'-':'+'}${Math.abs(pct)}%</span>`;
+}
+// BEFORE → AFTER, COLOURED BY WHICH WAY IS BETTER. VMAF: higher. Banding and
+// size: lower. Each later figure is judged against the one before it, so the
+// colour says "better than the previous number", not "good in itself".
+const _vmC = {good:'var(--ok)', bad:'var(--warn)', same:'inherit'};
+function vmGrade(after, before, higherBetter, tol){
+  if(after==null || before==null) return 'same';
+  const d = after - before;
+  if(Math.abs(d) <= (tol||0)) return 'same';
+  return ((d>0) === !!higherBetter) ? 'good' : 'bad';
+}
+function vmNum(v, grade, bold){
+  const c=_vmC[grade]||'inherit';
+  return `<span style="color:${c}${bold?';font-weight:700':''}">${v}</span>`;
+}
+function vmafTip(r){
+  let t=`samples predicted ${r.vmaf} (worst ${r.vmaf_min}); target ${r.want??95}`;
+  if(r.final_vmaf!=null) t+=`; the final file measured ${r.final_vmaf} (worst ${r.final_vmaf_min}), ${r.final_note||''}`;
+  return t;
+}
+function vmafCellV(r){
+  const want=r.want??95;
+  // samples: against the target (reaching it is what the search was for)
+  let h=vmNum(r.vmaf, r.vmaf>=want?'good':'bad', false);
+  if(r.final_vmaf!=null){
+    // final: against the samples' prediction, with half a point of slack
+    h+=` → ${vmNum(r.final_vmaf, vmGrade(r.final_vmaf, r.vmaf, true, 0.5), true)}`;
+    if(r.final_vmaf<want) h+=` <span style="font-size:10px;color:var(--warn)">under ${want}</span>`;
+  }
+  return h;
+}
+function vmafCellB(r){
+  const parts=[];
+  if(r.src_cambi!=null) parts.push(`<span class="dim">src</span> ${r.src_cambi}`);
+  if(r.cambi!=null) parts.push(vmNum(r.cambi, r.src_cambi!=null ? vmGrade(r.cambi, r.src_cambi, false, 0.3) : 'same', false));
+  if(r.final_cambi!=null) parts.push(vmNum(r.final_cambi, vmGrade(r.final_cambi, r.cambi, false, 0.3), true));
+  let h=parts.join(' → ');
+  const last = r.final_cambi!=null ? r.final_cambi : r.cambi;
+  if(last!=null && last>=5) h+=` <span style="font-size:10px;color:var(--bad)">visible</span>`;
+  return h||'—';
 }
 async function loadVmaf(){
   const el=document.getElementById('vmafBox'); if(!el) return;
@@ -35680,15 +35720,18 @@ async function loadVmaf(){
           <td class="mono">${esc(x.target)} · ${esc(x.family)}</td><td class="mono">${x.n}</td><td class="mono">${Math.round(x.fixed)}</td>
           <td class="mono">${(+x.cq).toFixed(1)}</td><td class="mono">${x.guess??'—'}</td><td>${sz(x.saved)}</td></tr>`).join('')}
       </table></div>`:''}
-    ${d.recent.length?`<details class="vmafLast"${lastOpen?' open':''} style="margin-top:8px;font-size:11px"><summary class="dim" style="cursor:pointer">last ${d.recent.length} files</summary>
-      <table style="width:100%;border-collapse:collapse;margin-top:3px">
-        <tr class="dim" style="font-size:10.5px"><td style="padding:3px 6px">FILE</td><td>CQ</td><td>VMAF</td><td>BANDING</td><td>FILE SIZE</td><td>SAMPLES VS FIXED CQ</td><td>SEARCH</td><td>WHEN</td></tr>
-        ${d.recent.map(r=>`<tr style="border-top:1px solid var(--line)"><td style="padding:3px 6px;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.name)}">${esc(r.name)}</td>
+    ${d.recent.length?`<details class="vmafLast"${lastOpen?' open':''} style="margin-top:8px;font-size:11px"><summary class="dim" style="cursor:pointer">last ${d.recent.length} files
+        <span style="margin-left:10px;font-size:10.5px"><span style="color:var(--ok)">green</span> = better than the figure before it · <span style="color:var(--warn)">amber</span> = worse · VMAF higher is better, banding and size lower</span></summary>
+      <div style="max-height:560px;overflow:auto;margin-top:4px;border:1px solid var(--line);border-radius:6px">
+      <table class="vmafTbl" style="width:100%;border-collapse:collapse">
+        <tr class="dim" style="font-size:10.5px;position:sticky;top:0;background:var(--panel);z-index:1"><td style="padding:5px 8px">FILE</td><td>CQ</td><td>VMAF <span style="font-weight:400">samples → final</span></td><td>BANDING <span style="font-weight:400">source → samples → final</span></td><td>FILE SIZE</td><td>SAMPLES VS FIXED CQ</td><td>SEARCH</td><td>WHEN</td></tr>
+        ${d.recent.map(r=>`<tr style="border-top:1px solid var(--line)"><td style="padding:4px 8px;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.name)}">${esc(r.name)}</td>
           <td class="mono">CQ ${r.cq_fixed} → <b>${r.cq_chosen}</b></td>
-          <td class="mono" title="mean over the samples; worst sample ${r.vmaf_min}${r.final_vmaf!=null?` - the final file measured ${r.final_vmaf} (worst ${r.final_vmaf_min}), ${r.final_note||''}`:''}">${r.vmaf}${r.final_vmaf!=null?` <span class="${r.final_vmaf>=r.want?'ok':'warn'}" style="font-size:10.5px">final ${r.final_vmaf}</span>`:''}</td>
-          <td class="mono dim" title="banding (CAMBI) - under 5 is not visible${r.final_cambi!=null?` - the final file measured ${r.final_cambi}`:''}">${r.src_cambi!=null?`source ${r.src_cambi} → `:''}${r.cambi==null?'':'band '+r.cambi}${r.final_cambi!=null?` <span style="font-size:10.5px">final ${r.final_cambi}</span>`:''}</td><td class="mono">${vmafSizes(r)}</td><td>${sz(r.saved_pct)}</td>
-          <td class="dim">${r.probes} probes · ${Math.round(r.secs)}s</td><td class="dim">${esc(ago(r.at))}</td></tr>`).join('')}
-      </table></details>`:''}
+          <td class="mono" title="${esc(vmafTip(r))}">${vmafCellV(r)}</td>
+          <td class="mono" title="banding (CAMBI) - under 5 is not visible; an encode should add no more than about 1 to the source's own">${vmafCellB(r)}</td>
+          <td class="mono">${vmafSizes(r)}</td><td>${sz(r.saved_pct)}</td>
+          <td class="dim">${r.probes} probes · ${Math.round(r.secs)}s</td><td class="dim" style="white-space:nowrap">${esc(ago(r.at))}</td></tr>`).join('')}
+      </table></div></details>`:''}
   </div>`;
   clearTimeout(_vmafT);
   if((d.running||[]).length) _vmafT=setTimeout(()=>shownPoll('vmafBox', loadVmaf), 3000);
