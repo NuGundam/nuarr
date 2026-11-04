@@ -35626,7 +35626,7 @@ async function idxCon(name,op,btn){
   loadIdx();
 }
 // ---- quality-targeted encoding (vmaftarget.py) ----
-let _vmafT=null;
+let _vmafT=null, _vmafSig='';
 // The real file before and after, from the job row. A skipped job kept its
 // original, so its size_after is what the discarded encode would have been.
 function vmafSizes(r){
@@ -35698,8 +35698,21 @@ async function loadVmaf(){
   const sz=v=>v==null?'—':(v>=0?`<span style="color:#7fd4a3">${v.toFixed(0)}% smaller</span>`:`<span style="color:#e2b341">${(-v).toFixed(0)}% larger</span>`);
   const run=(d.running||[]).map(r=>`<div style="font-size:11px;margin-top:4px"><span class="dlspin"></span> <b>${esc(r.label)}</b>
       <span class="dim">probe ${r.probe} · trying CQ ${r.cq} · ${Math.round(Date.now()/1000-r.at)}s</span></div>`).join('');
-  // The panel redraws every 3 s while a search runs: keep the list as it was.
+  // THE PANEL POLLS EVERY 3 s WHILE A SEARCH RUNS, and only the running line
+  // changes between most polls. Rewriting the whole thing repainted the list
+  // and threw away its scroll position, so: repaint only when the figures
+  // changed, and never under the pointer - a finished file waits until the
+  // pointer leaves the list.
+  const again=()=>{ clearTimeout(_vmafT);
+    if((d.running||[]).length) _vmafT=setTimeout(()=>shownPoll('vmafBox', loadVmaf), 3000); };
+  const sig=JSON.stringify([c,d.count,d.by,d.recent.map(r=>[r.at,r.final_vmaf,r.final_cambi,r.size_after,r.job_state])]);
+  const scroller=el.querySelector('.vmafScroll'), runEl=el.querySelector('#vmafRun');
+  if(runEl && (sig===_vmafSig || (scroller && scroller.matches(':hover')))){
+    runEl.innerHTML=run; again(); return;
+  }
+  _vmafSig=sig;
   const lastOpen=!!(el.querySelector('details.vmafLast')||{}).open;
+  const lastTop=scroller?scroller.scrollTop:0;
   el.innerHTML=`<div class="lkind" style="padding:10px 12px">
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
       <b style="color:#6fb0ff">Quality target (VMAF)</b>
@@ -35720,7 +35733,7 @@ async function loadVmaf(){
       indistinguishable on a TV) and runs the encode at the <b>highest CQ that still scores the target</b>. Never more than ${b.down} below
       or ${b.up} above the library's CQ below, and the bitrate cap still applies. It learns where each library lands, so the next file starts there.
       Left at the library's CQ: a burned-in subtitle, HDR, anything under ${b.min_minutes} minutes. The output is an ordinary file - playback is unchanged.</div>
-    ${run}
+    <div id="vmafRun">${run}</div>
     <div style="display:flex;gap:18px;flex-wrap:wrap;font-size:11.5px;margin-top:8px">
       <span><b>${fmt(d.count)}</b> <span class="dim">files measured</span></span>
       <span><span class="dim">samples vs the fixed CQ:</span> ${sz(d.avg_saved)}</span>
@@ -35736,7 +35749,7 @@ async function loadVmaf(){
       </table></div>`:''}
     ${d.recent.length?`<details class="vmafLast"${lastOpen?' open':''} style="margin-top:8px;font-size:11px"><summary class="dim" style="cursor:pointer">last ${d.recent.length} files
         <span style="margin-left:10px;font-size:10.5px"><span style="color:var(--ok)">green</span> = better than the figure before it · <span style="color:var(--warn)">amber</span> = worse · VMAF higher is better, banding and size lower</span></summary>
-      <div style="max-height:560px;overflow:auto;margin-top:4px;border:1px solid var(--line);border-radius:6px">
+      <div class="vmafScroll" style="max-height:560px;overflow:auto;margin-top:4px;border:1px solid var(--line);border-radius:6px">
       <style>.vmafTbl td{white-space:nowrap;padding:4px 6px}.vmafTbl td:first-child{width:100%;max-width:0;overflow:hidden;text-overflow:ellipsis;padding-left:8px}</style>
       <table class="vmafTbl" style="width:100%;border-collapse:collapse">
         <tr class="dim" style="font-size:10.5px;position:sticky;top:0;background:var(--panel);z-index:1"><td style="padding:5px 8px">FILE</td><td>CQ</td><td>VMAF <span style="font-weight:400">samples → final</span></td><td>BANDING <span style="font-weight:400">source → samples → final</span></td><td>FILE SIZE</td><td>VS FIXED CQ</td><td>PROBES · TIME</td><td>WHEN</td></tr>
@@ -35748,8 +35761,8 @@ async function loadVmaf(){
           <td class="dim">${r.probes} · ${Math.round(r.secs)}s</td><td class="dim" style="white-space:nowrap">${esc(ago(r.at))}</td></tr>`).join('')}
       </table></div></details>`:''}
   </div>`;
-  clearTimeout(_vmafT);
-  if((d.running||[]).length) _vmafT=setTimeout(()=>shownPoll('vmafBox', loadVmaf), 3000);
+  const sc=el.querySelector('.vmafScroll'); if(sc) sc.scrollTop=lastTop;
+  again();
 }
 // ---- library conversion to 10-bit HEVC (hevcconvert.py) ----
 async function loadConvert(){
