@@ -35723,6 +35723,7 @@ async function loadVmaf(){
     ${d.recent.length?`<details class="vmafLast"${lastOpen?' open':''} style="margin-top:8px;font-size:11px"><summary class="dim" style="cursor:pointer">last ${d.recent.length} files
         <span style="margin-left:10px;font-size:10.5px"><span style="color:var(--ok)">green</span> = better than the figure before it · <span style="color:var(--warn)">amber</span> = worse · VMAF higher is better, banding and size lower</span></summary>
       <div style="max-height:560px;overflow:auto;margin-top:4px;border:1px solid var(--line);border-radius:6px">
+      <style>.vmafTbl td{white-space:nowrap;padding:4px 8px}.vmafTbl td:first-child{white-space:nowrap}</style>
       <table class="vmafTbl" style="width:100%;border-collapse:collapse">
         <tr class="dim" style="font-size:10.5px;position:sticky;top:0;background:var(--panel);z-index:1"><td style="padding:5px 8px">FILE</td><td>CQ</td><td>VMAF <span style="font-weight:400">samples → final</span></td><td>BANDING <span style="font-weight:400">source → samples → final</span></td><td>FILE SIZE</td><td>SAMPLES VS FIXED CQ</td><td>SEARCH</td><td>WHEN</td></tr>
         ${d.recent.map(r=>`<tr style="border-top:1px solid var(--line)"><td style="padding:4px 8px;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.name)}">${esc(r.name)}</td>
