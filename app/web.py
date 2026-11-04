@@ -35673,9 +35673,23 @@ function vmafCellB(r){
   if(r.cambi!=null) parts.push(vmNum(r.cambi, r.src_cambi!=null ? vmGrade(r.cambi, r.src_cambi, false, 0.3) : 'same', false));
   if(r.final_cambi!=null) parts.push(vmNum(r.final_cambi, vmGrade(r.final_cambi, r.cambi, false, 0.3), true));
   let h=parts.join(' → ');
+  // Banding at 5+ only counts against the encode if the encode added it: most
+  // such files came from a source with more, and got cleaner.
   const last = r.final_cambi!=null ? r.final_cambi : r.cambi;
-  if(last!=null && last>=5) h+=` <span style="font-size:10px;color:var(--bad)">visible</span>`;
+  if(last!=null && last>=5){
+    if(r.src_cambi==null) h+=` <span style="font-size:10px;color:var(--warn)">visible</span>`;
+    else if(last>r.src_cambi+1) h+=` <span style="font-size:10px;color:var(--bad)">added by encode</span>`;
+    else h+=` <span class="dim" style="font-size:10px">from source</span>`;
+  }
   return h||'—';
+}
+// The title reads first; ids and the extension go, the release tags go quiet.
+// The whole name stays in the tooltip.
+function vmafName(name){
+  const n=String(name||'').replace(/[.][a-z0-9]+$/i,'').replace(/ *[{][^}]*[}]/g,'');
+  const i=n.indexOf(' [');
+  if(i<0) return esc(n);
+  return `${esc(n.slice(0,i))} <span class="dim" style="font-size:10px">${esc(n.slice(i+1))}</span>`;
 }
 async function loadVmaf(){
   const el=document.getElementById('vmafBox'); if(!el) return;
@@ -35723,15 +35737,15 @@ async function loadVmaf(){
     ${d.recent.length?`<details class="vmafLast"${lastOpen?' open':''} style="margin-top:8px;font-size:11px"><summary class="dim" style="cursor:pointer">last ${d.recent.length} files
         <span style="margin-left:10px;font-size:10.5px"><span style="color:var(--ok)">green</span> = better than the figure before it · <span style="color:var(--warn)">amber</span> = worse · VMAF higher is better, banding and size lower</span></summary>
       <div style="max-height:560px;overflow:auto;margin-top:4px;border:1px solid var(--line);border-radius:6px">
-      <style>.vmafTbl td{white-space:nowrap;padding:4px 8px}.vmafTbl td:first-child{white-space:nowrap}</style>
+      <style>.vmafTbl td{white-space:nowrap;padding:4px 6px}.vmafTbl td:first-child{width:100%;max-width:0;overflow:hidden;text-overflow:ellipsis;padding-left:8px}</style>
       <table class="vmafTbl" style="width:100%;border-collapse:collapse">
-        <tr class="dim" style="font-size:10.5px;position:sticky;top:0;background:var(--panel);z-index:1"><td style="padding:5px 8px">FILE</td><td>CQ</td><td>VMAF <span style="font-weight:400">samples → final</span></td><td>BANDING <span style="font-weight:400">source → samples → final</span></td><td>FILE SIZE</td><td>SAMPLES VS FIXED CQ</td><td>SEARCH</td><td>WHEN</td></tr>
-        ${d.recent.map(r=>`<tr style="border-top:1px solid var(--line)"><td style="padding:4px 8px;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.name)}">${esc(r.name)}</td>
+        <tr class="dim" style="font-size:10.5px;position:sticky;top:0;background:var(--panel);z-index:1"><td style="padding:5px 8px">FILE</td><td>CQ</td><td>VMAF <span style="font-weight:400">samples → final</span></td><td>BANDING <span style="font-weight:400">source → samples → final</span></td><td>FILE SIZE</td><td>VS FIXED CQ</td><td>PROBES · TIME</td><td>WHEN</td></tr>
+        ${d.recent.map(r=>`<tr style="border-top:1px solid var(--line)"><td title="${esc(r.name)}">${vmafName(r.name)}</td>
           <td class="mono">CQ ${r.cq_fixed} → <b>${r.cq_chosen}</b></td>
           <td class="mono" title="${esc(vmafTip(r))}">${vmafCellV(r)}</td>
           <td class="mono" title="banding (CAMBI) - under 5 is not visible; an encode should add no more than about 1 to the source's own">${vmafCellB(r)}</td>
           <td class="mono">${vmafSizes(r)}</td><td>${sz(r.saved_pct)}</td>
-          <td class="dim">${r.probes} probes · ${Math.round(r.secs)}s</td><td class="dim" style="white-space:nowrap">${esc(ago(r.at))}</td></tr>`).join('')}
+          <td class="dim">${r.probes} · ${Math.round(r.secs)}s</td><td class="dim" style="white-space:nowrap">${esc(ago(r.at))}</td></tr>`).join('')}
       </table></div></details>`:''}
   </div>`;
   clearTimeout(_vmafT);
