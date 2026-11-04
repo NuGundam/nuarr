@@ -35644,6 +35644,8 @@ async function loadVmaf(){
   const sz=v=>v==null?'—':(v>=0?`<span style="color:#7fd4a3">${v.toFixed(0)}% smaller</span>`:`<span style="color:#e2b341">${(-v).toFixed(0)}% larger</span>`);
   const run=(d.running||[]).map(r=>`<div style="font-size:11px;margin-top:4px"><span class="dlspin"></span> <b>${esc(r.label)}</b>
       <span class="dim">probe ${r.probe} · trying CQ ${r.cq} · ${Math.round(Date.now()/1000-r.at)}s</span></div>`).join('');
+  // The panel redraws every 3 s while a search runs: keep the list as it was.
+  const lastOpen=!!(el.querySelector('details.vmafLast')||{}).open;
   el.innerHTML=`<div class="lkind" style="padding:10px 12px">
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
       <b style="color:#6fb0ff">Quality target (VMAF)</b>
@@ -35678,7 +35680,7 @@ async function loadVmaf(){
           <td class="mono">${esc(x.target)} · ${esc(x.family)}</td><td class="mono">${x.n}</td><td class="mono">${Math.round(x.fixed)}</td>
           <td class="mono">${(+x.cq).toFixed(1)}</td><td class="mono">${x.guess??'—'}</td><td>${sz(x.saved)}</td></tr>`).join('')}
       </table></div>`:''}
-    ${d.recent.length?`<details style="margin-top:8px;font-size:11px"><summary class="dim" style="cursor:pointer">last ${d.recent.length} files</summary>
+    ${d.recent.length?`<details class="vmafLast"${lastOpen?' open':''} style="margin-top:8px;font-size:11px"><summary class="dim" style="cursor:pointer">last ${d.recent.length} files</summary>
       <table style="width:100%;border-collapse:collapse;margin-top:3px">
         <tr class="dim" style="font-size:10.5px"><td style="padding:3px 6px">FILE</td><td>CQ</td><td>VMAF</td><td>BANDING</td><td>FILE SIZE</td><td>SAMPLES VS FIXED CQ</td><td>SEARCH</td><td>WHEN</td></tr>
         ${d.recent.map(r=>`<tr style="border-top:1px solid var(--line)"><td style="padding:3px 6px;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.name)}">${esc(r.name)}</td>
