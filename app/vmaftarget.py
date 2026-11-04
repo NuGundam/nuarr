@@ -206,6 +206,54 @@ def headroom(library: str | None) -> float:
     return round(max(0.0, min(2.0, statistics.median(xs))), 2)
 
 
+# The ts_sync_mode fix went live here. Final scores before it are unreliable,
+# so the history marks the point rather than letting a jump look like learning.
+SCORER_FIXED_AT = 1793774622
+_learned_cache = {"at": 0.0, "v": None}
+
+
+def learned() -> dict:
+    """What each library has taught the search, for the hover box: the
+    sample-minus-final gap over time as a rolling median of 25 files (the same
+    window headroom() uses), the headroom that gives today, and where the
+    chosen CQ started against where it sits now. Cached for a minute."""
+    if _learned_cache["v"] is not None and time.time() - _learned_cache["at"] < 60:
+        return _learned_cache["v"]
+    with cursor() as cur:
+        rows = [dict(r) for r in cur.execute(
+            "SELECT at,library,target,family,cq_chosen,want,vmaf,final_vmaf FROM vmaf_log "
+            "WHERE final_vmaf IS NOT NULL AND final_vmaf > 70 ORDER BY id")]
+    libs = {}
+    for r in rows:
+        libs.setdefault(str(r["library"]), []).append(r)
+    out = []
+    for lib, rs in libs.items():
+        gaps = [r["vmaf"] - r["final_vmaf"] for r in rs]
+        roll = [(rs[i]["at"], statistics.median(gaps[max(0, i - 24):i + 1])) for i in range(len(rs))]
+        step = max(1, len(roll) // 40)
+        pts = roll[::step]
+        if pts[-1] is not roll[-1]:
+            pts.append(roll[-1])
+        last = rs[-1]
+        cqs = [r["cq_chosen"] for r in rs if r["target"] == last["target"] and r["family"] == last["family"]
+               and r["cq_chosen"] is not None]
+        recent = rs[-25:]
+        out.append({
+            "library": lib, "n": len(rs), "first_at": rs[0]["at"], "last_at": last["at"],
+            "gap_now": round(statistics.median(gaps[-25:]), 2), "head": headroom(lib if lib != "None" else None),
+            "points": [[round(a), round(g, 2)] for a, g in pts],
+            "cq_then": int(round(statistics.median(cqs[:25]))) if cqs else None,
+            "cq_now": int(round(statistics.median(cqs[-25:]))) if cqs else None,
+            "cq_target": last["target"],
+            "hit": sum(1 for r in recent if r["want"] is not None and r["final_vmaf"] >= r["want"]),
+            "hit_of": len(recent),
+        })
+    out.sort(key=lambda x: -x["n"])
+    v = {"libraries": out, "fixed_at": SCORER_FIXED_AT, "on": bool(cfg().get("headroom"))}
+    _learned_cache.update(at=time.time(), v=v)
+    return v
+
+
 def set_cfg(**kw) -> dict:
     c = cfg()
     for k, v in kw.items():

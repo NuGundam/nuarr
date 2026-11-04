@@ -11776,6 +11776,12 @@ def api_vmaf():
     return vmaftarget.snapshot()
 
 
+@app.get("/api/vmaf/learned")
+def api_vmaf_learned():
+    from . import vmaftarget
+    return vmaftarget.learned()
+
+
 @app.post("/api/vmaf/cfg")
 def api_vmaf_cfg(on: int = -1, target: float = 0, samples: int = 0, floor: float = -1, banding: float = 0,
                  verify: int = -1, low: float = -1, headroom: int = -1):
@@ -35672,7 +35678,7 @@ async function idxCon(name,op,btn){
   loadIdx();
 }
 // ---- quality-targeted encoding (vmaftarget.py) ----
-let _vmafT=null, _vmafSig='';
+let _vmafT=null, _vmafSig='', _vmafClock=null;
 // The real file before and after, from the job row. A skipped job kept its
 // original, so its size_after is what the discarded encode would have been.
 function vmafSizes(r){
@@ -35737,22 +35743,70 @@ function vmafName(name){
   if(i<0) return esc(n);
   return `${esc(n.slice(0,i))} <span class="dim" style="font-size:10px">${esc(n.slice(i+1))}</span>`;
 }
+// ONE ROW OF THE LIST, keyed by when its search ended. data-s is what can change
+// after the row first appears; the When cell is left to the clock below.
+const vmafRowSig=r=>[r.final_vmaf,r.final_cambi,r.size_after,r.job_state].join('|');
+function vmafRow(r,sz){
+  return `<tr data-k="${r.at}" data-s="${esc(vmafRowSig(r))}" style="border-top:1px solid var(--line)"><td title="${esc(r.name)}">${vmafName(r.name)}</td>
+    <td class="mono">CQ ${r.cq_fixed} → <b>${r.cq_chosen}</b></td>
+    <td class="mono" title="${esc(vmafTip(r))}">${vmafCellV(r)}</td>
+    <td class="mono" title="banding (CAMBI) - under 5 is not visible; an encode should add no more than about 1 to the source's own">${vmafCellB(r)}</td>
+    <td class="mono">${vmafSizes(r)}</td><td>${sz(r.saved_pct)}</td>
+    <td class="dim">${r.probes} · ${Math.round(r.secs)}s</td>
+    <td class="vmafWhen" style="white-space:nowrap" title="${esc(new Date(r.at*1000).toLocaleString())}" data-ago="${r.at}">${esc(agoFine(r.at))}</td></tr>`;
+}
+// Only the rows that changed are touched: new ones go in at the top, a row whose
+// encode finished is swapped, and the 101st drops off. When you have scrolled
+// down, the scroll position moves by what was added so the rows you are reading
+// stay where they are.
+function vmafPatchRows(sc,rows,sz){
+  const tbl=sc.querySelector('.vmafTbl'); if(!tbl) return;
+  const have=new Map([...tbl.querySelectorAll('tr[data-k]')].map(t=>[t.dataset.k,t]));
+  const head=tbl.rows[0], tmp=document.createElement('tbody'), h0=sc.scrollHeight, top=sc.scrollTop;
+  const make=r=>{ tmp.innerHTML=vmafRow(r,sz); return tmp.firstElementChild; };
+  const keep=new Set(rows.map(r=>String(r.at)));
+  have.forEach((t,k)=>{ if(!keep.has(k)) t.remove(); });
+  let after=head, added=false;
+  rows.forEach(r=>{
+    const k=String(r.at); let t=have.get(k);
+    if(!t){ t=make(r); t.classList.add('vmafNew'); after.after(t); added=true; }
+    else if(t.dataset.s!==vmafRowSig(r)){ const n=make(r); n.classList.add('vmafNew'); t.replaceWith(n); t=n; }
+    after=t;
+  });
+  if(added && top>0) sc.scrollTop=top+(sc.scrollHeight-h0);
+  vmafWhenTick();
+}
+// THE WHEN COLUMN COUNTS BY ITSELF and its colour says how fresh a row is. Text
+// and colour are written only when they change, so no tooltip is disturbed.
+function vmafWhenTick(){
+  const box=document.getElementById('vmafBox');
+  if(!box || box.offsetParent===null || document.hidden) return;
+  agoTick(box);
+  const now=Date.now()/1000;
+  box.querySelectorAll('.vmafWhen').forEach(e=>{
+    const s=now-parseFloat(e.dataset.ago);
+    const c=s<60?'var(--ok)':s<600?'var(--acc)':s<3600?'var(--fg)':s<86400?'var(--warn)':'var(--dim)';
+    if(e.dataset.c!==c){ e.dataset.c=c; e.style.color=c; }
+  });
+}
 async function loadVmaf(){
   const el=document.getElementById('vmafBox'); if(!el) return;
-  let d; try{ d=await (await fetch('/api/vmaf')).json(); }catch(e){ return; }
+  let d; try{ d=await (await fetch('/api/vmaf')).json(); }
+  catch(e){ clearTimeout(_vmafT); _vmafT=setTimeout(()=>shownPoll('vmafBox', loadVmaf), 5000); return; }
   const c=d.cfg, b=d.bounds;
   const sz=v=>v==null?'—':(v>=0?`<span style="color:#7fd4a3">${v.toFixed(0)}% smaller</span>`:`<span style="color:#e2b341">${(-v).toFixed(0)}% larger</span>`);
   const run=(d.running||[]).map(r=>`<div style="font-size:11px;margin-top:4px"><span class="dlspin"></span> <b>${esc(r.label)}</b>
       <span class="dim">probe ${r.probe} · trying CQ ${r.cq} · ${Math.round(Date.now()/1000-r.at)}s</span></div>`).join('');
-  // THE PANEL POLLS EVERY 3 s WHILE A SEARCH RUNS, and only the running line
-  // changes between most polls. Rewriting the whole thing repainted the list
-  // and threw away its scroll position, so: repaint only when the figures
-  // changed, and never under the pointer - a finished file waits until the
-  // pointer leaves the list.
+  // THE PANEL POLLS ALL THE TIME IT IS SHOWN: 3 s while a search runs, 5 s
+  // otherwise. It used to stop with the last search, but a file's final score
+  // and size land when its ENCODE ends, after the search has gone. The list is
+  // patched row by row, so it stays live under the pointer and while scrolling
+  // without a repaint; only the figures above it wait for the pointer to leave.
   const again=()=>{ clearTimeout(_vmafT);
-    if((d.running||[]).length) _vmafT=setTimeout(()=>shownPoll('vmafBox', loadVmaf), 3000); };
-  const sig=JSON.stringify([c,d.count,d.by,d.recent.map(r=>[r.at,r.final_vmaf,r.final_cambi,r.size_after,r.job_state])]);
+    _vmafT=setTimeout(()=>shownPoll('vmafBox', loadVmaf), (d.running||[]).length?3000:5000); };
+  const sig=JSON.stringify([c,d.count,d.by]);
   const scroller=el.querySelector('.vmafScroll'), runEl=el.querySelector('#vmafRun');
+  if(runEl && scroller) vmafPatchRows(scroller,d.recent,sz);
   if(runEl && (sig===_vmafSig || (scroller && scroller.matches(':hover')))){
     runEl.innerHTML=run; again(); return;
   }
@@ -35772,8 +35826,8 @@ async function loadVmaf(){
         <input type="number" min="0" max="20" step="0.5" value="${c.low}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="vmafSet({low:this.value})"></span>
       <span style="font-size:11.5px" title="CAMBI, Netflix's banding index: about 5 is where banding in flat colours and dark gradients becomes visible. VMAF alone under-scores banding, and banding is what cartoons show first.">banding at most
         <input type="number" min="1" max="20" step="0.5" value="${c.banding}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="vmafSet({banding:this.value})"></span>
-      <span class="pill ${c.headroom?'p-ok':'p-dim'}" style="cursor:pointer" onclick="vmafSet({headroom:${c.headroom?0:1}})"
-        title="the samples predict and the finished file measures a little under them; with this on, each library's recent median gap (0-2 points) is added to the target while searching, so the file lands on the target rather than the samples">headroom ${c.headroom?'learned':'off'}</span>
+      <span id="vmafHeadPill" class="pill ${c.headroom?'p-ok':'p-dim'}" style="cursor:pointer" onclick="vmafSet({headroom:${c.headroom?0:1}})"
+        onmouseenter="vmafHeadShow(this)">headroom ${c.headroom?'learned':'off'}</span>
       <span class="pill ${c.verify?'p-ok':'p-dim'}" style="cursor:pointer" onclick="vmafSet({verify:${c.verify?0:1}})"
         title="keep the reference cuts until the encode is finished and score the FINAL file against them before it replaces the original. The search's VMAF is a prediction from sample encodes; this is the measurement. Adds about a minute per file and ${c.samples} x ${c.sample_s}-second lossless cuts in the cache while the encode runs.">check the final file: ${c.verify?'ON':'off'}</span>
     </div>
@@ -35799,20 +35853,18 @@ async function loadVmaf(){
           <td class="mono">${(+x.cq).toFixed(1)}</td><td class="mono">${x.guess??'—'}</td><td>${sz(x.saved)}</td></tr>`).join('')}
       </table></div>`:''}
     ${d.recent.length?`<details class="vmafLast"${lastOpen?' open':''} style="margin-top:8px;font-size:11px"><summary class="dim" style="cursor:pointer">last ${d.recent.length} files
-        <span style="margin-left:10px;font-size:10.5px"><span style="color:var(--ok)">green</span> = better than the figure before it · <span style="color:var(--warn)">amber</span> = worse · VMAF higher is better, banding and size lower</span></summary>
+        <span style="margin-left:10px;font-size:10.5px"><span style="color:var(--ok)">green</span> = better than the figure before it · <span style="color:var(--warn)">amber</span> = worse · VMAF higher is better, banding and size lower · when: <span style="color:var(--ok)">under 1 min</span> <span style="color:var(--acc)">10 min</span> <span style="color:var(--fg)">1 hour</span> <span style="color:var(--warn)">1 day</span> <span class="dim">older</span></span></summary>
       <div class="vmafScroll" style="max-height:560px;overflow:auto;margin-top:4px;border:1px solid var(--line);border-radius:6px">
-      <style>.vmafTbl td{white-space:nowrap;padding:4px 6px}.vmafTbl td:first-child{width:100%;max-width:0;overflow:hidden;text-overflow:ellipsis;padding-left:8px}</style>
+      <style>.vmafTbl td{white-space:nowrap;padding:4px 6px}.vmafTbl td:first-child{width:100%;max-width:0;overflow:hidden;text-overflow:ellipsis;padding-left:8px}
+        @keyframes vmafNew{from{background:rgba(111,176,255,.22)}to{background:transparent}}.vmafNew td{animation:vmafNew 2.5s ease-out}</style>
       <table class="vmafTbl" style="width:100%;border-collapse:collapse">
         <tr class="dim" style="font-size:10.5px;position:sticky;top:0;background:var(--panel);z-index:1"><td style="padding:5px 8px">FILE</td><td>CQ</td><td>VMAF <span style="font-weight:400">samples → final</span></td><td>BANDING <span style="font-weight:400">source → samples → final</span></td><td>FILE SIZE</td><td>VS FIXED CQ</td><td>PROBES · TIME</td><td>WHEN</td></tr>
-        ${d.recent.map(r=>`<tr style="border-top:1px solid var(--line)"><td title="${esc(r.name)}">${vmafName(r.name)}</td>
-          <td class="mono">CQ ${r.cq_fixed} → <b>${r.cq_chosen}</b></td>
-          <td class="mono" title="${esc(vmafTip(r))}">${vmafCellV(r)}</td>
-          <td class="mono" title="banding (CAMBI) - under 5 is not visible; an encode should add no more than about 1 to the source's own">${vmafCellB(r)}</td>
-          <td class="mono">${vmafSizes(r)}</td><td>${sz(r.saved_pct)}</td>
-          <td class="dim">${r.probes} · ${Math.round(r.secs)}s</td><td class="dim" style="white-space:nowrap">${esc(ago(r.at))}</td></tr>`).join('')}
+        ${d.recent.map(r=>vmafRow(r,sz)).join('')}
       </table></div></details>`:''}
   </div>`;
   const sc=el.querySelector('.vmafScroll'); if(sc) sc.scrollTop=lastTop;
+  vmafWhenTick();
+  if(!_vmafClock) _vmafClock=setInterval(vmafWhenTick,1000);
   again();
 }
 // ---- library conversion to 10-bit HEVC (hevcconvert.py) ----
@@ -36057,6 +36109,60 @@ async function convSet(o){
 // uses). A blank cell inherits the figure in the row above; a typed one
 // overrides it for that kind only. Live action defaults to a tighter worst
 // frame: grain and dark film fall apart in a few frames before the mean moves.
+// WHAT HEADROOM HAS LEARNED. The box lives on <body>, not in the panel: the
+// panel repaints on polls, which would take a box inside it away mid-read and
+// never fire mouseleave. The timer closes it once neither the pill (found again
+// by id, in case it was repainted) nor the box is under the pointer.
+let _vmafHeadTimer=null;
+function vmafHeadSpark(L,fixedAt){
+  const W=170,H=34,P=L.points, t0=P[0][0], t1=P[P.length-1][0]||t0+1, span=Math.max(1,t1-t0);
+  const ys=P.map(p=>p[1]), lo=Math.min(0,...ys), hi=Math.max(0.5,...ys), sc=Math.max(0.01,hi-lo);
+  const x=t=>((t-t0)/span*(W-4)+2).toFixed(1), y=v=>(H-3-(v-lo)/sc*(H-6)).toFixed(1);
+  const fix=fixedAt>t0&&fixedAt<t1?`<line x1="${x(fixedAt)}" x2="${x(fixedAt)}" y1="0" y2="${H}" stroke="var(--warn)" stroke-dasharray="2 2"/>`:'';
+  return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="display:block">
+    <line x1="0" x2="${W}" y1="${y(0)}" y2="${y(0)}" stroke="var(--line)"/>${fix}
+    <polyline fill="none" stroke="var(--acc)" stroke-width="1.5" points="${P.map(p=>x(p[0])+','+y(p[1])).join(' ')}"/></svg>`;
+}
+function vmafHeadHtml(d){
+  const day=t=>new Date(t*1000).toLocaleDateString(undefined,{month:'short',day:'numeric'});
+  const sg=v=>(v>0?'+':'')+v;
+  const rows=(d.libraries||[]).map(L=>`<tr style="border-top:1px solid var(--line)">
+    <td style="padding:5px 10px 5px 0;white-space:nowrap"><b>${esc(L.library)}</b><div class="dim">${L.n} files · ${day(L.first_at)} - ${day(L.last_at)}</div></td>
+    <td style="padding:5px 10px 5px 0">${vmafHeadSpark(L,d.fixed_at)}</td>
+    <td class="mono" style="padding:5px 10px 5px 0;white-space:nowrap">${sg(L.gap_now)}<div class="dim">adds ${L.head>0?'+'+L.head:'0'}</div></td>
+    <td class="mono" style="padding:5px 10px 5px 0;white-space:nowrap">${L.cq_then??'-'} → ${L.cq_now??'-'}<div class="dim">${esc(L.cq_target||'')}</div></td>
+    <td class="mono" style="padding:5px 0;white-space:nowrap">${L.hit}/${L.hit_of}</td></tr>`).join('');
+  return `<div style="font-weight:600;margin-bottom:2px">What headroom has learned${d.on?'':' (off - not being applied)'}</div>
+    <div class="dim" style="margin-bottom:6px">How far each finished file scored under its samples. The recent median, held to 0-2 points, is added to the target while searching.</div>
+    <table style="border-collapse:collapse;font-size:11px"><tr class="dim" style="text-align:left">
+      <th style="font-weight:400;padding-right:10px">library</th><th style="font-weight:400;padding-right:10px">gap over time, median of 25</th>
+      <th style="font-weight:400;padding-right:10px">gap now</th><th style="font-weight:400;padding-right:10px">typical CQ</th><th style="font-weight:400">on target</th></tr>
+      ${rows||'<tr><td colspan="5" class="dim">no finished files checked yet</td></tr>'}</table>
+    <div class="dim" style="margin-top:6px">Below the grey line, files beat their samples, so nothing is added. <span style="color:var(--warn)">Dashed line</span>: the scorer fix - scores before it are unreliable. On target: of the last 25, how many finished at the target or above.</div>`;
+}
+async function vmafHeadShow(el){
+  let b=document.getElementById('vmafHeadBox');
+  if(!b){
+    b=document.createElement('div'); b.id='vmafHeadBox'; b.setAttribute('role','tooltip');
+    b.style.cssText='position:fixed;z-index:9999;max-width:min(680px,calc(100vw - 16px));box-sizing:border-box;padding:10px 12px;background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:6px;box-shadow:0 6px 20px rgba(0,0,0,.45);font-size:11.5px;overflow:auto';
+    document.body.appendChild(b);
+  }
+  b.innerHTML='<span class="dim">loading...</span>'; b.style.display='block';
+  const place=()=>{
+    const r=el.getBoundingClientRect(), bw=b.offsetWidth, bh=b.offsetHeight;
+    b.style.left=Math.max(8,Math.min(r.left,innerWidth-bw-8))+'px';
+    b.style.top=(r.bottom+6+bh<innerHeight?r.bottom+6:Math.max(8,r.top-bh-6))+'px';
+  };
+  place();
+  clearInterval(_vmafHeadTimer);
+  _vmafHeadTimer=setInterval(()=>{
+    if(!document.querySelector('#vmafHeadPill:hover')&&!b.matches(':hover')){b.style.display='none';clearInterval(_vmafHeadTimer);}
+  },250);
+  try{
+    const d=await (await fetch('/api/vmaf/learned')).json();
+    b.innerHTML=vmafHeadHtml(d); place();
+  }catch(e){ b.innerHTML='<span class="dim">could not load the history</span>'; }
+}
 function vmafKindsHtml(d){
   const K=d.kinds||{}, c=d.cfg, over=(k,f)=>((c.kinds||{})[k]||{})[f];
   const cell=(k,f,min,max,step)=>`<td><input type="number" min="${min}" max="${max}" step="${step}" value="${over(k,f)??''}" placeholder="${K[k]?.[f]??''}"
