@@ -1849,7 +1849,19 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
     accepted = ["h264", "hevc", "h265"]
     if not _v("convert_av1", CONFIG["convertAv1"]):
         accepted.append("av1")
-    needs_codec_change = vcodec not in accepted
+    # MARKED "DON'T ENCODE" BY HAND (noencode.py): no rule rebuilds this video.
+    # A note, not p.add() - add() sets needed, and a plan that is "needed" for
+    # nothing would come back on every pass.
+    _noenc = False
+    try:
+        from . import noencode as _ne
+        _noenc = _ne.has(file_id)
+    except Exception:                                            # noqa: BLE001
+        pass
+    if _noenc:
+        oversized = _conv = False
+        p.notes.append("video left alone - this file is marked Don't encode")
+    needs_codec_change = vcodec not in accepted and not _noenc
     if needs_codec_change:
         why = ("AV1 is not decoded by every client here; the ones that cannot "
                "fall back to a CPU transcode"
@@ -2399,7 +2411,7 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
             real = p.keep_subs[bi] if p.keep_subs else bi
             is_image = (subs[real].get("codec_name") or "").lower() in IMAGE_SUB_CODECS
             allowed = (p.encode or (_sr("burn_image_always") and is_image)
-                       or not CONFIG["burnOnlyWhenEncoding"])
+                       or not CONFIG["burnOnlyWhenEncoding"]) and not _noenc
             if hdr and not _sr("burn_hdr"):
                 p.add("subtitle", f"leave the signs on subtitle {real} as they are",
                       "burning is switched off for HDR files here, so the signs "

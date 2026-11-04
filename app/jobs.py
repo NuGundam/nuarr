@@ -4584,6 +4584,17 @@ async def _run(job: Job, pool: str) -> None:
                        "warn", job.id)
             job.plan = None
 
+        # MARKED "DON'T ENCODE" AFTER THIS WAS QUEUED: the stored plan predates
+        # the mark, so it goes and the file is planned again without the encode.
+        try:
+            from . import noencode as _ne
+            if job.plan is not None and job.plan.encode and _ne.has(job.file_id):
+                joblog.log("this file is marked Don't encode - dropping the queued encode "
+                           "and planning again", "warn", job.id)
+                job.plan = None
+        except Exception:                                        # noqa: BLE001
+            pass
+
         if job.plan is None:
             # rules.is_anime, not a second hand-rolled test - see its docstring.
             anime = rules.is_anime(job.path, job.title or "")

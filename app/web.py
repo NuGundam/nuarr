@@ -9710,6 +9710,19 @@ async def api_integrity_mode(mode: str):
     return {"ok": True, "mode": integrity.mode()}
 
 
+@app.get("/api/noencode")
+def api_noencode_list():
+    from . import noencode
+    return {"files": noencode.all_ids()}
+
+
+@app.post("/api/files/{file_id}/noencode")
+def api_noencode(file_id: int, on: int = 1, why: str = ""):
+    """Mark or clear "Don't encode" on one file. See noencode.py."""
+    from . import noencode
+    return noencode.mark(file_id, bool(on), why)
+
+
 @app.get("/api/files/{file_id}/refetch")
 async def api_refetch_plan(file_id: int):
     """What rejecting this file's release would do. Changes nothing.
@@ -13570,6 +13583,7 @@ def api_browse_list(path: str | None = None, library: str | None = None):
                        f"WHERE file_id IN ({ph}) AND banding IS NOT NULL", tuple(batch)):
             srcband[r["file_id"]] = r["banding"]
 
+    from . import noencode as _noenc
     files = []
     for e in media:
         try:
@@ -13595,6 +13609,7 @@ def api_browse_list(path: str | None = None, library: str | None = None):
                 "final_worst": (enc.get(r.get("id")) or {}).get("final_vmaf_min"),
                 "final_cambi": (enc.get(r.get("id")) or {}).get("final_cambi"),
                 "src_banding": srcband.get(r.get("id")),
+                "id": r.get("id"), "noencode": _noenc.has(r.get("id")),
             })
         except OSError:
             continue
@@ -22024,8 +22039,8 @@ function renderBrowse(d){
     // old markup packed all three into one auto-sized cell, which is why
     // the middle of the listing looked ragged.
     return `<div class="brow bfile" onclick="fileInfo('${key}')"
-                 data-fk="${key}" data-fp="${esc(f.path)}">
-        <span class="bname" title="${esc(f.path)}">${esc(f.name)}</span>
+                 data-fk="${key}" data-fp="${esc(f.path)}" data-fid="${f.id||''}" data-ne="${f.noencode?1:0}">
+        <span class="bname" title="${esc(f.path)}">${esc(f.name)}${f.noencode?' <span class="pill p-dim" style="font-size:10px">don\'t encode</span>':''}</span>
         <span class="bstate ${st[1]}">${esc(st[0])}</span>
         <span class="dim binfo">${info}${encv?'<br>'+encv:''}</span>
         <span class="bdisk mono" style="color:${f.disk?diskColor(f.disk)
@@ -22069,7 +22084,7 @@ async function fileInfo(key){
     box.innerHTML=openFileHtml;
     return;
   }
-  openFileHtml=renderMediaInfo(d);
+  openFileHtml=noEncodeBar(row.dataset.fid, row.dataset.ne==='1')+renderMediaInfo(d);
   // Re-query: a repaint during the fetch may have replaced the element the
   // reference above points at.
   const live=document.querySelector('.bfile[data-fk="'+key+'"]');
@@ -22079,6 +22094,26 @@ async function fileInfo(key){
     const nb=document.createElement('div');
     nb.className='minfo'; nb.innerHTML=openFileHtml; live.after(nb);
   }
+}
+// "Don't encode": no rule rebuilds this file's video. Audio, subtitles and
+// renames carry on. Clicks stay inside the box so the row does not fold shut.
+function noEncodeBar(id, on){
+  if(!id) return '';
+  return `<label style="display:inline-flex;gap:6px;align-items:center;padding:8px 14px 0;font-size:11.5px;cursor:pointer"
+      title="Keeps the video exactly as it is. Audio and subtitle work still runs. A re-download gets a new record and needs marking again."
+      onclick="event.stopPropagation()"><input type="checkbox" ${on?'checked':''} onchange="noEncodeSet(${+id},this)">
+    <b>Don't encode</b> <span class="dim">keep this file's video as it is</span></label>`;
+}
+async function noEncodeSet(id, box){
+  box.disabled=true;
+  try{
+    const r=await (await fetch(`/api/files/${id}/noencode?on=${box.checked?1:0}`,{method:'POST'})).json();
+    if(!r.ok) throw 0;
+    const row=document.querySelector(`.bfile[data-fid="${id}"]`);
+    if(row) row.dataset.ne=box.checked?'1':'0';
+    openFileHtml=box.closest('.minfo')?box.closest('.minfo').innerHTML:openFileHtml;
+  }catch(e){ box.checked=!box.checked; }
+  box.disabled=false;
 }
 function renderMediaInfo(d){
   const tag=(t,cls)=>`<span class="mtag ${cls||''}">${esc(t)}</span>`;
