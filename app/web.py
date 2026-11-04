@@ -11778,12 +11778,23 @@ def api_vmaf():
 
 @app.post("/api/vmaf/cfg")
 def api_vmaf_cfg(on: int = -1, target: float = 0, samples: int = 0, floor: float = -1, banding: float = 0,
-                 verify: int = -1):
+                 verify: int = -1, low: float = -1, headroom: int = -1):
     from . import vmaftarget
     c = vmaftarget.set_cfg(on=None if on < 0 else bool(on), target=target or None,
                            samples=samples or None, floor=None if floor < 0 else floor,
-                           banding=banding or None, verify=None if verify < 0 else bool(verify))
+                           banding=banding or None, verify=None if verify < 0 else bool(verify),
+                           low=None if low < 0 else low, headroom=None if headroom < 0 else bool(headroom))
     joblog.log(f"VMAF target: {'on' if c['on'] else 'off'}, {c['target']:g}, {c['samples']} samples", "info")
+    return c
+
+
+@app.post("/api/vmaf/kind/{kind}")
+def api_vmaf_kind(kind: str, target: str = "", floor: str = "", low: str = "", banding: str = ""):
+    """One kind's overrides. A blank value clears that figure back to the global one."""
+    from . import vmaftarget
+    sent = {k: v for k, v in (("target", target), ("floor", floor), ("low", low), ("banding", banding)) if v != "-"}
+    c = vmaftarget.set_kind(kind, **sent)
+    joblog.log(f"VMAF target for {kind}: {vmaftarget.for_kind(c, kind)}", "info")
     return c
 
 
@@ -25729,8 +25740,8 @@ function vmafCell(w){
     const sv = r.saved;
     const svt = sv==null ? '' : (sv>=0 ? `<span style="color:#7fd4a3">samples ${sv.toFixed(0)}% smaller</span> than at CQ ${r.fixed}`
                                        : `<span style="color:#ff7b72">samples ${(-sv).toFixed(0)}% larger</span> than at CQ ${r.fixed}`);
-    const chips = (r.tried||[]).map(t => `<span class="vmafcq" title="CQ ${t.cq}: VMAF ${t.vmaf}, banding ${t.cambi}"
-        style="color:${t.ok?'#7fd4a3':'#e0575b'};border-color:${t.ok?'rgba(127,212,163,.45)':'rgba(224,87,91,.45)'};${t.cq===r.cq?'font-weight:700;background:rgba(162,224,94,.12)':''}">CQ ${t.cq} ${t.ok?'✓':'✗'} ${t.vmaf}</span>`).join('');
+    const chips = (r.tried||[]).map(t => `<span class="vmafcq" title="CQ ${t.cq}: VMAF ${t.vmaf}, worst sample ${t.worst}${t.low!=null?`, worst frame ${t.low}`:''}, banding ${t.cambi}${t.fail?` - failed on ${t.fail}`:''}"
+        style="color:${t.ok?'#7fd4a3':'#e0575b'};border-color:${t.ok?'rgba(127,212,163,.45)':'rgba(224,87,91,.45)'};${t.cq===r.cq?'font-weight:700;background:rgba(162,224,94,.12)':''}">CQ ${t.cq} ${t.ok?'✓':'✗'} ${t.vmaf}${t.fail?` <span style="font-size:9.5px;opacity:.8">${t.fail}</span>`:''}</span>`).join('');
     return `<div class="socr vmafrow">
       <span class="pill" style="color:${col};border-color:${col}">quality ✓</span>
       <span><b style="color:${col}">CQ ${r.cq}</b> <span class="dim">chosen (library ${r.fixed})</span> · VMAF <b>${r.vmaf}</b>
@@ -35757,11 +35768,16 @@ async function loadVmaf(){
       <span style="font-size:11.5px"><input type="number" min="2" max="8" value="${c.samples}" style="width:52px;box-sizing:border-box;font-size:11px" onchange="vmafSet({samples:this.value})"> samples</span>
       <span style="font-size:11.5px" title="no single sample may fall further than this below the target - one bad scene is what people notice">worst sample within
         <input type="number" min="0" max="10" step="0.5" value="${c.floor}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="vmafSet({floor:this.value})"></span>
+      <span style="font-size:11.5px" title="the 5th-percentile frame across all samples may sit at most this far under the target - the mean hides a bad second">worst frame within
+        <input type="number" min="0" max="20" step="0.5" value="${c.low}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="vmafSet({low:this.value})"></span>
       <span style="font-size:11.5px" title="CAMBI, Netflix's banding index: about 5 is where banding in flat colours and dark gradients becomes visible. VMAF alone under-scores banding, and banding is what cartoons show first.">banding at most
         <input type="number" min="1" max="20" step="0.5" value="${c.banding}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="vmafSet({banding:this.value})"></span>
+      <span class="pill ${c.headroom?'p-ok':'p-dim'}" style="cursor:pointer" onclick="vmafSet({headroom:${c.headroom?0:1}})"
+        title="the samples predict and the finished file measures a little under them; with this on, each library's recent median gap (0-2 points) is added to the target while searching, so the file lands on the target rather than the samples">headroom ${c.headroom?'learned':'off'}</span>
       <span class="pill ${c.verify?'p-ok':'p-dim'}" style="cursor:pointer" onclick="vmafSet({verify:${c.verify?0:1}})"
         title="keep the reference cuts until the encode is finished and score the FINAL file against them before it replaces the original. The search's VMAF is a prediction from sample encodes; this is the measurement. Adds about a minute per file and ${c.samples} x ${c.sample_s}-second lossless cuts in the cache while the encode runs.">check the final file: ${c.verify?'ON':'off'}</span>
     </div>
+    ${vmafKindsHtml(d)}
     <div class="dim" style="font-size:11px;margin-top:6px">One CQ for every file is right for none of them: it spends the same on a flat cartoon, where most of it is wasted,
       as on grainy film. Before each encode nuarr cuts ${c.samples} ${c.sample_s}-second samples from across the file, encodes them with the very
       settings the real encode will use, scores each against the source with <b>VMAF</b> (Netflix's model of what a viewer sees; ~95 is
@@ -36036,6 +36052,26 @@ async function grpTierRun(btn){
 async function convSet(o){
   const q=Object.entries(o).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');
   await fetch('/api/convert/cfg?'+q,{method:'POST'}); loadConvert();
+}
+// PER KIND. anime / animation / live (the same split the language policy
+// uses). A blank cell inherits the figure in the row above; a typed one
+// overrides it for that kind only. Live action defaults to a tighter worst
+// frame: grain and dark film fall apart in a few frames before the mean moves.
+function vmafKindsHtml(d){
+  const K=d.kinds||{}, c=d.cfg, over=(k,f)=>((c.kinds||{})[k]||{})[f];
+  const cell=(k,f,min,max,step)=>`<td><input type="number" min="${min}" max="${max}" step="${step}" value="${over(k,f)??''}" placeholder="${K[k]?.[f]??''}"
+      style="width:58px;box-sizing:border-box;font-size:11px${over(k,f)!=null?';border-color:#6fb0ff':''}" title="${over(k,f)!=null?'set for '+k+' - clear to inherit':'inherits '+(K[k]?.[f]??'')}"
+      onchange="vmafKind('${k}','${f}',this.value)"></td>`;
+  const heads=Object.entries(d.headroom||{}).filter(([l,h])=>h>0).map(([l,h])=>`${esc(l)} +${h}`).join(' · ');
+  return `<table style="font-size:11px;border-collapse:collapse;margin-top:6px">
+    <tr class="dim" style="font-size:10.5px"><td style="padding:2px 8px 2px 0">KIND</td><td>TARGET</td><td>WORST SAMPLE WITHIN</td><td>WORST FRAME WITHIN</td><td>BANDING AT MOST</td><td style="padding-left:10px">MUST SCORE</td></tr>
+    ${['anime','animation','live'].map(k=>`<tr><td style="padding:2px 8px 2px 0"><b>${k}</b></td>
+      ${cell(k,'target',80,99,0.5)}${cell(k,'floor',0,10,0.5)}${cell(k,'low',0,20,0.5)}${cell(k,'banding',1,20,0.5)}
+      <td class="mono dim" style="padding-left:10px">mean ≥ ${K[k].target} · sample ≥ ${(K[k].target-K[k].floor).toFixed(1)} · frame ≥ ${(K[k].target-K[k].low).toFixed(1)}</td></tr>`).join('')}
+  </table>${heads?`<div class="dim" style="font-size:10.5px;margin-top:3px">headroom now: ${heads}</div>`:''}`;
+}
+async function vmafKind(kind, f, v){
+  await fetch(`/api/vmaf/kind/${kind}?${f}=${encodeURIComponent(v)}`,{method:'POST'}); loadVmaf();
 }
 async function vmafSet(o){
   const q=Object.entries(o).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');

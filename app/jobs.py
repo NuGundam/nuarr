@@ -6259,6 +6259,16 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
                 _vr = await asyncio.to_thread(
                     _vt.choose, job.id, job.file_id, job.path, job.plan, probe_data, w.duration,
                     _library_of_file(job.file_id), os.path.join(SETTINGS.cache_dir, "vmaf"), _vtick)
+                if _vr.get("refuse"):
+                    # the search found the encode would band at every CQ and
+                    # this is a size job: nothing is written, the original stays
+                    joblog.log(f"quality search refused the encode: {_vr['refuse']}", "warn", job.id)
+                    try:
+                        _vt.discard(SETTINGS.cache_dir, job.id)
+                    except Exception:                    # noqa: BLE001
+                        pass
+                    _finish(job, "skipped", 0, 0, note=f"quality search: {_vr['refuse']}")
+                    return
                 if _vr.get("cq") is not None:
                     _fixed = int((job.plan.venc or {}).get("cq") or 0)
                     job.plan.venc = dict(job.plan.venc or {}, cq=int(_vr["cq"]), cq_fixed=_fixed,

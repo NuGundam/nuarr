@@ -1870,9 +1870,35 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
         p.encode = True
         # Not a shrink job - see Plan.grow_ok.
         p.grow_ok = True
+        # ONE GENERATION, NOT TWO. A library that converts to 10-bit HEVC used
+        # to rebuild MPEG-2 into 8-bit H.264 first and convert THAT later -
+        # and the 8-bit pass added banding the source never had (Sonic
+        # Underground: 1.4 -> 9.9 at every CQ, 2026-11-03). Go straight to
+        # 10-bit HEVC where the library's switch is on.
+        _to10 = False
+        if target == "h264" and not hdr:
+            try:
+                from . import hevcconvert as _hc4
+                _to10 = bool(_hc4.cfg()["on"] and _hc4.lib_cfg(library) is not None)
+            except Exception:                            # noqa: BLE001
+                _to10 = False
+        if _to10:
+            p.target = target = "h265"
+            _tg = CONFIG["videoTargets"][target]
+            _hv = _tg["encoder"]
+            try:
+                from . import encoders as _enc4
+                _hv = _enc4.encoder_for(p.venc.get("family") or "nvenc", "hevc")
+            except Exception:                            # noqa: BLE001
+                pass
+            p.venc.update(encoder=_hv, preset=str(_v("h265_preset", _tg["preset"])),
+                          cq=int(_v("h265_cq", _tg["cq"])),
+                          extra=CONFIG["nvencExtra"].get(target, ""))
+            p.ten_bit = True
         p.add("video", f"rebuild the video from {vcodec} to {target}"
-                       + (" (10-bit kept)" if p.ten_bit else ""),
-              why,
+                       + (" as 10-bit HEVC" if _to10 else " (10-bit kept)" if p.ten_bit else ""),
+              why + ("; this library converts to 10-bit HEVC, so one encode instead of an 8-bit "
+                     "rebuild and a conversion after it" if _to10 else ""),
               f"{p.venc['encoder']} cq={p.venc['cq']}")
     elif oversized or _conv:
         p.encode = True

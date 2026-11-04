@@ -46,9 +46,25 @@ from .db import cursor, kv_get, kv_set
 KV = "vmaf.cfg"
 KV_LEARN = "vmaf.learn"
 DEFAULTS = {"on": True, "target": 95.0, "samples": 4, "sample_s": 6.0, "floor": 2.0, "banding": 4.0,
+            # THE WORST FRAME. The mean hides a bad scene and the worst sample's
+            # mean hides a bad second: the 5th-percentile frame across all the
+            # samples may sit at most this far under the target.
+            "low": 5.0,
+            # ONE BAR DOES NOT FIT EVERY KIND. VMAF reads a flat cel the same
+            # as grainy film, but the viewer does not: film needs its worst
+            # moments held closer. Each kind (langpolicy: anime / animation /
+            # live) can override target, floor, low and banding; an empty
+            # entry inherits the figures above.
+            "kinds": {"anime": {}, "animation": {}, "live": {"low": 4.0}},
+            # THE SAMPLES PREDICT, THE FILE MEASURES, and the file lands a
+            # little under the prediction. Add this library's recent median
+            # gap (0-2 points) to the target while searching.
+            "headroom": True,
             # keep the reference cuts and score the FINISHED file against them
             # before it is committed - see verify_final()
             "verify": True}
+KINDS = ("anime", "animation", "live")
+KIND_KEYS = ("target", "floor", "low", "banding")
 CQ_DOWN = 4            # at most this many CQ steps BELOW the library's CQ
 CQ_UP = 14             # at most this many above it (was 10; burn-heavy anime passed VMAF 96-98 at the old cap of +10)
 MIN_MINUTES = 4.0
@@ -66,6 +82,16 @@ MAX_SEARCHES = 2               # the default; kv vmaf.searches overrides (1-4)
 # than this much over that sample's own banding.
 BAND_MARGIN = 1.0
 SUBSAMPLE = 4
+# FRAME N MUST MEET FRAME N. libvmaf pairs its two inputs by timestamp, and
+# Matroska keeps timestamps in whole milliseconds: a 29.97 or 23.976 stream
+# steps 33,33,34 (41,42,42) ms, and two files of the same frames can round
+# differently. Then the pairing slips a frame every few frames, and a lossless
+# copy of a cut scored 82 against the cut itself, with frames at 0 (Sonic
+# Underground, 2026-11-03). Every DVD search gave up at the library CQ, and
+# 84 finished anime files "measured" 77-90 with a worst frame of 0 for the
+# same reason. nearest = pair each frame with the nearest timestamp instead:
+# the lossless copy scores 99, the real sample 98.
+TS_SYNC = ":ts_sync_mode=nearest"
 _COND = threading.Condition()
 _ACTIVE = {"n": 0}
 
@@ -117,7 +143,67 @@ def cfg() -> dict:
         d = json.loads(kv_get(KV) or "{}")
     except Exception:                                    # noqa: BLE001
         d = {}
-    return {**DEFAULTS, **{k: v for k, v in d.items() if k in DEFAULTS}}
+    out = {**DEFAULTS, **{k: v for k, v in d.items() if k in DEFAULTS}}
+    kinds = {k: dict(v) for k, v in (DEFAULTS["kinds"] or {}).items()}
+    for k, v in (out.get("kinds") or {}).items():
+        if k in KINDS and isinstance(v, dict):
+            kinds[k] = {kk: vv for kk, vv in v.items() if kk in KIND_KEYS}
+    out["kinds"] = kinds
+    return out
+
+
+def _clamp(k: str, v):
+    if k == "target":
+        return max(80.0, min(99.0, float(v)))
+    if k == "floor":
+        return max(0.0, min(10.0, float(v)))
+    if k == "low":
+        return max(0.0, min(20.0, float(v)))
+    if k == "banding":
+        return max(1.0, min(20.0, float(v)))
+    return v
+
+
+def for_kind(c: dict, kind: str) -> dict:
+    """The figures that apply to one kind: the global ones, overridden by the kind's."""
+    out = {k: c[k] for k in KIND_KEYS}
+    out.update({k: v for k, v in ((c.get("kinds") or {}).get(kind) or {}).items() if k in KIND_KEYS and v is not None})
+    out["kind"] = kind
+    return out
+
+
+def set_kind(kind: str, **kw) -> dict:
+    """Override one kind's figures; None (or "") clears a key back to inherit."""
+    c = cfg()
+    if kind not in KINDS:
+        return c
+    kinds = dict(c.get("kinds") or {})
+    k = dict(kinds.get(kind) or {})
+    for key, v in kw.items():
+        if key not in KIND_KEYS:
+            continue
+        if v is None or v == "":
+            k.pop(key, None)
+        else:
+            k[key] = _clamp(key, v)
+    kinds[kind] = k
+    c["kinds"] = kinds
+    kv_set(KV, json.dumps(c))
+    return c
+
+
+def headroom(library: str | None) -> float:
+    """This library's recent sample-minus-final gap, median of the last 25, 0..2."""
+    try:
+        with cursor() as cur:
+            xs = [r["d"] for r in cur.execute(
+                "SELECT vmaf - final_vmaf d FROM vmaf_log WHERE library IS ? AND final_vmaf IS NOT NULL "
+                "AND final_vmaf > 70 ORDER BY id DESC LIMIT 25", (library,))]
+    except Exception:                                    # noqa: BLE001
+        return 0.0
+    if len(xs) < 5:
+        return 0.0
+    return round(max(0.0, min(2.0, statistics.median(xs))), 2)
 
 
 def set_cfg(**kw) -> dict:
@@ -125,8 +211,12 @@ def set_cfg(**kw) -> dict:
     for k, v in kw.items():
         if k not in DEFAULTS or v is None:
             continue
-        if k == "on" or k == "verify":
+        if k in ("on", "verify", "headroom"):
             c[k] = bool(v)
+        elif k == "low":
+            c[k] = _clamp("low", v)
+        elif k == "kinds":
+            continue                                     # set_kind() owns this
         elif k == "samples":
             c[k] = max(2, min(8, int(v)))
         elif k == "target":
@@ -155,7 +245,7 @@ def init() -> None:
         # real encode exists. NULL until then - and forever, for a file that
         # was searched before this existed or with the check switched off.
         for col in ("final_vmaf REAL", "final_vmaf_min REAL", "final_cambi REAL", "final_at REAL", "final_note TEXT",
-                    "final_samples TEXT"):
+                    "final_samples TEXT", "vmaf_low REAL", "kind TEXT", "head REAL"):
             if col.split()[0] not in have:
                 cur.execute(f"ALTER TABLE vmaf_log ADD COLUMN {col}")
 
@@ -352,7 +442,7 @@ def _score(ff, ref, enc, ten, threads, card: bool = False) -> tuple[float, float
     lav = (f"[0:v]format={fmt},setpts=PTS-STARTPTS[d];"
            f"[1:v]format={fmt},setpts=PTS-STARTPTS[r];"
            f"[d][r]libvmaf=log_fmt=json:log_path='{log.replace(chr(92), '/').replace(':', chr(92) + ':')}'"
-           f":n_threads={threads}:n_subsample={SUBSAMPLE}:feature=name=cambi")
+           f":n_threads={threads}:n_subsample={SUBSAMPLE}:feature=name=cambi{TS_SYNC}")
     # Both sides off NVDEC when the references are HEVC; libvmaf itself
     # wants system frames, so the format= step above is where they come down.
     hw = _NVDEC if card else []
@@ -437,7 +527,15 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
     if family == "cpu":
         lo, hi = max(lo, 14), min(hi, 34)
     ff = jobs._ffmpeg_exe()
-    want, floor, banding = float(c["target"]), float(c["floor"]), float(c["banding"])
+    try:
+        from .langpolicy import kind_for
+        kind = kind_for(path=src, library=library or "")
+    except Exception:                                    # noqa: BLE001
+        kind = "live"
+    kc = for_kind(c, kind)
+    want, floor, banding, low_floor = float(kc["target"]), float(kc["floor"]), float(kc["banding"]), float(kc["low"])
+    head = headroom(library) if c.get("headroom") else 0.0
+    aim = want + head                       # what the samples must reach for the file to land on `want`
     n, length = int(c["samples"]), float(c["sample_s"])
     times = _sample_times(duration, n, length)
     threads = max(2, (os.cpu_count() or 8) // (searches() + 1))
@@ -471,7 +569,8 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
         total = 1 + est["probes"]                    # 1 unit for cutting, 1 per probe
         info = {"tried": sorted(({"cq": k2, "vmaf": v["vmaf"], "cambi": v["cambi"], "ok": v["ok"]}
                                  for k2, v in tried.items()), key=lambda x: x["cq"]),
-                "want": want, "banding": banding, "probes_est": est["probes"]}
+                "want": want, "banding": banding, "probes_est": est["probes"],
+                "kind": kind, "head": head, "low": low_floor, "floor": floor}
         try:
             tick(text, min(0.99, done_units / total), info)
         except TypeError:
@@ -543,12 +642,18 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
              "worst": round(min(means), 2), "cambi": round(max(bands), 2),
              "src_cambi": round(max(src_band), 2) if src_band else None,
              "band_added": round(max((b - sb) for b, sb in zip(bands, src_band)), 2) if src_band else None}
-        # PASSES = the samples average the target AND none of them falls more
-        # than `floor` below it - one bad scene is what people notice - AND no
-        # sample bands visibly.
+        # PASSES = the samples average the target (plus headroom) AND no sample
+        # falls more than `floor` below it AND no sample's worst frames fall
+        # more than `low` below it - one bad scene, one bad second, is what
+        # people notice - AND no sample bands visibly.
         band_ok = all(b <= max(banding, sb + BAND_MARGIN)
                       for b, sb in zip(bands, src_band or [0.0] * len(bands)))
-        r["ok"] = r["vmaf"] >= want and r["worst"] >= want - floor and band_ok
+        r["ok"] = (r["vmaf"] >= aim and r["worst"] >= aim - floor
+                   and r["low"] >= aim - low_floor and band_ok)
+        r["fail"] = ("" if r["ok"] else
+                     "banding" if not band_ok else
+                     "mean" if r["vmaf"] < aim else
+                     "worst sample" if r["worst"] < aim - floor else "worst frame")
         tried[cq] = r
         return r
 
@@ -611,7 +716,7 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
         saved = round(100.0 * (1 - chosen["size"] / base["size"]), 1) if base and base["size"] else None
         secs = round(time.time() - t0, 1)
         note = ("reached the target" if chosen["ok"] else
-                f"could not reach {want:g} without banding within CQ {lo}-{hi}")
+                f"could not reach {aim:g} ({tried[best]['fail'] if best in tried else 'target'}) within CQ {lo}-{hi}")
         _remember(library, target, family, best)
         # KEEP THE REFERENCES FOR THE FINAL FILE. Everything above scored
         # SAMPLE encodes; the real encode is a different ffmpeg run over the
@@ -630,14 +735,25 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
                 pass
         with cursor() as cur:
             cur.execute("INSERT INTO vmaf_log(at,file_id,job_id,path,library,target,family,cq_fixed,cq_chosen,"
-                        "vmaf,vmaf_min,want,saved_pct,probes,secs,note,cambi) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "vmaf,vmaf_min,want,saved_pct,probes,secs,note,cambi,vmaf_low,kind,head) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (time.time(), file_id, job_id, src, library, target, family, fixed, best,
-                         chosen["vmaf"], chosen["worst"], want, saved, len(tried), secs, note, chosen["cambi"]))
+                         chosen["vmaf"], chosen["worst"], want, saved, len(tried), secs, note, chosen["cambi"],
+                         chosen["low"], kind, head))
+        # AN ENCODE THAT BANDS AT EVERY CQ DAMAGES THE PICTURE. For a size job
+        # that is a reason not to encode: the caller keeps the original. A
+        # compatibility rebuild still has to happen and goes at the library CQ.
+        refuse = ""
+        if not chosen["ok"] and chosen.get("fail") == "banding" and not getattr(plan, "grow_ok", False):
+            refuse = (f"the encode adds banding at every CQ tried ({chosen['cambi']} against the source's "
+                      f"{chosen.get('src_cambi')}) - original kept")
         return {"cq": best, "fixed": fixed, "vmaf": chosen["vmaf"], "worst": chosen["worst"], "saved": saved,
-                "cambi": chosen["cambi"],
+                "cambi": chosen["cambi"], "low": chosen["low"], "kind": kind, "head": head, "want": want,
+                "refuse": refuse,
                 "probes": len(tried), "secs": secs, "note": note,
                 "src_cambi": chosen.get("src_cambi"), "band_added": chosen.get("band_added"),
-                "tried": sorted(({"cq": k, "vmaf": v["vmaf"], "worst": v["worst"], "cambi": v["cambi"], "ok": v["ok"]}
+                "tried": sorted(({"cq": k, "vmaf": v["vmaf"], "worst": v["worst"], "low": v["low"], "cambi": v["cambi"],
+                                  "ok": v["ok"], "fail": v.get("fail", "")}
                                  for k, v in tried.items()), key=lambda x: x["cq"])}
     except Exception as e:                               # noqa: BLE001
         joblog.log(f"VMAF search failed ({type(e).__name__}: {e}) - encoding at the library's CQ {fixed}",
@@ -782,7 +898,7 @@ def verify_final(job_id: str, final: str, cache_dir: str, tick=None) -> dict | N
                 lav = (f"[0:v]format={fmt},trim=start_frame={dskip},setpts=PTS-STARTPTS[d];"
                        f"[1:v]format={fmt},trim=start_frame={rskip},setpts=PTS-STARTPTS[r];"
                        f"[d][r]libvmaf=log_fmt=json:log_path='{log.replace(chr(92), '/').replace(':', chr(92) + ':')}'"
-                       f":n_threads={threads}:n_subsample={SUBSAMPLE}:feature=name=cambi")
+                       f":n_threads={threads}:n_subsample={SUBSAMPLE}:feature=name=cambi{TS_SYNC}")
                 hw = _NVDEC if card else []
                 rc, _err = _run([ff, "-hide_banner", "-nostdin", "-v", "error"] + hw + ["-i", cut] + hw + ["-i", ref,
                                  "-lavfi", lav, "-f", "null", "-"], 600)
@@ -844,8 +960,9 @@ def snapshot() -> dict:
     init()
     with cursor() as cur:
         rows = [dict(r) for r in cur.execute(
-            "SELECT at,file_id,job_id,path,library,target,family,cq_fixed,cq_chosen,vmaf,vmaf_min,want,saved_pct,"
-            "probes,secs,note,cambi,final_vmaf,final_vmaf_min,final_cambi,final_note FROM vmaf_log ORDER BY id DESC LIMIT 100")]
+            "SELECT at,file_id,job_id,path,library,target,family,cq_fixed,cq_chosen,vmaf,vmaf_min,vmaf_low,kind,head,want,"
+            "saved_pct,probes,secs,note,cambi,final_vmaf,final_vmaf_min,final_cambi,final_note FROM vmaf_log "
+            "ORDER BY id DESC LIMIT 100")]
         # BEFORE AND AFTER. The job row has the real file sizes, and the plan
         # text the search wrote has the source's banding ("banding 1.2 (source
         # 0.9)") - so this works for files encoded before this table showed it.
@@ -875,7 +992,16 @@ def snapshot() -> dict:
     for b in by:
         xs = learn.get(_lkey(b["library"], b["target"], b["family"])) or []
         b["guess"] = int(round(statistics.median(xs))) if len(xs) >= 2 else None
-    return {"cfg": cfg(), "recent": rows, "count": int(tot["n"] or 0),
+    c = cfg()
+    heads = {}
+    try:
+        with cursor() as cur:
+            libs = [r["library"] for r in cur.execute("SELECT DISTINCT library FROM vmaf_log")]
+        heads = {str(l): headroom(l) for l in libs}
+    except Exception:                                    # noqa: BLE001
+        pass
+    return {"cfg": c, "kinds": {k: for_kind(c, k) for k in KINDS}, "headroom": heads,
+            "recent": rows, "count": int(tot["n"] or 0),
             "avg_saved": round(tot["s"], 1) if tot["s"] is not None else None,
             "avg_secs": round(tot["t"] or 0, 1), "avg_probes": round(tot["p"] or 0, 1),
             "avg_shift": round(tot["d"], 1) if tot["d"] is not None else None,
