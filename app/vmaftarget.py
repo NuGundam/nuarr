@@ -192,13 +192,31 @@ def set_kind(kind: str, **kw) -> dict:
     return c
 
 
-def headroom(library: str | None) -> float:
-    """This library's recent sample-minus-final gap, median of the last 25, 0..2."""
+# The ts_sync_mode fix went live here. Final scores before it are unreliable,
+# so the history marks the point rather than letting a jump look like learning.
+SCORER_FIXED_AT = 1793774622
+
+
+def is_dvd(path: str | None) -> bool:
+    """DVD sources carry the arr's quality tag in the file name: [DVD], [DVD-576p]."""
+    return "[DVD" in (path or "").upper()
+
+
+def headroom(library: str | None, dvd: bool = False) -> float:
+    """The recent sample-minus-final gap, median of the last 25, 0..2.
+
+    DVD SOURCES ARE COUNTED APART. Interlaced MPEG-2 finishes 1-2 points under
+    its samples where a Blu-ray in the same library finishes level, so one
+    figure per library hid the gap (Sonic Underground, 2026-11-04). Only DVD
+    rows after the scorer fix count: the ones before it read 2-6 points the
+    wrong way, and DVD rows are too few to wash that out."""
     try:
         with cursor() as cur:
             xs = [r["d"] for r in cur.execute(
                 "SELECT vmaf - final_vmaf d FROM vmaf_log WHERE library IS ? AND final_vmaf IS NOT NULL "
-                "AND final_vmaf > 70 ORDER BY id DESC LIMIT 25", (library,))]
+                "AND final_vmaf > 70 AND "
+                + ("path LIKE '%[DVD%' AND at >= ?" if dvd else "path NOT LIKE '%[DVD%' AND ? > 0")
+                + " ORDER BY id DESC LIMIT 25", (library, SCORER_FIXED_AT))]
     except Exception:                                    # noqa: BLE001
         return 0.0
     if len(xs) < 5:
@@ -206,9 +224,6 @@ def headroom(library: str | None) -> float:
     return round(max(0.0, min(2.0, statistics.median(xs))), 2)
 
 
-# The ts_sync_mode fix went live here. Final scores before it are unreliable,
-# so the history marks the point rather than letting a jump look like learning.
-SCORER_FIXED_AT = 1793774622
 _learned_cache = {"at": 0.0, "v": None}
 
 
@@ -221,13 +236,16 @@ def learned() -> dict:
         return _learned_cache["v"]
     with cursor() as cur:
         rows = [dict(r) for r in cur.execute(
-            "SELECT at,library,target,family,cq_chosen,want,vmaf,final_vmaf FROM vmaf_log "
+            "SELECT at,path,library,target,family,cq_chosen,want,vmaf,final_vmaf FROM vmaf_log "
             "WHERE final_vmaf IS NOT NULL AND final_vmaf > 70 ORDER BY id")]
     libs = {}
     for r in rows:
-        libs.setdefault(str(r["library"]), []).append(r)
+        dvd = is_dvd(r["path"])
+        if dvd and r["at"] < SCORER_FIXED_AT:            # as headroom(): not counted
+            continue
+        libs.setdefault((str(r["library"]), dvd), []).append(r)
     out = []
-    for lib, rs in libs.items():
+    for (lib, dvd), rs in libs.items():
         gaps = [r["vmaf"] - r["final_vmaf"] for r in rs]
         roll = [(rs[i]["at"], statistics.median(gaps[max(0, i - 24):i + 1])) for i in range(len(rs))]
         step = max(1, len(roll) // 40)
@@ -239,8 +257,9 @@ def learned() -> dict:
                and r["cq_chosen"] is not None]
         recent = rs[-25:]
         out.append({
-            "library": lib, "n": len(rs), "first_at": rs[0]["at"], "last_at": last["at"],
-            "gap_now": round(statistics.median(gaps[-25:]), 2), "head": headroom(lib if lib != "None" else None),
+            "library": lib + (" - DVD" if dvd else ""), "n": len(rs), "first_at": rs[0]["at"], "last_at": last["at"],
+            "gap_now": round(statistics.median(gaps[-25:]), 2),
+            "head": headroom(lib if lib != "None" else None, dvd),
             "points": [[round(a), round(g, 2)] for a, g in pts],
             "cq_then": int(round(statistics.median(cqs[:25]))) if cqs else None,
             "cq_now": int(round(statistics.median(cqs[-25:]))) if cqs else None,
@@ -582,7 +601,7 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
         kind = "live"
     kc = for_kind(c, kind)
     want, floor, banding, low_floor = float(kc["target"]), float(kc["floor"]), float(kc["banding"]), float(kc["low"])
-    head = headroom(library) if c.get("headroom") else 0.0
+    head = headroom(library, is_dvd(src)) if c.get("headroom") else 0.0
     aim = want + head                       # what the samples must reach for the file to land on `want`
     n, length = int(c["samples"]), float(c["sample_s"])
     times = _sample_times(duration, n, length)
@@ -1046,6 +1065,7 @@ def snapshot() -> dict:
         with cursor() as cur:
             libs = [r["library"] for r in cur.execute("SELECT DISTINCT library FROM vmaf_log")]
         heads = {str(l): headroom(l) for l in libs}
+        heads.update({f"{l} DVD": headroom(l, True) for l in libs})
     except Exception:                                    # noqa: BLE001
         pass
     return {"cfg": c, "kinds": {k: for_kind(c, k) for k in KINDS}, "headroom": heads,
