@@ -35627,6 +35627,16 @@ async function idxCon(name,op,btn){
 }
 // ---- quality-targeted encoding (vmaftarget.py) ----
 let _vmafT=null;
+// The real file before and after, from the job row. A skipped job kept its
+// original, so its size_after is what the discarded encode would have been.
+function vmafSizes(r){
+  const b=r.size_before, a=r.size_after;
+  if(r.job_state==='skipped') return `${b?humanBytes(b)+' ':''}<span class="dim">original kept</span>`;
+  if(!b) return '—';
+  if(!a) return `${humanBytes(b)} <span class="dim">→ encoding</span>`;
+  const pct=Math.round((1-a/b)*100);
+  return `${humanBytes(b)} → <b>${humanBytes(a)}</b> <span style="color:${pct>=0?'#7fd4a3':'#e2b341'}">${pct>=0?'-':'+'}${Math.abs(pct)}%</span>`;
+}
 async function loadVmaf(){
   const el=document.getElementById('vmafBox'); if(!el) return;
   let d; try{ d=await (await fetch('/api/vmaf')).json(); }catch(e){ return; }
@@ -35670,10 +35680,11 @@ async function loadVmaf(){
       </table></div>`:''}
     ${d.recent.length?`<details style="margin-top:8px;font-size:11px"><summary class="dim" style="cursor:pointer">last ${d.recent.length} files</summary>
       <table style="width:100%;border-collapse:collapse;margin-top:3px">
+        <tr class="dim" style="font-size:10.5px"><td style="padding:3px 6px">FILE</td><td>CQ</td><td>VMAF</td><td>BANDING</td><td>FILE SIZE</td><td>SAMPLES VS FIXED CQ</td><td>SEARCH</td><td>WHEN</td></tr>
         ${d.recent.map(r=>`<tr style="border-top:1px solid var(--line)"><td style="padding:3px 6px;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.name)}">${esc(r.name)}</td>
           <td class="mono">CQ ${r.cq_fixed} → <b>${r.cq_chosen}</b></td>
           <td class="mono" title="mean over the samples; worst sample ${r.vmaf_min}${r.final_vmaf!=null?` - the final file measured ${r.final_vmaf} (worst ${r.final_vmaf_min}), ${r.final_note||''}`:''}">${r.vmaf}${r.final_vmaf!=null?` <span class="${r.final_vmaf>=r.want?'ok':'warn'}" style="font-size:10.5px">final ${r.final_vmaf}</span>`:''}</td>
-          <td class="mono dim" title="banding (CAMBI) - under 5 is not visible${r.final_cambi!=null?` - the final file measured ${r.final_cambi}`:''}">${r.cambi==null?'':'band '+r.cambi}${r.final_cambi!=null?` <span style="font-size:10.5px">final ${r.final_cambi}</span>`:''}</td><td>${sz(r.saved_pct)}</td>
+          <td class="mono dim" title="banding (CAMBI) - under 5 is not visible${r.final_cambi!=null?` - the final file measured ${r.final_cambi}`:''}">${r.src_cambi!=null?`source ${r.src_cambi} → `:''}${r.cambi==null?'':'band '+r.cambi}${r.final_cambi!=null?` <span style="font-size:10.5px">final ${r.final_cambi}</span>`:''}</td><td class="mono">${vmafSizes(r)}</td><td>${sz(r.saved_pct)}</td>
           <td class="dim">${r.probes} probes · ${Math.round(r.secs)}s</td><td class="dim">${esc(ago(r.at))}</td></tr>`).join('')}
       </table></details>`:''}
   </div>`;

@@ -788,12 +788,25 @@ def verify_final(job_id: str, final: str, cache_dir: str, tick=None) -> dict | N
 
 
 # ----------------------------------------------------------------- page ----
+_SRC_BAND = re.compile(r"banding [0-9.]+ \(source ([0-9.]+)\)")
+_SRC_SIZE = re.compile(r'"src_size": ?([0-9]+)')
+
+
 def snapshot() -> dict:
     init()
     with cursor() as cur:
         rows = [dict(r) for r in cur.execute(
-            "SELECT at,file_id,path,library,target,family,cq_fixed,cq_chosen,vmaf,vmaf_min,want,saved_pct,"
+            "SELECT at,file_id,job_id,path,library,target,family,cq_fixed,cq_chosen,vmaf,vmaf_min,want,saved_pct,"
             "probes,secs,note,cambi,final_vmaf,final_vmaf_min,final_cambi,final_note FROM vmaf_log ORDER BY id DESC LIMIT 40")]
+        # BEFORE AND AFTER. The job row has the real file sizes, and the plan
+        # text the search wrote has the source's banding ("banding 1.2 (source
+        # 0.9)") - so this works for files encoded before this table showed it.
+        ids = [r["job_id"] for r in rows if r.get("job_id")]
+        jobs_by = {}
+        if ids:
+            ph = ",".join("?" * len(ids))
+            jobs_by = {j["job_id"]: dict(j) for j in cur.execute(
+                f"SELECT job_id,state,size_before,size_after,plan_json FROM jobs WHERE job_id IN ({ph})", ids)}
         tot = cur.execute("SELECT COUNT(*) n, AVG(saved_pct) s, AVG(secs) t, AVG(probes) p, "
                           "AVG(cq_chosen - cq_fixed) d FROM vmaf_log").fetchone()
         by = [dict(r) for r in cur.execute(
@@ -801,6 +814,15 @@ def snapshot() -> dict:
             "AVG(saved_pct) saved, AVG(vmaf) vmaf FROM vmaf_log GROUP BY library, target, family ORDER BY n DESC")]
     for r in rows:
         r["name"] = os.path.basename(r.pop("path") or "")
+        j = jobs_by.get(r.pop("job_id", None)) or {}
+        plan = j.get("plan_json") or ""
+        m = _SRC_BAND.search(plan)
+        r["src_cambi"] = float(m.group(1)) if m else None
+        before = j.get("size_before")
+        if not before:
+            m = _SRC_SIZE.search(plan)
+            before = int(m.group(1)) if m else None
+        r["size_before"], r["size_after"], r["job_state"] = before, j.get("size_after"), j.get("state")
     learn = _learn()
     for b in by:
         xs = learn.get(_lkey(b["library"], b["target"], b["family"])) or []
