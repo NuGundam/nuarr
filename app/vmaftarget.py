@@ -154,7 +154,8 @@ def init() -> None:
         # THE FINAL FILE'S OWN SCORES, filled in by verify_final() once the
         # real encode exists. NULL until then - and forever, for a file that
         # was searched before this existed or with the check switched off.
-        for col in ("final_vmaf REAL", "final_vmaf_min REAL", "final_cambi REAL", "final_at REAL", "final_note TEXT"):
+        for col in ("final_vmaf REAL", "final_vmaf_min REAL", "final_cambi REAL", "final_at REAL", "final_note TEXT",
+                    "final_samples TEXT"):
             if col.split()[0] not in have:
                 cur.execute(f"ALTER TABLE vmaf_log ADD COLUMN {col}")
 
@@ -690,6 +691,38 @@ def sweep(cache_dir: str, max_age_s: float = 3 * 86400) -> int:
     return n
 
 
+# A FINAL SCORE UNDER 90, KEPT TO BE LOOKED AT. Erik, 2026-11-03. 84 of 756 Anime
+# Shows conversions scored under 90 with a worst moment near 0, after samples
+# that predicted 95+. The originals were gone and the cuts deleted, so it could
+# not be told whether the score or the file was wrong. Now such a file keeps its
+# reference cuts, its final cuts, libvmaf's per-frame logs and a scores.json, in
+# their own folder: sweep() reads only "vmaf", so they outlive the three days.
+# ~0.5-1 GB a file, so only the newest KEEP_MAX stay.
+KEEP_BELOW = 90.0
+KEEP_MAX = 30
+
+
+def _keep_dir(cache_dir: str) -> str:
+    return os.path.join(cache_dir, "vmaf-low")
+
+
+def _keep_cuts(cache_dir: str, job_id: str, work_dir: str, facts: dict) -> str:
+    """Move a job's cuts to the kept folder and drop the oldest past KEEP_MAX."""
+    import shutil as _sh
+    base = _keep_dir(cache_dir)
+    os.makedirs(base, exist_ok=True)
+    with open(os.path.join(work_dir, "scores.json"), "w", encoding="utf-8") as fh:
+        json.dump(facts, fh, indent=1)
+    dest = os.path.join(base, os.path.basename(_job_dir(cache_dir, job_id)))
+    _sh.rmtree(dest, ignore_errors=True)
+    os.replace(work_dir, dest)
+    kept = sorted((os.path.join(base, n) for n in os.listdir(base) if os.path.isdir(os.path.join(base, n))),
+                  key=os.path.getmtime)
+    for old in kept[:-KEEP_MAX]:
+        _sh.rmtree(old, ignore_errors=True)
+    return dest
+
+
 def verify_final(job_id: str, final: str, cache_dir: str, tick=None) -> dict | None:
     """Score the FINISHED encode against the reference cuts the search kept.
 
@@ -708,6 +741,7 @@ def verify_final(job_id: str, final: str, cache_dir: str, tick=None) -> dict | N
     only ever score lower than the right one."""
     import shutil as _sh
     from . import jobs
+    init()
     work_dir = _job_dir(cache_dir, job_id)
     man = os.path.join(work_dir, "verify.json")
     if not os.path.exists(man):
@@ -721,7 +755,7 @@ def verify_final(job_id: str, final: str, cache_dir: str, tick=None) -> dict | N
     ten, card, length = bool(m["ten"]), bool(m["card"]), float(m["length"])
     threads = max(2, int(m.get("threads") or 4))
     fmt = "yuv420p10le" if ten else "yuv420p"
-    means, worsts, bands = [], [], []
+    means, worsts, bands, per_sample = [], [], [], []
     t0 = time.time()
     try:
         for k, name in enumerate(m["refs"]):
@@ -763,9 +797,11 @@ def verify_final(job_id: str, final: str, cache_dir: str, tick=None) -> dict | N
                 except Exception:                        # noqa: BLE001
                     continue
                 if best is None or mean > best[0]:
-                    best = (mean, float(low), cambi)
+                    best = (mean, float(low), cambi, dskip, rskip)
             if best:
                 means.append(best[0]); worsts.append(best[1]); bands.append(best[2])
+                per_sample.append({"t": round(t, 3), "vmaf": round(best[0], 2), "worst": round(best[1], 2),
+                                   "cambi": round(best[2], 2), "final_skip": best[3], "ref_skip": best[4]})
         if not means:
             res = {"vmaf": None, "worst": None, "cambi": None, "samples": 0, "secs": round(time.time() - t0, 1),
                    "note": "could not score the final file against the kept samples"}
@@ -775,11 +811,23 @@ def verify_final(job_id: str, final: str, cache_dir: str, tick=None) -> dict | N
                    "note": f"{len(means)} of {len(m['refs'])} samples" if len(means) < len(m["refs"]) else "all samples",
                    "sample_vmaf": m.get("sample_vmaf"), "sample_worst": m.get("sample_worst"),
                    "sample_cambi": m.get("sample_cambi")}
+        low = res["vmaf"] is not None and res["vmaf"] < KEEP_BELOW
+        if low:
+            try:
+                res["kept"] = _keep_cuts(cache_dir, job_id, work_dir, {
+                    "job": job_id, "src": m.get("src"), "final": final, "at": time.time(), "vmaf": res["vmaf"],
+                    "worst": res["worst"], "cambi": res["cambi"], "sample_vmaf": res.get("sample_vmaf"),
+                    "sample_worst": res.get("sample_worst"), "sample_cambi": res.get("sample_cambi"),
+                    "length": length, "samples": per_sample})
+                res["note"] += "; cuts kept"
+            except Exception as e:                       # noqa: BLE001
+                res["note"] += f"; could not keep the cuts ({type(e).__name__})"
         try:
             with cursor() as cur:
-                cur.execute("UPDATE vmaf_log SET final_vmaf=?, final_vmaf_min=?, final_cambi=?, final_at=?, final_note=? "
-                            "WHERE id=(SELECT MAX(id) FROM vmaf_log WHERE job_id=?)",
-                            (res["vmaf"], res["worst"], res["cambi"], time.time(), res["note"], job_id))
+                cur.execute("UPDATE vmaf_log SET final_vmaf=?, final_vmaf_min=?, final_cambi=?, final_at=?, final_note=?, "
+                            "final_samples=? WHERE id=(SELECT MAX(id) FROM vmaf_log WHERE job_id=?)",
+                            (res["vmaf"], res["worst"], res["cambi"], time.time(), res["note"],
+                             json.dumps(per_sample) if low else None, job_id))
         except Exception:                                # noqa: BLE001
             pass
         return res
