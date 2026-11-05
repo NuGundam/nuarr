@@ -11784,12 +11784,13 @@ def api_vmaf_learned():
 
 @app.post("/api/vmaf/cfg")
 def api_vmaf_cfg(on: int = -1, target: float = 0, samples: int = 0, floor: float = -1, banding: float = 0,
-                 verify: int = -1, low: float = -1, headroom: int = -1):
+                 verify: int = -1, low: float = -1, headroom: int = -1, dark: int = -1):
     from . import vmaftarget
     c = vmaftarget.set_cfg(on=None if on < 0 else bool(on), target=target or None,
                            samples=samples or None, floor=None if floor < 0 else floor,
                            banding=banding or None, verify=None if verify < 0 else bool(verify),
-                           low=None if low < 0 else low, headroom=None if headroom < 0 else bool(headroom))
+                           low=None if low < 0 else low, headroom=None if headroom < 0 else bool(headroom),
+                           dark=None if dark < 0 else bool(dark))
     joblog.log(f"VMAF target: {'on' if c['on'] else 'off'}, {c['target']:g}, {c['samples']} samples", "info")
     return c
 
@@ -25753,7 +25754,7 @@ function vmafCell(w){
       <span><b style="color:${col}">CQ ${r.cq}</b> <span class="dim">chosen (library ${r.fixed})</span> · VMAF <b>${r.vmaf}</b>
         <span class="dim">(worst ${r.worst})</span> · banding <b>${r.cambi}</b>${r.src_cambi!=null?` <span class="dim" title="the source's own banding on the same samples - an encode passes if it adds no more than 1 point to it">(source ${r.src_cambi})</span>`:''}${svt?' · '+svt:''}</span>
       <span>${chips}</span>
-      <span class="dim">${r.probes||''} probes in ${Math.round(r.secs||0)}s</span></div>`;
+      <span class="dim">${r.probes||''} probes in ${Math.round(r.secs||0)}s${r.dark!=null?` · dark scene at ${vmafMmss(r.dark)}`:''}</span></div>`;
   }
   if(!w.vmaf_stage) return '';
   const f = Math.max(0, Math.min(1, w.vmaf_frac||0)), pct = f*100;
@@ -25768,7 +25769,7 @@ function vmafCell(w){
     <span class="pill" style="color:${col};border-color:${col}">quality</span>
     <span class="vmafbar"><i style="width:${pct.toFixed(1)}%"></i><b></b></span>
     <span class="mono socrpct" style="color:${col};min-width:40px">${pct.toFixed(0)}%</span>
-    <span class="dim">${esc(w.vmaf_stage)} · ${mmss(el)}${left!=null?' · ~'+mmss(left)+' left':''}</span>
+    <span class="dim">${esc(w.vmaf_stage)} · ${mmss(el)}${left!=null?' · ~'+mmss(left)+' left':''}${info.dark!=null?` · <span title="${Math.round((info.dark_risk||0)*100)}% of the picture there is a dark gradient">dark scene at ${vmafMmss(info.dark)}</span>`:''}</span>
     <span>${chips}</span>
     <span class="dim">· looking for the smallest file that still scores VMAF ${info.want??95} without adding banding</span></div>`;
 }
@@ -35703,6 +35704,7 @@ function vmNum(v, grade, bold){
   const c=_vmC[grade]||'inherit';
   return `<span style="color:${c}${bold?';font-weight:700':''}">${v}</span>`;
 }
+const vmafMmss=t=>`${Math.floor(t/60)}:${String(Math.floor(t%60)).padStart(2,'0')}`;
 function vmafTip(r){
   let t=`samples predicted ${r.vmaf} (worst ${r.vmaf_min}); target ${r.want??95}`;
   if(r.final_vmaf!=null) t+=`; the final file measured ${r.final_vmaf} (worst ${r.final_vmaf_min}), ${r.final_note||''}`;
@@ -35828,6 +35830,8 @@ async function loadVmaf(){
         <input type="number" min="1" max="20" step="0.5" value="${c.banding}" style="width:56px;box-sizing:border-box;font-size:11px" onchange="vmafSet({banding:this.value})"></span>
       <span id="vmafHeadPill" class="pill ${c.headroom?'p-ok':'p-dim'}" style="cursor:pointer" onclick="vmafSet({headroom:${c.headroom?0:1}})"
         onmouseenter="vmafHeadShow(this)">headroom ${c.headroom?'learned':'off'}</span>
+      <span class="pill ${c.dark!==false?'p-ok':'p-dim'}" style="cursor:pointer" onclick="vmafSet({dark:${c.dark!==false?0:1}})"
+        title="before cutting the samples, scan the file's keyframes for the darkest smooth scene - the dark gradients where banding shows - and move the nearest sample onto it. Evenly spaced samples cover about 24 s of an episode and missed a 4-second banding shot 40 s away. Costs 3-15 s on the card per file; files with dark scenes tend to land one CQ step lower">dark scenes: ${c.dark!==false?'sampled':'off'}</span>
       <span class="pill ${c.verify?'p-ok':'p-dim'}" style="cursor:pointer" onclick="vmafSet({verify:${c.verify?0:1}})"
         title="keep the reference cuts until the encode is finished and score the FINAL file against them before it replaces the original. The search's VMAF is a prediction from sample encodes; this is the measurement. Adds about a minute per file and ${c.samples} x ${c.sample_s}-second lossless cuts in the cache while the encode runs.">check the final file: ${c.verify?'ON':'off'}</span>
     </div>

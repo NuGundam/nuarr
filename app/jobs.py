@@ -6283,7 +6283,7 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
                     w.vmaf_result = {"cq": int(_vr["cq"]), "fixed": _fixed, "vmaf": _vr.get("vmaf"),
                                      "worst": _vr.get("worst"), "cambi": _vr.get("cambi"),
                                      "saved": _sv, "probes": _vr.get("probes"), "secs": _vr.get("secs"),
-                                     "src_cambi": _vr.get("src_cambi"),
+                                     "src_cambi": _vr.get("src_cambi"), "dark": _vr.get("dark"),
                                      "note": _vr.get("note"), "tried": _vr.get("tried") or []}
                     joblog.log(f"VMAF target: CQ {_vr['cq']} chosen instead of the library's {_fixed} - "
                                f"VMAF {_vr['vmaf']} (worst sample {_vr['worst']}), banding {_vr.get('cambi')}"

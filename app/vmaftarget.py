@@ -60,6 +60,10 @@ DEFAULTS = {"on": True, "target": 95.0, "samples": 4, "sample_s": 6.0, "floor": 
             # little under the prediction. Add this library's recent median
             # gap (0-2 points) to the target while searching.
             "headroom": True,
+            # AIM ONE SAMPLE AT THE DARKEST SMOOTH SCENE. Evenly spaced cuts
+            # cover 24 s of a 24-minute file and miss the 4-second dark shot
+            # where banding shows - see _dark_time().
+            "dark": True,
             # keep the reference cuts and score the FINISHED file against them
             # before it is committed - see verify_final()
             "verify": True}
@@ -278,7 +282,7 @@ def set_cfg(**kw) -> dict:
     for k, v in kw.items():
         if k not in DEFAULTS or v is None:
             continue
-        if k in ("on", "verify", "headroom"):
+        if k in ("on", "verify", "headroom", "dark"):
             c[k] = bool(v)
         elif k == "low":
             c[k] = _clamp("low", v)
@@ -357,6 +361,82 @@ def _sample_times(duration: float, n: int, length: float) -> list[float]:
     if hi <= lo:
         return [max(0.0, duration / 2 - length / 2)]
     return [lo + (hi - lo) * i / max(1, n - 1) for i in range(n)]
+
+
+# WHERE BANDING SHOWS IS NOT WHERE THE SAMPLES FALL. Don't Hurt Me, My
+# Healer! S01E03 (2026-11-05): the four evenly spaced cuts measured CAMBI
+# 0.1-0.2 on the source, while a 4-second shot of a black shirt against a
+# cave at 20:33 measured 5.1 - visible - and sat 40 s from the nearest cut.
+# Banding lives on dark, smooth gradients, so the file is scanned for them
+# first and the cut nearest the worst stretch is moved onto it.
+#
+# THE SCAN DECODES KEYFRAMES ONLY (-skip_frame nokey): one frame per scene
+# cut, 263 frames for a 24-minute episode, 2.6 s on NVDEC and 11 s on the
+# CPU. Each frame, shrunk to 192x108 grey, is split into 12x12 blocks; a block
+# is at risk when it is dark (mean under 56 of 255) and a gradient rather than
+# flat black or texture (deviation 0.3-5). A frame's risk is the share of its
+# blocks at risk, a stretch's risk the mean over the keyframes inside one
+# sample length from it, so a single fade frame does not win. Measured on the
+# episode above: the top three stretches by this score had source CAMBI
+# 2.4-3.8 (peaks 5-7.5); the evenly spaced cuts 0.1-0.2.
+DARK_W, DARK_H, DARK_BLOCK = 192, 108, 12
+DARK_MIN_RISK = 0.15          # under this share of the picture, nothing is moved
+
+
+def _dark_time(ff, src, duration: float, length: float, times: list[float], card: bool) -> dict | None:
+    """The start of the darkest smooth stretch, or None when the file has none
+    worth a sample or a cut already covers it. {"t", "risk", "i"}: i is the
+    index of the evenly spaced cut nearest to it, the one to move."""
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    lo, hi = duration * 0.10, duration * 0.90 - length
+    if hi <= lo:
+        return None
+
+    def scan(hw: bool):
+        args = ([ff, "-hide_banner", "-nostdin", "-v", "info"] + (["-hwaccel", "cuda"] if hw else [])
+                + ["-skip_frame", "nokey", "-i", src, "-map", "0:v:0", "-an", "-sn", "-dn", "-fps_mode", "passthrough",
+                   "-vf", f"scale={DARK_W}:{DARK_H}:flags=area,format=gray,showinfo",
+                   "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+        p = subprocess.run(args, capture_output=True, timeout=300, creationflags=NO_WINDOW, startupinfo=hidden_si())
+        n = len(p.stdout) // (DARK_W * DARK_H)
+        ts = [float(m) for m in re.findall(rb"Parsed_showinfo.*?pts_time:\s*([\d.]+)", p.stderr or b"")]
+        if p.returncode != 0 or n < 2 or len(ts) < n:
+            return None
+        return np.frombuffer(p.stdout[:n * DARK_W * DARK_H], dtype=np.uint8).reshape(n, DARK_H, DARK_W).astype(np.float32), ts[:n]
+
+    try:
+        got = scan(True) if card else None
+        if got is None:
+            got = scan(False)
+    except Exception:                                    # noqa: BLE001
+        return None
+    if got is None:
+        return None
+    fr, ts = got
+    n, b = len(fr), DARK_BLOCK
+    blk = fr.reshape(n, DARK_H // b, b, DARK_W // b, b).transpose(0, 1, 3, 2, 4).reshape(n, -1, b * b)
+    mean, std = blk.mean(-1), blk.std(-1)
+    risk = ((mean < 56) & (std > 0.3) & (std < 5.0)).mean(-1)
+    t_arr = np.asarray(ts)
+    best = None
+    for i in range(n):
+        t = float(t_arr[i])
+        if t < lo or t > hi:
+            continue
+        inside = risk[(t_arr >= t) & (t_arr < t + length)]
+        r = float(inside.mean()) if len(inside) else float(risk[i])
+        if best is None or r > best[0]:
+            best = (r, t)
+    if best is None or best[0] < DARK_MIN_RISK:
+        return None
+    r, t = best
+    if any(abs(t - t0) < length for t0 in times):      # a cut already covers it
+        return None
+    i = min(range(len(times)), key=lambda k: abs(times[k] - t))
+    return {"t": round(t, 3), "risk": round(r, 3), "i": i}
 
 
 # THE SEARCH WAS THE CPU COST OF AN ENCODE, not the encode. Measured on a
@@ -606,6 +686,20 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
     n, length = int(c["samples"]), float(c["sample_s"])
     times = _sample_times(duration, n, length)
     threads = max(2, (os.cpu_count() or 8) // (searches() + 1))
+    card = _card_wanted(family)
+    dark = None
+    if c.get("dark", True):
+        if tick:
+            try:
+                tick("looking for the darkest smooth scene", 0.0)
+            except Exception:                            # noqa: BLE001
+                pass
+        dark = _dark_time(ff, src, duration, length, times, card)
+        if dark:
+            times[dark["i"]] = dark["t"]
+            joblog.log(f"VMAF target: sample {dark['i'] + 1} moved to the dark scene at "
+                       f"{int(dark['t'] // 60)}:{int(dark['t'] % 60):02d} ({dark['risk']:.0%} of the picture is a dark "
+                       f"gradient) - {os.path.basename(src)[:80]}", "info")
     # ONE FOLDER PER JOB. The first trial ran three encodes at once, all at
     # CQ 20, and every sample file was named by process, CQ and sample - so
     # the three wrote over each other and none could be scored.
@@ -624,7 +718,6 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
     # search runs past it, so the bar never sits at 100 % while work remains.
     _vs0 = next((x for x in (probe or {}).get("streams", []) if x.get("codec_type") == "video"), None) or {}
     src10 = "10" in str(_vs0.get("pix_fmt") or "") or str(_vs0.get("bits_per_raw_sample") or "") == "10"
-    card = _card_wanted(family)
     _g0 = guess(library, target, family)
     est = {"probes": 4 if _g0 is not None else MAX_PROBES}
     tried: dict[int, dict] = {}
@@ -637,7 +730,8 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
         info = {"tried": sorted(({"cq": k2, "vmaf": v["vmaf"], "cambi": v["cambi"], "ok": v["ok"]}
                                  for k2, v in tried.items()), key=lambda x: x["cq"]),
                 "want": want, "banding": banding, "probes_est": est["probes"],
-                "kind": kind, "head": head, "low": low_floor, "floor": floor}
+                "kind": kind, "head": head, "low": low_floor, "floor": floor,
+                "dark": (dark or {}).get("t"), "dark_risk": (dark or {}).get("risk")}
         try:
             tick(text, min(0.99, done_units / total), info)
         except TypeError:
@@ -784,6 +878,8 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
         secs = round(time.time() - t0, 1)
         note = ("reached the target" if chosen["ok"] else
                 f"could not reach {aim:g} ({tried[best]['fail'] if best in tried else 'target'}) within CQ {lo}-{hi}")
+        if dark:
+            note += f" · dark scene sampled at {int(dark['t'] // 60)}:{int(dark['t'] % 60):02d}"
         _remember(library, target, family, best)
         # KEEP THE REFERENCES FOR THE FINAL FILE. Everything above scored
         # SAMPLE encodes; the real encode is a different ffmpeg run over the
@@ -819,6 +915,7 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
                 "refuse": refuse,
                 "probes": len(tried), "secs": secs, "note": note,
                 "src_cambi": chosen.get("src_cambi"), "band_added": chosen.get("band_added"),
+                "dark": (dark or {}).get("t"), "dark_risk": (dark or {}).get("risk"),
                 "tried": sorted(({"cq": k, "vmaf": v["vmaf"], "worst": v["worst"], "low": v["low"], "cambi": v["cambi"],
                                   "ok": v["ok"], "fail": v.get("fail", "")}
                                  for k, v in tried.items()), key=lambda x: x["cq"])}
