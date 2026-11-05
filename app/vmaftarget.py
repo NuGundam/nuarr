@@ -60,9 +60,9 @@ DEFAULTS = {"on": True, "target": 95.0, "samples": 4, "sample_s": 6.0, "floor": 
             # little under the prediction. Add this library's recent median
             # gap (0-2 points) to the target while searching.
             "headroom": True,
-            # AIM ONE SAMPLE AT THE DARKEST SMOOTH SCENE. Evenly spaced cuts
-            # cover 24 s of a 24-minute file and miss the 4-second dark shot
-            # where banding shows - see _dark_time().
+            # ONE EXTRA SAMPLE ON THE DARKEST SMOOTH SCENE, judged for banding
+            # only. Evenly spaced cuts cover 24 s of a 24-minute file and miss
+            # the 4-second dark shot where banding shows - see _dark_time().
             "dark": True,
             # keep the reference cuts and score the FINISHED file against them
             # before it is committed - see verify_final()
@@ -368,7 +368,15 @@ def _sample_times(duration: float, n: int, length: float) -> list[float]:
 # 0.1-0.2 on the source, while a 4-second shot of a black shirt against a
 # cave at 20:33 measured 5.1 - visible - and sat 40 s from the nearest cut.
 # Banding lives on dark, smooth gradients, so the file is scanned for them
-# first and the cut nearest the worst stretch is moved onto it.
+# first and one extra cut is taken on the worst stretch.
+#
+# THAT CUT COUNTS FOR BANDING AND NOTHING ELSE. The first version moved an even
+# cut onto the scene and held it to every gate. VMAF reads these scenes low
+# whatever the banding, so of 117 searches none failed on banding, 13 missed
+# the target on VMAF, 16 % went under the library's CQ against 4 %, and 30
+# encodes came out too big to keep - Batman: Caped Crusader at CQ 19-21, up to
+# 115 % of its source. The four even cuts carry the mean, worst-sample,
+# worst-frame and size figures exactly as they did before the scan existed.
 #
 # THE SCAN DECODES KEYFRAMES ONLY (-skip_frame nokey): one frame per scene
 # cut, 263 frames for a 24-minute episode, 2.6 s on NVDEC and 11 s on the
@@ -385,8 +393,7 @@ DARK_MIN_RISK = 0.15          # under this share of the picture, nothing is move
 
 def _dark_time(ff, src, duration: float, length: float, times: list[float], card: bool) -> dict | None:
     """The start of the darkest smooth stretch, or None when the file has none
-    worth a sample or a cut already covers it. {"t", "risk", "i"}: i is the
-    index of the evenly spaced cut nearest to it, the one to move."""
+    worth a sample or a cut already covers it. {"t", "risk"}."""
     try:
         import numpy as np
     except ImportError:
@@ -435,8 +442,7 @@ def _dark_time(ff, src, duration: float, length: float, times: list[float], card
     r, t = best
     if any(abs(t - t0) < length for t0 in times):      # a cut already covers it
         return None
-    i = min(range(len(times)), key=lambda k: abs(times[k] - t))
-    return {"t": round(t, 3), "risk": round(r, 3), "i": i}
+    return {"t": round(t, 3), "risk": round(r, 3)}
 
 
 # THE SEARCH WAS THE CPU COST OF AN ENCODE, not the encode. Measured on a
@@ -696,8 +702,8 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
                 pass
         dark = _dark_time(ff, src, duration, length, times, card)
         if dark:
-            times[dark["i"]] = dark["t"]
-            joblog.log(f"VMAF target: sample {dark['i'] + 1} moved to the dark scene at "
+            times.append(dark["t"])
+            joblog.log(f"VMAF target: banding sample added on the dark scene at "
                        f"{int(dark['t'] // 60)}:{int(dark['t'] % 60):02d} ({dark['risk']:.0%} of the picture is a dark "
                        f"gradient) - {os.path.basename(src)[:80]}", "info")
     # ONE FOLDER PER JOB. The first trial ran three encodes at once, all at
@@ -712,6 +718,8 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
         pass
     work_dir = os.path.join(work_dir, _re.sub(r"[^\w-]", "_", str(job_id)) or "job")
     os.makedirs(work_dir, exist_ok=True)
+    # the dark cut, by name: a cut that fails leaves `refs` shorter than `times`
+    dark_ref = os.path.join(work_dir, f"ref-{len(times) - 1}.mkv") if dark else None
     # HOW FAR ALONG, HONESTLY. The probes a search will need are not known
     # up front: a library with a learned CQ usually settles in 3-4, a cold one
     # takes up to MAX_PROBES. The estimate starts there and grows if the
@@ -790,10 +798,11 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
                 sc = _score(ff, ref, out, ten, threads, card)
                 if not sc:
                     raise RuntimeError("VMAF could not score the sample")
-                sizes += sz
-                means.append(sc[0])
-                lows.append(sc[1])
                 bands.append(sc[2])
+                if ref != dark_ref:                      # banding only - see _dark_time
+                    sizes += sz
+                    means.append(sc[0])
+                    lows.append(sc[1])
             finally:
                 try:
                     os.remove(out)
@@ -890,6 +899,7 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
             try:
                 with open(os.path.join(work_dir, "verify.json"), "w", encoding="utf-8") as fh:
                     json.dump({"refs": [os.path.basename(r) for r in refs], "times": times, "length": length,
+                               "dark_ref": os.path.basename(dark_ref) if dark_ref else None,
                                "ten": ten, "card": card, "threads": threads, "src": src,
                                "sample_vmaf": chosen["vmaf"], "sample_worst": chosen["worst"],
                                "sample_cambi": chosen["cambi"]}, fh)
@@ -1079,16 +1089,22 @@ def verify_final(job_id: str, final: str, cache_dir: str, tick=None) -> dict | N
                 if best is None or mean > best[0]:
                     best = (mean, float(low), cambi, dskip, rskip)
             if best:
-                means.append(best[0]); worsts.append(best[1]); bands.append(best[2])
+                # as in the search: the dark cut speaks for banding only, or the
+                # sample-minus-final gap headroom learns from would mean nothing
+                is_dark = name == m.get("dark_ref")
+                if not is_dark:
+                    means.append(best[0]); worsts.append(best[1])
+                bands.append(best[2])
                 per_sample.append({"t": round(t, 3), "vmaf": round(best[0], 2), "worst": round(best[1], 2),
-                                   "cambi": round(best[2], 2), "final_skip": best[3], "ref_skip": best[4]})
+                                   "cambi": round(best[2], 2), "final_skip": best[3], "ref_skip": best[4],
+                                   "dark": is_dark})
         if not means:
             res = {"vmaf": None, "worst": None, "cambi": None, "samples": 0, "secs": round(time.time() - t0, 1),
                    "note": "could not score the final file against the kept samples"}
         else:
             res = {"vmaf": round(statistics.mean(means), 2), "worst": round(min(worsts), 2),
                    "cambi": round(max(bands), 2), "samples": len(means), "secs": round(time.time() - t0, 1),
-                   "note": f"{len(means)} of {len(m['refs'])} samples" if len(means) < len(m["refs"]) else "all samples",
+                   "note": f"{len(bands)} of {len(m['refs'])} samples" if len(bands) < len(m["refs"]) else "all samples",
                    "sample_vmaf": m.get("sample_vmaf"), "sample_worst": m.get("sample_worst"),
                    "sample_cambi": m.get("sample_cambi")}
         low = res["vmaf"] is not None and res["vmaf"] < KEEP_BELOW
