@@ -14,11 +14,18 @@ userinput.py), each read the way its own panel reads it:
     Audio User Input questions the audio queue will not answer itself
     Subtitle User Input  reader rows waiting on you + the subtitle queue's asks
     Raws             nothing you can read - Blocklist & re-download, or Keep
+                     (manual mode only, and not once the maker has the file)
     Bitrate cuts     upgrades that cut the picture - fetch or keep
 
 Not files, so not here: banned-term collisions, TheTVDB re-ids, download
 leftovers. Not a question about the file either: "subtitle rules changed"
 waits on a Requeue that only re-applies the rules.
+
+A RAW IN AUTO IS NOT WAITING ON ANYONE. subneed.findings() queues it for the
+Subtitle maker and replaces it only if the maker fails, all by itself. Holding
+it also stopped the maker, which is not a read-only kind, so the job sat queued
+and the raw stayed a raw: Patlabor WXIII, 14 hours (2026-11-05). The same goes
+for a raw a person sent to the maker in manual mode.
 
 Read-only checks still run on a held file (jobs.HELD_OK_KINDS) - they are how
 a question gets asked again after a fix. Answering releases the file within a
@@ -84,8 +91,13 @@ def _collect() -> dict:
         pass
     try:
         from . import subneed
-        for r in subneed.missing(100000) or []:
-            put(r.get("file_id"), "it is a raw - waiting on Blocklist & re-download or Keep")
+        if subneed.mode() != "auto":
+            from . import submake
+            rows = subneed.missing(100000) or []
+            gates = submake.gate_many([r.get("file_id") for r in rows])
+            for r in rows:
+                if gates.get(int(r.get("file_id") or 0)) != "pending":
+                    put(r.get("file_id"), "it is a raw - waiting on Blocklist & re-download or Keep")
     except Exception:                                            # noqa: BLE001
         pass
     try:

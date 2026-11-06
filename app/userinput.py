@@ -56,6 +56,8 @@ def _raws() -> dict | None:
     """Raws - nothing here you can read: files with no track in a language
     the library requires, waiting on Blocklist & re-download or Keep."""
     from . import subneed
+    if subneed.mode() == "auto":            # auto answers these itself - see hold.py
+        return None
     n = int((subneed.counts() or {}).get(subneed.MISSING) or 0)
     if not n:
         return None
