@@ -43196,8 +43196,9 @@ function snPaint(force){
     <span class="subskind ${auto?'k-auto':'k-ask'}"
       title="${auto?'Files carrying none of a required language are replaced by the shared remedy without asking, capped per hour across every check.':'Nothing is replaced until you press a button.'}">${auto?'runs by itself':'waiting on you'}</span>
     <span class="dim subssub" title="A RAW is a film nobody here can follow: spoken in a language this library was not asked to keep, and carrying no dialogue you can read - not a tagged track, not a file beside it, not words burned into the picture, and not an untagged track that might be the one. Signs and songs are not dialogue; they translate a shop front and leave the conversation alone. Nothing nuarr can do to a raw produces a subtitle - the planner cannot translate, the OCR has no picture to read, the listener hears Japanese - so the fixes are a different release, or the Subtitle maker above, which listens to the audio, reads the picture and writes English subtitles. A film spoken in the language is never a raw however its tracks are labelled.">raws - films and episodes nobody here can follow</span>
-    <span class="subsn">${miss?`${num(miss,'you')} <span class="dim">to answer</span>`
-                              :'<b style="color:var(--ok)">nothing to answer</b>'}</span>
+    <span class="subsn">${miss?(auto?`${num(miss,'auto')} <span class="dim">being handled</span>`
+                                    :`${num(miss,'you')} <span class="dim">to answer</span>`)
+                              :`<b style="color:var(--ok)">${auto?'nothing to handle':'nothing to answer'}</b>`}</span>
     </div>
     <span class="dim" style="font-size:11.5px">
       ${req?`<span>${req}</span> · `:''}
@@ -43396,8 +43397,8 @@ function snPaint(force){
   // as "everything is fine".
   const foot=`<div class="dim" style="display:flex;gap:12px;align-items:center;
        flex-wrap:wrap;font-size:11px;margin-top:6px">
-    <span>${miss?`${fmt(miss)} raw${miss===1?'':'s'} still to answer`
-                 :'no raws still to answer'}${
+    <span>${miss?`${fmt(miss)} raw${miss===1?'':'s'} ${auto?'being handled':'still to answer'}`
+                 :(auto?'no raws being handled':'no raws still to answer')}${
       unk?` · <span title="Files nuarr could not decide - it has not been able to read the picture, or its own reader is unsure of it. They are rows on What each file actually carries, where they can be answered.">${
         fmt(unk)} undecided, on the board above</span>`:''}</span>
     ${nDone?`<a href="#" onclick="snShowDone(${_snDone?0:1});return false"
