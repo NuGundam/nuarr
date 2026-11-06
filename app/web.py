@@ -1011,6 +1011,9 @@ async def _startup() -> None:
     # run on any machine, attached pool or share.
     from . import arrgap as _arrgap
     asyncio.create_task(_arrgap.watch())
+    from . import remuxlabel as _remuxlabel, runtimecheck as _runtimecheck
+    asyncio.create_task(_runtimecheck.watch())
+    asyncio.create_task(_remuxlabel.watch())
     asyncio.create_task(ffmpeg_update.watch())
     # Notices a GPU driver swap, re-measures NVENC, and hands in-flight encodes
     # back to the queue - see ffmpeg_update.watch_driver().
@@ -9672,6 +9675,15 @@ async def api_subembed_one(file_id: int):
 def api_integrity():
     from . import integrity
     return {**integrity.stats(), "findings": integrity.findings(200)}
+
+
+@app.post("/api/integrity/keep")
+def api_integrity_keep(file_id: int):
+    """This film's length is right. Holds until the file changes."""
+    from . import runtimecheck, userinput
+    ok = runtimecheck.keep(file_id)
+    userinput.rows(fresh=True)
+    return {"ok": ok}
 
 
 @app.post("/api/integrity/run")
@@ -24811,6 +24823,10 @@ async function loadIntegrity(){
   igPaint();
 }
 let _igKey='';
+async function igKeep(id){
+  try{ await fetch('/api/integrity/keep?file_id='+id,{method:'POST'}); }catch(_){}
+  loadIntegrity();
+}
 function igPaint(){
   const el=document.getElementById('igCard'); if(!el||!_ig) return;
   const d=_ig, bad=(d.findings||[]);
@@ -24860,7 +24876,8 @@ function igPaint(){
           >${esc(r.why||'')}</td>
         <td style="padding:3px 0;white-space:nowrap">${
           remedyBtns(r.file_id, r.kind||'file/corrupt',
-                     {source:'integrity'})}</td>
+                     {source:'integrity'})}${r.keep?` <button onclick="igKeep(${r.file_id})"
+            title="This length is right. Asked again only if the file changes.">Keep</button>`:''}</td>
       </tr>`).join('')}</tbody></table>`
     : `<div class="dim" style="font-size:11.5px">${
         tested ? 'Every file read so far decoded in every window.'

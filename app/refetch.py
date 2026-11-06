@@ -23,9 +23,13 @@ delete button already attached to it.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import re
+import shutil
 import time
+from datetime import datetime, timezone
+from pathlib import PureWindowsPath
 
 from .arr import shared_client
 from .config import SETTINGS
@@ -264,8 +268,93 @@ def order_note(arr: str = "") -> str:
             f"makes the replacement search reject its own results.")
 
 
+PRIOR_MAX_AGE_S = 6 * 86400       # inside the arrs' seven-day recycle bin
+
+
+async def prior_copy(file_id: int) -> dict | None:
+    """The copy an upgrade put in the recycle bin, or None. Read-only.
+
+    {"src", "dst", "name"}. Only a single-episode file or a film: a file that
+    covers two episodes has no one predecessor."""
+    row = _file_row(file_id)
+    cfg = _arr_for((row or {}).get("library") or "")
+    if not row or not cfg or not row.get("arr_file_id") or not row.get("arr_parent_id"):
+        return None
+    c = shared_client(cfg)
+    pid, fid = int(row["arr_parent_id"]), int(row["arr_file_id"])
+    bin_ = str((await c._get("/config/mediamanagement")).get("recycleBin") or "")
+    if not bin_:
+        return None
+    if cfg.kind == "sonarr":
+        eps = [e["id"] for e in await c._get("/episode", seriesId=pid)
+               if e.get("episodeFileId") == fid]
+        if len(eps) != 1:
+            return None
+        key, want, deleted = "episodeId", eps[0], "episodeFileDeleted"
+        hist = await c._get("/history/series", seriesId=pid)
+    else:
+        key, want, deleted = "movieId", pid, "movieFileDeleted"
+        hist = await c._get("/history/movie", movieId=pid)
+    now = datetime.now(timezone.utc)
+    gone = [h for h in hist or []
+            if h.get("eventType") == deleted and h.get(key) == want
+            and (h.get("data") or {}).get("reason") == "Upgrade"]
+    if not gone:
+        return None
+    last = max(gone, key=lambda h: h["date"])
+    at = datetime.fromisoformat(last["date"].replace("Z", "+00:00"))
+    if (now - at).total_seconds() > PRIOR_MAX_AGE_S:
+        return None
+    name = PureWindowsPath(last.get("sourceTitle") or "").name
+    here = PureWindowsPath(row["path"])
+    src = PureWindowsPath(bin_).joinpath(*here.parts[2:-1], name)
+    dst = here.parent / name
+    if not name or not os.path.isfile(str(src)) or os.path.exists(str(dst)):
+        return None
+    return {"src": str(src), "dst": str(dst), "name": name}
+
+
+async def restore_prior(file_id: int, reason: str) -> dict | None:
+    """Put the upgrade's predecessor back and reject the upgrade. None when
+    there is nothing to put back - the caller then replaces as usual.
+
+    THE COPY GOES IN FIRST, so a failure leaves the bad file where it was, and
+    the arr rescans between the delete and the blocklist: the search that
+    follows then measures candidates against the good copy."""
+    from . import integrity
+    pr = await prior_copy(file_id)
+    if not pr or await integrity.encrypted(pr["src"]):
+        return None
+    p = await plan(file_id, reason=reason)
+    if not p.get("ok") and not p.get("can_search"):
+        return None
+    row = _file_row(file_id)
+    size = os.path.getsize(pr["src"])
+    await asyncio.to_thread(shutil.move, pr["src"], pr["dst"])
+    if os.path.getsize(pr["dst"]) != size:
+        raise RuntimeError(f"size changed moving {pr['name']} out of the recycle bin")
+
+    async def rescan(client) -> None:
+        sonarr = client.cfg.kind == "sonarr"
+        cmd = await client._post("/command", {
+            "name": "RescanSeries" if sonarr else "RescanMovie",
+            ("seriesId" if sonarr else "movieId"): int(row["arr_parent_id"])})
+        if (cmd or {}).get("id"):
+            await client.wait_command(cmd["id"], timeout_s=180)
+        await asyncio.sleep(4)
+
+    out = await run(file_id, reason=f"{reason} - the copy it replaced is back",
+                    after_delete=rescan)
+    if not out.get("ok"):
+        await asyncio.to_thread(shutil.move, pr["dst"], pr["src"])
+        return out
+    out.setdefault("did", []).append(f"restored {pr['name']} from the recycle bin")
+    joblog.log(f"REFETCH {row.get('title')}: restored {pr['name']}", "warn")
+    return out
+
+
 async def run(file_id: int, delete_file: bool = True,
-              reason: str = "") -> dict:
+              reason: str = "", after_delete=None) -> dict:
     r"""Delete the file, blocklist the release, search for a replacement.
 
     Re-plans rather than trusting whatever the caller was shown: the panel may
@@ -395,6 +484,8 @@ async def run(file_id: int, delete_file: bool = True,
                         f"removed there")}
                 else:
                     raise
+        if after_delete:
+            await after_delete(client)
 
         # TWO: THE RELEASE. markFailed blocklists it AND queues the arr's own
         # search, which is why the search below is a fallback rather than a

@@ -47,6 +47,7 @@ to a person and harmless to the library.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import time
@@ -160,8 +161,14 @@ _NO_DECODER = re.compile(
 # that deletes the file and asks the arr for another. "A window came back
 # empty" can also mean a seek landed badly on a pool disk that was spinning
 # up, and a maybe must never hold a delete button. file/short is replaceable
-# only by a person.
+# only after a second read agrees - see recheck_short().
 OK, CORRUPT, UNREADABLE, SHORT = "ok", "corrupt", "unreadable", "short"
+# A TRACK STILL UNDER DRM. Only the video is decoded here, so Batman: Caped
+# Crusader S01E09 passed with its English audio encrypted (tag enca) and then
+# failed every encode. The tag is the file's own statement, not a guess.
+ENCRYPTED = "encrypted"
+SECOND_READ_AFTER_S = 1800
+SECOND_READ = "confirmed on a second read"
 
 
 def carry(file_id: int, path: str) -> bool:
@@ -480,10 +487,35 @@ VIDEO_END_TRUST = 0.5
 AV_AGREE_S = 5.0
 
 
+async def encrypted(path: str) -> str:
+    """Which track still carries DRM, in words, or ''. Unknown reads as ''."""
+    try:
+        from .jobs import _ffprobe_exe
+        p = await asyncio.create_subprocess_exec(
+            _ffprobe_exe(), "-v", "error", "-show_entries",
+            "stream=index,codec_type,codec_tag_string:stream_tags=language",
+            "-of", "json", path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            creationflags=NO_WINDOW)
+        out, _ = await asyncio.wait_for(p.communicate(), 60)
+        streams = json.loads(out or b"{}").get("streams") or []
+    except Exception:                                            # noqa: BLE001
+        return ""
+    bad = [s for s in streams if s.get("codec_tag_string") in ("enca", "encv")]
+    if not bad:
+        return ""
+    return "still encrypted: " + ", ".join(
+        f"{s.get('codec_type')} track {s.get('index')}"
+        f" ({(s.get('tags') or {}).get('language') or 'no language'})" for s in bad)
+
+
 async def test_one(file_id: int, path: str, duration: float = 0.0,
                    on_pid=None, on_stage=None) -> dict:
     """Every window in windows(). -> {verdict, detail, secs}"""
     t0 = time.time()
+    locked = await encrypted(path)
+    if locked:
+        return {"verdict": ENCRYPTED, "detail": locked, "secs": time.time() - t0}
     if duration:
         vd = await _stream_end(path, "v:0")
         if 0 < vd < duration:
@@ -875,7 +907,8 @@ def findings(limit: int = 200) -> list[dict]:
     if not _READY:
         init()
     kinds = {CORRUPT: "file/corrupt", UNREADABLE: "file/unreadable",
-             SHORT: "file/short"}
+             SHORT: "file/short", ENCRYPTED: "audio/encrypted"}
+    from . import runtimecheck
     try:
         with cursor() as cur:
             return [{"file_id": r["file_id"],
@@ -884,12 +917,49 @@ def findings(limit: int = 200) -> list[dict]:
                     for r in cur.execute(
                         "SELECT i.file_id, i.path, i.detail, i.at, i.verdict "
                         "  FROM integrity i JOIN files f ON f.id = i.file_id "
-                        " WHERE i.verdict IN (?, ?, ?) "
+                        " WHERE i.verdict IN (?, ?, ?, ?) "
                         "   AND f.state NOT IN ('deleted','duplicate') "
                         " ORDER BY i.at DESC LIMIT ?",
-                        (CORRUPT, UNREADABLE, SHORT, int(limit)))]
+                        (CORRUPT, UNREADABLE, SHORT, ENCRYPTED, int(limit)))
+                    ] + runtimecheck.findings(limit)
     except Exception:                                            # noqa: BLE001
         return []
+
+
+def auto_findings(limit: int = 50) -> list[dict]:
+    """What the remedy may see: not a short file on one reading, and not the
+    runtime list, which is a person's."""
+    return [f for f in findings(limit) if f["kind"] != "file/runtime"
+            and (f["kind"] != "file/short" or SECOND_READ in (f.get("why") or ""))]
+
+
+async def recheck_short(limit: int = 2) -> int:
+    """Read a short file again once its disk has had time to wake."""
+    with cursor() as cur:
+        rows = [dict(r) for r in cur.execute(
+            "SELECT i.file_id, i.path, f.duration FROM integrity i "
+            "  JOIN files f ON f.id=i.file_id "
+            " WHERE i.verdict=? AND i.at<? AND i.detail NOT LIKE ? "
+            "   AND f.state NOT IN ('deleted','duplicate') ORDER BY i.at LIMIT ?",
+            (SHORT, time.time() - SECOND_READ_AFTER_S, f"%{SECOND_READ}%", int(limit)))]
+    done = 0
+    for r in rows:
+        try:
+            st = os.stat(r["path"])
+        except OSError:
+            continue
+        out = await test_one(int(r["file_id"]), r["path"], float(r["duration"] or 0))
+        if not out.get("verdict"):
+            continue
+        if out["verdict"] == SHORT:
+            out["detail"] = f"{out['detail'][:560]} - {SECOND_READ}"
+        await asyncio.to_thread(_write, int(r["file_id"]), r["path"],
+                                st.st_size, st.st_mtime, out)
+        done += 1
+    if done:
+        from . import remedy
+        await remedy.auto(auto_findings(50), "integrity", mode() == "auto")
+    return done
 
 
 def stats() -> dict:
@@ -1023,7 +1093,7 @@ async def _do_one(r: dict, report=None) -> dict:
 async def _after(_d: dict) -> None:
     """What a finished pass is for: handing the findings to the remedy."""
     from . import remedy
-    got = findings(50)
+    got = auto_findings(50)
     if got:
         await remedy.auto(got, "integrity", mode() == "auto")
 
@@ -1283,13 +1353,13 @@ async def job_one(r: dict, on_pid=None, on_stage=None) -> dict:
     # file/unreadable may only be replaced by a person. Routing just the
     # corrupt ones here meant an unreadable file was written down and never
     # mentioned again.
-    if out["verdict"] in (CORRUPT, UNREADABLE):
+    if out["verdict"] in (CORRUPT, UNREADABLE, ENCRYPTED):
         joblog.log(f"integrity: {os.path.basename(r['path'])} - "
                    f"{out['detail']}",
                    "error" if out["verdict"] == CORRUPT else "warn")
         try:
             from . import remedy
-            await remedy.auto(findings(50), "integrity", mode() == "auto")
+            await remedy.auto(auto_findings(50), "integrity", mode() == "auto")
         except Exception:                                        # noqa: BLE001
             pass
     return {"ok": True, "verdict": out["verdict"],
@@ -1310,6 +1380,7 @@ async def watch() -> None:
         try:
             d = await topup()
             STATE["fed"] = int(d.get("made") or 0)
+            await recheck_short()
         except Exception:                                        # noqa: BLE001
             pass
         await asyncio.sleep(FEED_S)

@@ -117,14 +117,23 @@ _kind("file/unreadable", False, True, False,
       "that is a limit of this toolchain as much as of the file, so the "
       "replacement is yours to ask for")
 # -- it ends before it says it does, or a window of it decoded nothing.
-#    auto_replace is False for the same reason as file/unreadable above: the
-#    evidence is an ABSENCE - no frames came back from somewhere frames were
-#    expected - and a seek landing badly on a pool disk that was spinning up
-#    produces the same absence as a truncated download. A person looks.
-_kind("file/short", False, True, False,
-      "part of this file decoded nothing - usually an interrupted download "
-      "that ends before its header says it does, occasionally a disk that "
-      "was not ready, so the replacement is yours to ask for")
+#    The evidence is an ABSENCE - no frames came back from somewhere frames
+#    were expected - and a seek landing badly on a pool disk that was spinning
+#    up produces the same absence as a truncated download. So one reading is
+#    not enough: integrity.auto_findings() withholds this until a second read
+#    at least half an hour later agrees.
+_kind("file/short", False, True, True,
+      "part of this file decoded nothing on two reads half an hour apart - "
+      "an interrupted download that ends before its header says it does")
+# -- the header and the bytes agree; only the arr's runtime disagrees. Listed
+#    for a person: the figure may be the wrong one. See runtimecheck.
+_kind("file/runtime", False, True, False,
+      "far shorter than Radarr lists - cut short, the wrong file, or a wrong "
+      "listing, so the replacement is yours to ask for")
+# -- DRM left on a track. Not file/unreadable's limit of this toolchain: the
+#    file says so itself, with an enca/encv tag, and no player has the key.
+_kind("audio/encrypted", False, True, True,
+      "a track is still encrypted, so nothing can play or convert it")
 _kind("audio/missing", False, True, True,
       "there is no audio stream at all - there is nothing to re-encode")
 _kind("video/missing", False, True, True,
@@ -671,6 +680,11 @@ async def reask(file_id: int, kind: str, source: str = "",
     return {"ok": True, "why": f"asked {cfg.name} to search again"}
 
 
+# A BAD UPGRADE PUTS BACK WHAT IT REPLACED. The encrypted SPWEB Batman S01E09
+# (2026-11-05) replaced a good FLUX copy that was still in the recycle bin.
+RESTORE_KINDS = ("audio/encrypted", "file/corrupt", "file/short")
+
+
 async def replace(file_id: int, kind: str, source: str = "", why: str = "",
                   auto: bool = False) -> dict:
     """Blocklist the release and ask the arr for another one. Destructive.
@@ -704,8 +718,13 @@ async def replace(file_id: int, kind: str, source: str = "", why: str = "",
         return {"ok": False, "why": "auto mode has spent this hour's "
                                     "replacement budget", "capped": True}
     try:
-        out = await refetch.run(int(file_id),
-                                reason=why or policy(kind)["why"])
+        out = None
+        if kind in RESTORE_KINDS:
+            out = await refetch.restore_prior(int(file_id),
+                                              why or policy(kind)["why"])
+        if out is None:
+            out = await refetch.run(int(file_id),
+                                    reason=why or policy(kind)["why"])
     except Exception as e:                                       # noqa: BLE001
         _note(file_id, kind, REPLACE, source, auto, False,
               f"{type(e).__name__}: {e}")

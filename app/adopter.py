@@ -77,7 +77,10 @@ MIN_SIZE_B = 100 * 1024 * 1024
 # 100 MB floor kept it out of adoption, and the dashboard filed it under
 # "Extras (kept) - OP/ED, specials, bonus". 737 tracked episodes here are
 # under 100 MB. Named S01-S99 + E = an episode; S00 specials stay extras.
-EPISODE_SQL = ("(path GLOB '*[Ss]0[1-9][Ee][0-9]*' "
+# S00 COUNTS: a special named in the arr's own format is an episode the arr lost,
+# not an extra. Lord Marksman S00E07, 43 MB, dropped by Sonarr as missing from
+# disk on 2026-11-02 and left unadopted until someone rescanned it by hand.
+EPISODE_SQL = ("(path GLOB '*[Ss]0[0-9][Ee][0-9]*' "
                "OR path GLOB '*[Ss][1-9][0-9][Ee][0-9]*')")
 
 STATS: dict = {"last_run": 0.0, "next_run": 0.0, "running": False,

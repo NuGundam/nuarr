@@ -164,8 +164,19 @@ def _download_leftovers() -> dict | None:
                        f"{round(r['size'] / 1e9, 1)} GB, {round(r['age_h'])} h old"} for r in rows[:6]]}
 
 
+def _short_films() -> dict | None:
+    """Films far shorter than Radarr lists, waiting on Replace or Keep."""
+    from . import runtimecheck
+    rows = runtimecheck.findings(200)
+    if not rows:
+        return None
+    return {"what": "short films", "n": len(rows),
+            "note": f"{len(rows)} far shorter than listed", "goto": "/settings#ruleschk@igCard",
+            "items": [{"title": r["title"], "detail": r["why"]} for r in rows[:6]]}
+
+
 SOURCES = (_subtitle_input, _raws, _audio_questions, _rules_gap, _bitrate_cuts,
-           _ban_collisions, _tvdb_left, _download_leftovers)
+           _ban_collisions, _tvdb_left, _download_leftovers, _short_films)
 
 
 def _build() -> list:
