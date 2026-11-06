@@ -2842,7 +2842,7 @@ def busy_with(file_id: int) -> str:
 
 
 # Checks that only read the file, and are how a question gets asked again.
-HELD_OK_KINDS = ("listen", "decode", "verify")
+HELD_OK_KINDS = ("listen", "decode", "verify", "subread")
 
 
 def held_for_person(file_id: int) -> str:

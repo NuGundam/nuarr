@@ -350,7 +350,9 @@ def _raw_rows(existing: list) -> list:
             "kind": pst, "chosen": False,
             "kinds": [{"id": k, "word": hardsub.KIND_WORDS[k]}
                       for k in hardsub.KINDS],
-            "sure": score, "read": bool(pst), "unread": False,
+            # A reading the reader will redo is its turn, not a question: 2026-11-05
+            # six such rows asked for an answer and held their files.
+            "sure": score, "read": bool(pst) and rule != "stale", "unread": False,
             # A FILE NOTHING HAS READ STILL ARRIVED ON A DAY. The added column
             # drew a dash on every raw row because this was left at zero -
             # and "this whole show landed an hour ago" is exactly the context

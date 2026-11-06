@@ -2555,7 +2555,7 @@ def _candidates_all(limit: int) -> list:
             # being written out a second time here and drifting.
             "  AND (COALESCE(f.sub_langs,'')='' "
             "       OR f.id IN (SELECT n.file_id FROM sub_need n "
-            "                    WHERE n.rule = 'nopic')) "
+            "                    WHERE n.rule IN ('nopic','stale'))) "
             "  AND COALESCE(f.duration,0) > 120 "
             "  AND COALESCE(f.mtime,0) < ? "
             # NEVER READ, OR READ BY A READER THAT HAS SINCE BEEN CORRECTED.
