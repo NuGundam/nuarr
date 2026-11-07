@@ -1083,7 +1083,7 @@ def _pass() -> str:
     STATS.update(removed=STATS["removed"] + removed, swept=STATS["swept"] + swept, kept=kept)
     bits = []
     if malware:
-        bits.append(f"{malware} program(s) or disk image(s) posing as video removed and blocklisted")
+        bits.append(f"{malware} fake(s) posing as video removed and blocklisted")
     if stalls:
         bits.append(f"{stalls} stalled download(s) removed and blocklisted, searched again")
     if removed - malware - stalls:
