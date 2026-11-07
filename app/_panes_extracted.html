@@ -74,10 +74,13 @@
           Where Sonarr and Radarr are, and what Nuarr is allowed to change on
           them. The connection details come first because nothing below works
           without them &mdash; every rename, every import check and every
-          language lookup goes through these two.
+          language lookup goes through these two. Then everything you
+          switch on, list or press; the read-only checks (health, the
+          agreement count, path mapping) come last.
         </div>
         <div id="arrConns" style="padding:10px 14px 0"></div>
-        <div id="arrHealth" style="padding:4px 14px 0"></div>
+        <div id="arrsBody" style="padding:10px 14px 0"></div>
+        <div id="arrLangSync" style="padding:4px 14px 0"></div>
         <div style="padding:10px 14px 0">
           <div class="lkind" style="padding:9px 12px">
             <b style="color:#6fb0ff">Arr agreement check</b>
@@ -92,7 +95,7 @@
             </div>
           </div>
         </div>
-
+        <div id="arrHealth" style="padding:4px 14px 0"></div>
         <div style="padding:10px 14px 0">
           <div class="lkind" style="padding:9px 12px">
             <b style="color:#6fb0ff">Path mapping</b>
@@ -102,8 +105,6 @@
             </div>
           </div>
         </div>
-        <div id="arrLangSync" style="padding:4px 14px 0"></div>
-        <div id="arrsBody" style="padding:0 14px 10px"></div>
       </div>
       <div id="metaPane" style="display:none">
         <div id="metaBody" style="padding:10px 14px"></div>
