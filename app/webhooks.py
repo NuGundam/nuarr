@@ -710,6 +710,16 @@ async def _handle(cfg, body: dict) -> str:
               "ApplicationUpdate", "Grab"):
         return f"{ev} acknowledged"
 
+    # THE ARR JUST PARKED A DOWNLOAD it will not import on its own (a fake
+    # video, a name it cannot read, "not an upgrade"). The queue janitor
+    # handles those on a five-minute poll; this wakes it now.
+    if ev == "ManualInteractionRequired":
+        from . import arrqueue
+        title = (_obj(body.get("release")).get("releaseTitle")
+                 or _obj(body.get("downloadInfo")).get("title") or "")
+        arrqueue.kick(f"{cfg.name}: {title[:80]}")
+        return f"queue janitor woken for {title[:60] or 'a parked download'}"
+
     if kind == "sonarr":
         pid = _obj(body.get("series")).get("id")
 
@@ -927,7 +937,8 @@ async def register(cfg, base_url: str) -> dict:
         wanted = ["onDownload", "onUpgrade", "onImportComplete", "onRename",
                   "onEpisodeFileDelete", "onEpisodeFileDeleteForUpgrade",
                   "onMovieFileDelete", "onMovieFileDeleteForUpgrade",
-                  "onSeriesDelete", "onMovieDelete"]
+                  "onSeriesDelete", "onMovieDelete",
+                  "onManualInteractionRequired"]    # wakes the queue janitor
         for k in wanted:
             if payload.get("supports" + k[2:]) is True or k in payload:
                 if payload.get("supports" + k[2:]) is not False:
@@ -1033,6 +1044,8 @@ async def verify(cfg, base_url: str) -> dict:
         # notification exists but is useless.
         if mine.get("onDownload") is False:
             return {"ok": False, "reason": "onDownload disabled", "want_url": want_url}
+        if mine.get("onManualInteractionRequired") is False:
+            return {"ok": False, "reason": "onManualInteractionRequired disabled", "want_url": want_url}
         return {"ok": True, "url": got}
     except Exception as e:
         # Unreachable arr is NOT drift - do not rewrite config on a transient

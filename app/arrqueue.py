@@ -92,6 +92,115 @@ EXEC_EXT = (".exe", ".scr", ".bat", ".cmd", ".com", ".pif", ".msi", ".lnk",
 EXEC_EXT = EXEC_EXT + (".iso", ".img", ".dmg", ".vhd", ".vhdx", ".wim")
 EXEC_SAYS = ("found executable file", "potentially dangerous file")
 
+# NOT A VIDEO AT ALL. Erik, 2026-11-07: two "Scavengers Reign ... HONE" jobs
+# from SABnzbd, each one 1.3 GB "...mkv.bin" - one an rclone-encrypted blob
+# (it starts "RCLONE"), the other all zeros. Sonarr said "Unable to determine
+# if file is a sample" and parked them; the janitor counted them "kept for a
+# person" every five minutes. What a file IS is read from its first bytes,
+# not its name: a real video under a wrong name (".mkv.bin" that starts like
+# Matroska) is renamed and the arr asked to import the folder again; a
+# download with no real video in it is removed and blocklisted so the arr
+# looks for another release; junk beside a real video (nfo, txt, sfv, jpg,
+# .bin) is moved to the Recycle Bin, subtitles are kept.
+VIDEO_EXT = (".mkv", ".mp4", ".m4v", ".avi", ".ts", ".m2ts", ".mov", ".wmv", ".webm", ".mpg", ".mpeg")
+SUB_EXT = (".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup", ".smi")
+LANDED_SAYS = ("unable to determine if file is a sample", "no files found are eligible for import",
+               "invalid video file", "not a video", "sample")
+
+
+def _sniff(path: str) -> str:
+    """The container the first bytes say this is ('.mkv', '.mp4', ...) or ''."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(400)
+    except OSError:
+        return ""
+    if head[:4] == b"\x1a\x45\xdf\xa3":
+        return ".mkv"
+    if head[4:8] == b"ftyp":
+        return ".mp4"
+    if head[:4] == b"RIFF" and head[8:12] == b"AVI ":
+        return ".avi"
+    if head[:4] == b"\x30\x26\xb2\x75":
+        return ".wmv"
+    if head[:4] == b"\x00\x00\x01\xba":
+        return ".mpg"
+    if len(head) >= 377 and head[0] == 0x47 and head[188] == 0x47 and head[376] == 0x47:
+        return ".ts"
+    return ""
+
+
+def _landed(a, row: dict) -> tuple[str, dict | None]:
+    """A finished download the arr parked over what its files are.
+    -> (why it was removed, or ''), (a recent-list row for a rename/clean-up, or None)."""
+    if (row.get("status") or "") != "completed" or (row.get("sizeleft") or 0) > 0:
+        return "", None
+    if (row.get("trackedDownloadStatus") or "") != "warning":
+        return "", None
+    low = " | ".join(m for s_ in (row.get("statusMessages") or [])
+                     for m in ([s_.get("title") or ""] + list(s_.get("messages") or []))).lower()
+    if not any(k in low for k in LANDED_SAYS):
+        return "", None
+    out = (row.get("outputPath") or "").rstrip("\\/")
+    if not out or not os.path.exists(out):
+        return "", None
+    files = [out] if os.path.isfile(out) else [os.path.join(r_, f) for r_, _d, fs in os.walk(out) for f in fs]
+    real, junk, renamed = [], [], []
+    for p in files:
+        ext = os.path.splitext(p)[1].lower()
+        is_ = _sniff(p)
+        if is_:
+            if ext in VIDEO_EXT:
+                real.append(p)
+                continue
+            # a real video under a wrong name: "X.mkv.bin" -> "X.mkv"
+            stem, _e = os.path.splitext(p)
+            new = stem if os.path.splitext(stem)[1].lower() in VIDEO_EXT else stem + is_
+            try:
+                if not os.path.exists(new):
+                    os.rename(p, new)
+                    renamed.append(os.path.basename(new))
+                    real.append(new)
+            except OSError as e:
+                STATS["detail"].append(f"{a.name}: could not rename {os.path.basename(p)[:50]}: {e}"[:160])
+                real.append(p)
+            continue
+        if ext in SUB_EXT:
+            continue
+        junk.append(p)
+    if not real:
+        names = ", ".join(os.path.basename(p)[-50:] for p in junk[:2]) or "nothing"
+        return (f"not a video: the download held only {names} - removed and blocklisted, "
+                "the arr will look for another release"), None
+    if not renamed and not junk:
+        return "", None
+    from . import fileops
+    gone = []
+    for p in junk:
+        try:
+            r = fileops.recycle(p)
+            if getattr(r, "ok", False):
+                gone.append(os.path.basename(p))
+        except Exception as e:                                   # noqa: BLE001
+            STATS["detail"].append(f"{a.name}: could not recycle {os.path.basename(p)[:50]}: {e}"[:160])
+    try:
+        cmd = "DownloadedEpisodesScan" if a.kind == "sonarr" else "DownloadedMoviesScan"
+        body = {"name": cmd, "path": out if os.path.isdir(out) else os.path.dirname(out), "importMode": "Move"}
+        if row.get("downloadId"):
+            body["downloadClientId"] = row["downloadId"]
+        _call(a, "/api/v3/command", "POST", body)
+    except Exception as e:                                       # noqa: BLE001
+        STATS["detail"].append(f"{a.name}: could not ask for a new import of {out[-50:]}: {e}"[:160])
+    bits = []
+    if renamed:
+        bits.append("renamed " + ", ".join(renamed)[:120] + " (a real video under a wrong name)")
+    if gone:
+        bits.append(f"{len(gone)} non-media file(s) moved to the Recycle Bin")
+    why = "; ".join(bits) + " - the arr was asked to import the folder again"
+    STATS["detail"].append(f"{a.name}: {(row.get('title') or '')[:60]} - {why}")
+    return "", {"at": time.time(), "arr": a.name, "title": row.get("title") or "",
+                "client": row.get("downloadClient") or "", "why": why, "kind": "cleaned"}
+
 STATS: dict = {"last_run": 0.0, "last_result": "", "next_run": 0.0,
                "removed": 0, "swept": 0, "kept": 0, "detail": [], "running": False}
 KV_LAST = "arrqueue.last"     # last run survives a restart, so the card is not blank
@@ -921,6 +1030,15 @@ def _pass() -> str:
             if did and did in gone:
                 continue
             bad = _malware(r, exe)
+            if not bad:
+                try:
+                    bad, cleaned = _landed(a, r)
+                except Exception as e:                           # noqa: BLE001
+                    bad, cleaned = "", None
+                    STATS["detail"].append(f"{a.name}: landed-file check: {type(e).__name__}: {e}"[:160])
+                if cleaned:
+                    new.append(cleaned)
+                    continue                # the arr is importing it now
             stall = ""
             if did in stalled and (r.get("sizeleft") or 0) > 0:
                 stall = (f"stalled: no progress for {stalled[did]:.0f} h at "
@@ -991,8 +1109,27 @@ def _pass() -> str:
     return "; ".join(bits) or "nothing to clean"
 
 
+# WOKEN BY THE ARR. Sonarr and Radarr post a ManualInteractionRequired
+# webhook the moment they park a download (see webhooks._handle); that sets
+# this and the loop runs a pass KICK_DELAY_S later - long enough for the arr
+# to finish writing its own queue - instead of up to five minutes later.
+_KICK: asyncio.Event | None = None
+KICK_DELAY_S = 20
+KICKED: dict = {"why": "", "at": 0.0}
+
+
+def kick(why: str = "") -> None:
+    KICKED.update(why=why, at=time.time())
+    if _KICK is not None:
+        _KICK.set()
+
+
 async def run() -> str:
+    if STATS["running"]:
+        return STATS["last_result"]
     STATS["running"] = True
+    before = (STATS["removed"], STATS["swept"])
+    prev = STATS["last_result"]
     try:
         res = await asyncio.to_thread(_pass)
     finally:
@@ -1003,7 +1140,12 @@ async def run() -> str:
         kv_set(KV_LAST, json.dumps({"at": STATS["last_run"], "result": res}))
     except Exception:                                            # noqa: BLE001
         pass
-    if res != "nothing to clean":
+    # ONE LINE PER CHANGE, NOT ONE PER PASS. "2 with a warning kept for a
+    # person" every five minutes for a day is 288 copies of one fact; it is
+    # logged when it changes, and every pass that removed or cleaned something.
+    acted = (STATS["removed"], STATS["swept"]) != before or any(
+        ": removed " in ln or " - renamed " in ln or "Recycle Bin" in ln for ln in STATS["detail"])
+    if res != "nothing to clean" and (acted or res != prev):
         joblog.log("arr queue janitor: " + res, "ok")
         for ln in STATS["detail"]:
             joblog.log("  " + ln, "debug")
@@ -1019,6 +1161,8 @@ async def watch() -> None:
         STATS["last_result"] = str(last.get("result") or "")
     except Exception:                                            # noqa: BLE001
         pass
+    global _KICK
+    _KICK = asyncio.Event()
     await asyncio.sleep(300)             # never compete with startup
     while True:
         try:
@@ -1027,7 +1171,14 @@ async def watch() -> None:
         except Exception as e:                                   # noqa: BLE001
             joblog.log(f"arr queue janitor: {type(e).__name__}: {e}", "error")
         STATS["next_run"] = time.time() + POLL_S
-        await asyncio.sleep(POLL_S)
+        _KICK.clear()
+        try:
+            await asyncio.wait_for(_KICK.wait(), timeout=POLL_S)
+        except asyncio.TimeoutError:
+            continue
+        # woken by a webhook: give the arr a moment to finish its own bookkeeping
+        STATS["next_run"] = time.time() + KICK_DELAY_S
+        await asyncio.sleep(KICK_DELAY_S)
 
 
 def snapshot() -> dict:
@@ -1035,4 +1186,4 @@ def snapshot() -> dict:
     # what went wrong, so the card is not the same list twice.
     problems = [ln for ln in STATS["detail"] if ": removed " not in ln]
     return {"stats": {k: v for k, v in STATS.items() if k != "detail"} | {"detail": problems[:12]},
-            "recent": _recent()[:RECENT_KEEP], "poll_s": POLL_S}
+            "recent": _recent()[:RECENT_KEEP], "poll_s": POLL_S, "kicked": KICKED}
