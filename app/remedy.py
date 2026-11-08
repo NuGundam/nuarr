@@ -710,6 +710,16 @@ async def replace(file_id: int, kind: str, source: str = "", why: str = "",
         return {"ok": False,
                 "why": f"nuarr has no row with id {int(file_id)}. This wants "
                        f"nuarr's own file id, not the arr's"}
+    # ALREADY GONE. Sonic Underground S01E30 (2026-11-08): the rule audit
+    # rejected the German-only file at 10:50, Sonarr had the DVD imported by
+    # 10:52, and at 10:53 the settling check drained its own parked finding
+    # for the same file and ran refetch again - a second blocklist of the same
+    # release and a second search Sonarr did not need. A row refetch has
+    # already closed, or whose file is no longer on disk, is answered here.
+    if str(_row.get("state") or "") == "deleted" or not os.path.exists(_row.get("path") or ""):
+        why = ("already replaced: " + str(_row.get("state_reason") or "the file is no longer on disk"))[:200]
+        _note(file_id, kind, REPLACE, source, auto, False, why, _row.get("path") or "")
+        return {"ok": False, "why": why, "already": True}
     a = attempts(file_id, kind)
     if a.get(REPLACE, 0) >= MAX_REPLACES:
         return {"ok": False, "why": f"already replaced {a[REPLACE]}x for "
