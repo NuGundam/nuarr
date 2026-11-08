@@ -1085,6 +1085,8 @@ async def _startup() -> None:
     asyncio.create_task(arrguard.watch())
     from . import arrqueue as _arrqueue
     asyncio.create_task(_arrqueue.watch())
+    from . import prowlsearch as _prowlsearch
+    asyncio.create_task(_prowlsearch.watch())
     # Import loops: a release the arr takes, nuarr rewrites, the arr takes
     # again (Bleach S17E50, fifteen laps in a night). Reads the arr's history.
     from . import arrloop as _arrloop
@@ -2990,8 +2992,10 @@ def api_arrguard():
                         "release_ban": gate.get_toggle("arrs.release_ban"),
                         "queue_janitor": gate.get_toggle("arrs.queue_janitor"),
                         "tvdb_fix": gate.get_toggle("arrs.tvdb_fix"),
+                        "prowlarr_search": gate.get_toggle("arrs.prowlarr_search"),
                         },
             "tvdb_fix": _tvdbfix_snapshot(),
+            "prowlarr_search": _prowlsearch_snapshot(),
             "release_ban": _arrban_snapshot(),
             "queue_janitor": _arrqueue_snapshot(),
             # The names each job works on, so the page can show and edit them
@@ -3001,6 +3005,14 @@ def api_arrguard():
             "trash_autoadd": gate.get_toggle("arrs.trash_autoadd"),
             "defaults": {"split_profiles": arrguard.DEFAULT_TARGET_2160,
                          "anime_formats": arrguard.DEFAULT_ANIME_FORMATS}}
+
+
+def _prowlsearch_snapshot() -> dict:
+    try:
+        from . import prowlsearch
+        return prowlsearch.snapshot()
+    except Exception as e:                                       # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}", "stats": {}, "recent": []}
 
 
 def _tvdbfix_snapshot() -> dict:
@@ -3214,7 +3226,7 @@ async def api_arrguard_choices(job: str):
     return out
 
 
-_ARR_JOBS = ("profile_guard", "trash_anime", "release_ban", "queue_janitor", "tvdb_fix")
+_ARR_JOBS = ("profile_guard", "trash_anime", "release_ban", "queue_janitor", "tvdb_fix", "prowlarr_search")
 
 
 @app.post("/api/arrguard/toggle")
@@ -3245,6 +3257,9 @@ async def api_arrguard_run(job: str):
     if job == "tvdb_fix":
         from . import tvdbfix
         return {"result": await tvdbfix.run()}
+    if job == "prowlarr_search":
+        from . import prowlsearch
+        return {"result": await prowlsearch.run()}
     raise HTTPException(400, f"job must be one of {', '.join(_ARR_JOBS)}")
 
 
@@ -49538,6 +49553,17 @@ async function loadArrsTab(refresh){
         +'arr goes looking for a real release instead. And a finished download the arr cannot place - "Unable to parse release", an unknown series or film - has its name read by Qwen, and is imported when that reading matches exactly one film or episode here and the arr offers the file for it; anything else stays for you. A download Sonarr refuses for its shape - a single episode where a two-episode file sits on disk, or a name its parser reads differently from its own grab - is imported when it beats every file it would replace (higher quality in the profile, or the same quality and a higher score), and removed when it beats none of them.',
         d.toggles.queue_janitor, qjst,
         {label:'', kind:'queue_janitor', names:{}, empty:'', adder:qjList(qj)})
+    + job('prowlarr_search','Prowlarr searcher: nuarr looks for the replacement itself',
+        'When nuarr rejects a file (wrong language, broken, a fake), the arr\'s own search is one indexer round '
+        +'scored by its own rules, and it never weighs a season pack against the single episode it wants. This asks '
+        +'Prowlarr directly - every indexer it has - reads each name with the arr\'s own parser (quality, custom-format '
+        +'score, which episodes it holds), ranks them by the quality profile, drops anything banned, and for a series takes '
+        +'the season pack when it is at least as good as the best single and not a step down from any file already in '
+        +'that season. The winner is handed to the arr (release push), which downloads and imports it as its own grab; '
+        +'a name the arr refuses moves on to the next. Nothing downloads outside the arr. Run now sweeps the arrs\' wanted '
+        +'lists (aired, monitored, no file) for what their own searches have not filled; the sweep also runs every 6 hours.',
+        d.toggles.prowlarr_search, (d.prowlarr_search||{}).stats||{},
+        {label:'', kind:'prowlarr_search', names:{}, empty:'', adder:psList(d.prowlarr_search||{})})
     + `<div id="bcBox" style="margin-top:12px"></div>`;
   loadHookState();
   _bcKey='';                 // the box is new and empty - paint it whatever the data says
@@ -49848,6 +49874,24 @@ function tvList(t){
         <td><b>${esc(r.title||'')}</b> <span class="dim mono">${esc(String(r.old||''))}${r.new?' \u2192 '+esc(String(r.new)):''}</span>
           <div style="font-size:10px;color:${r.ok?'#7fd4a3':'#e8a33d'}">${esc(r.why||'')}</div></td></tr>`).join('')}
     </table></div></div>`;
+}
+// ---- the Prowlarr searcher's recent searches - see prowlsearch.py --------
+function psList(ps){
+  const rows=ps.recent||[];
+  if(!rows.length) return `<div class="dim" style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px;font-size:11px">no searches yet</div>`;
+  return `<div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px">
+    <div style="font-size:11px;font-weight:600">Searched (last ${rows.length})</div>
+    <table class="mono" style="font-size:11px;margin-top:4px;width:100%;border-collapse:collapse">
+      ${rows.map(r=>`<tr style="border-top:1px solid var(--line);vertical-align:top">
+        <td class="dim" style="padding:3px 6px 3px 0;white-space:nowrap">${ago(r.at)}</td>
+        <td style="padding:3px 6px 3px 0;white-space:nowrap">${esc(r.arr||'')}</td>
+        <td style="padding:3px 6px 3px 0"><b>${esc(r.item||'')}</b>
+          <span class="dim"> · ${esc(r.source||'')} · ${fmt(r.raw||0)} offered, ${fmt(r.found||0)} fit, ${fmt(r.secs||0)}s</span>
+          ${r.ok?`<div style="color:#3fb950">${esc(r.release||'')}</div><div class="dim">${esc(r.why||'')}</div>`
+               :`<div style="color:#e3b341">${esc(r.why||'')}</div>`}
+          ${(r.beat&&r.beat.length)?`<div class="dim">also fit: ${esc(r.beat.join(' · '))}</div>`:''}</td>
+      </tr>`).join('')}
+    </table></div>`;
 }
 function qjList(qj){
   banStyle();

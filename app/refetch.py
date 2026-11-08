@@ -487,6 +487,22 @@ async def run(file_id: int, delete_file: bool = True,
         if after_delete:
             await after_delete(client)
 
+        # ONE AND A HALF: NUARR'S OWN SEARCH. Prowlarr directly, every
+        # indexer, ranked by the arr's own parser and profile, a season pack
+        # when it beats the single - see prowlsearch.py. Pushed to the arr,
+        # which downloads and imports it. The blocklist call below still
+        # starts the arr's own search; two downloads for one item are the
+        # queue janitor's to settle (it keeps the higher score).
+        try:
+            from . import prowlsearch
+            ps = await prowlsearch.replace(row, reason=reason or str(p.get("explain") or ""))
+            if ps.get("ok"):
+                did.append(f"found {ps['pushed']!r} through Prowlarr and handed it to {cfg.name}")
+            elif ps.get("found") is not None:
+                did.append(f"Prowlarr search: {ps.get('why', '')[:120]}")
+        except Exception as e:                                   # noqa: BLE001
+            joblog.log(f"prowlarr search: {type(e).__name__}: {e}", "debug")
+
         # TWO: THE RELEASE. markFailed blocklists it AND queues the arr's own
         # search, which is why the search below is a fallback rather than a
         # second request - the arr's search is aimed at the right episode,

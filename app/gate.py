@@ -290,6 +290,10 @@ DEFAULTS = {
     # A series TheTVDB re-added under a new id is re-linked in Sonarr. On by
     # default: it only acts on a single exact title-and-year match. tvdbfix.py
     "arrs.tvdb_fix": "1",
+    # nuarr's own Prowlarr search when a file is rejected, and a sweep of the
+    # arrs' wanted lists. On: it only hands names to the arr, which still
+    # applies its own profile, size and blocklist rules. prowlsearch.py
+    "arrs.prowlarr_search": "1",
     # REMOVING A TRACK IS NOT LIKE ADDING ONE. This sweep takes a duplicate
     # subtitle out of a file that had it, so it waits to be asked. See
     # subdupe.enabled.
