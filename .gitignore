@@ -33,3 +33,4 @@ build/
 *.swp
 Thumbs.db
 desktop.ini
+tools/build/
