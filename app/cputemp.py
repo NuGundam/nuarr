@@ -56,8 +56,21 @@ _STATE: dict = {"at": 0.0, "out": {}, "why": "", "opening": False,
                 "tried": False}
 
 
+# nuarr's own copy of the library, LibreHardwareMonitor 0.9.6 or later,
+# which talks to the signed PawnIO driver (installed separately, service
+# "PawnIO"). WinTmp still ships 0.9.5, which loads the old WinRing0 driver
+# that Defender flags as CVE-2020-14979 - so that copy is the fallback,
+# never the first choice. Driver swap 2026-11-08.
+LIB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "lib", "lhm")
+
+
 def _dll() -> str:
-    """LibreHardwareMonitorLib.dll, as WinTmp ships it. '' when absent."""
+    """LibreHardwareMonitorLib.dll: nuarr's lib/lhm copy first, then WinTmp's.
+    '' when neither is there."""
+    own = os.path.join(LIB_DIR, "LibreHardwareMonitorLib.dll")
+    if os.path.exists(own):
+        return own
     try:
         spec = importlib.util.find_spec("WinTmp")
         if not spec or not spec.origin:
@@ -92,6 +105,8 @@ def _open() -> str:
         msg = str(e)[:160]
         if "access" in msg.lower() or "denied" in msg.lower():
             msg += " - the driver needs nuarr to run elevated"
+        if "pawnio" in msg.lower() or "PawnIO" in dll:
+            msg += " - is the PawnIO driver installed? (service PawnIO)"
         return f"could not open the sensor driver: {type(e).__name__}: {msg}"
 
 
@@ -182,7 +197,8 @@ def read() -> dict:
         why = _STATE["why"]
         first = _HW is None and not why
     if out.get("package") is not None or out.get("cores"):
-        return {"ok": True, "source": "LibreHardwareMonitor", **out}
+        return {"ok": True, "source": "LibreHardwareMonitor"
+                + (" via PawnIO" if _dll().startswith(LIB_DIR) else ""), **out}
     if first:
         return {"ok": False, "why": "opening the sensor driver…", "opening": True}
     return {"ok": False, "why": why or "no reading yet"}
