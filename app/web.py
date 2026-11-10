@@ -49917,7 +49917,7 @@ function psTableHtml(){
   const mk=k=>_psSort.k===k?`<span style="color:var(--acc)">${_psSort.d>0?'▲':'▼'}</span>`:'';
   const th=(k,t,cls)=>`<th class="${cls}" onclick="psSortBy('${k}')" title="Sort by ${t}">${t} ${mk(k)}</th>`;
   return `<div class="rowbox" style="max-height:260px"><table class="sktbl bantbl" style="width:100%;font-size:11.5px;table-layout:fixed">
-    <colgroup><col style="width:62px"><col style="width:58px"><col style="width:70px"><col style="width:auto"></colgroup>
+    <colgroup><col style="width:74px"><col style="width:58px"><col style="width:70px"><col style="width:auto"></colgroup>
     <thead><tr class="dim" style="font-size:10.5px">${th('at','when','c')}${th('arr','arr','c')}${th('result','result','c')}${th('item','item · release or why','l')}</tr></thead>
     <tbody>${psSorted().map(psRowHtml).join('')}</tbody></table></div>`;
 }
