@@ -3007,6 +3007,13 @@ def api_arrguard():
                          "anime_formats": arrguard.DEFAULT_ANIME_FORMATS}}
 
 
+@app.get("/api/prowlsearch")
+def api_prowlsearch():
+    """The Prowlarr searcher's card on its own - polled every few seconds
+    while it works, so it must stay cheap (no arr calls)."""
+    return _prowlsearch_snapshot()
+
+
 def _prowlsearch_snapshot() -> dict:
     try:
         from . import prowlsearch
@@ -3259,7 +3266,7 @@ async def api_arrguard_run(job: str):
         return {"result": await tvdbfix.run()}
     if job == "prowlarr_search":
         from . import prowlsearch
-        return {"result": await prowlsearch.run()}
+        return {"result": prowlsearch.start()}
     raise HTTPException(400, f"job must be one of {', '.join(_ARR_JOBS)}")
 
 
@@ -49924,13 +49931,95 @@ function psTableHtml(){
 function psPaint(){ keepBox('psTable', psTableHtml()); }
 function psSortBy(k){ if(_psSort.k===k) _psSort.d=-_psSort.d; else _psSort={k, d:k==='at'?-1:1}; psPaint(); }
 function psOpen(id,ev){ if(ev) ev.stopPropagation(); if(_psOpen.has(id)) _psOpen.delete(id); else _psOpen.add(id); psPaint(); }
+// LIVE. While anything is being searched the card asks /api/prowlsearch every
+// 3 s (15 s when idle) and repaints only the strip and the table - a search a
+// refetch starts shows up within seconds, not at the page's 60 s refresh.
+let _psLast=null, _psTimer=null, _psKey='';
+function psHead(){
+  const handed=_psRows.filter(r=>r.ok).length;
+  return `Searched${_psRows.length?` (last ${_psRows.length}${handed?`, <span style="color:#3fb950">${handed} handed</span>`:''})`:''}`;
+}
+function psLiveHtml(ps){
+  const st=(ps&&ps.stats)||{}, act=(ps&&ps.active)||[], sw=(ps&&ps.sweep)||{};
+  if(!st.running && !act.length) return '';
+  const now=(ps&&ps.now)||Date.now()/1000;
+  const n=sw.n||0, i=sw.i||0;
+  const pct=st.running&&n?Math.max(3,Math.round(100*Math.max(0,i-1)/n)):0;
+  const bar=st.running&&n
+    ?`<div class="psbar"><div class="psfill" style="width:${pct}%"></div></div>`
+    :`<div class="psbar"><div class="psflow"></div></div>`;
+  const rows=act.map(a=>`<div style="display:flex;gap:8px;align-items:baseline;margin-top:3px">
+      <span class="psdot"></span>
+      <b style="font-size:11px">${esc(a.item||'')}</b>
+      <span class="dim" style="font-size:10.5px">${esc(a.arr||'')}${a.source?' · '+esc(a.source):''}</span>
+      <span style="font-size:10.5px;color:var(--acc)">${esc(a.step||'')}</span>
+      <span class="dim mono" style="font-size:10px;margin-left:auto">${Math.round(now-(a.since||now))}s</span></div>`).join('');
+  return `<div style="margin:6px 0 8px;padding:7px 10px;border:1px solid var(--line);border-radius:6px;background:rgba(88,166,255,.05)">
+    <div style="display:flex;gap:10px;align-items:center;font-size:11px">
+      <b style="color:var(--acc)">${st.running?(n?`sweeping ${Math.max(i,1)} of ${n}`:'sweeping…'):'searching…'}</b>
+      ${st.running&&!act.length?`<span class="dim">${esc(sw.step||'')}</span>`:''}
+    </div>${bar}${rows}</div>`;
+}
+function psStyle(){
+  if(document.getElementById('psStyle')) return;
+  document.head.insertAdjacentHTML('beforeend',`<style id="psStyle">
+    .psbar{position:relative;height:4px;border-radius:2px;background:rgba(255,255,255,.07);overflow:hidden;margin:6px 0 2px}
+    .psfill{height:100%;background:var(--acc);border-radius:2px;transition:width .6s ease;
+      background-image:linear-gradient(90deg,rgba(255,255,255,0) 0,rgba(255,255,255,.35) 50%,rgba(255,255,255,0) 100%);
+      background-size:60px 100%;animation:psshine 1.2s linear infinite}
+    .psflow{position:absolute;top:0;bottom:0;width:30%;background:var(--acc);border-radius:2px;animation:psslide 1.3s ease-in-out infinite}
+    .psdot{width:7px;height:7px;border-radius:50%;background:var(--acc);flex:none;align-self:center;animation:pspulse 1s ease-in-out infinite}
+    .psrun{display:inline-block;width:10px;height:10px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;
+      animation:psspin .8s linear infinite;vertical-align:-1px;margin-right:6px}
+    @keyframes psshine{from{background-position:-60px 0}to{background-position:200% 0}}
+    @keyframes psslide{0%{left:-30%}100%{left:100%}}
+    @keyframes pspulse{0%,100%{opacity:.35;transform:scale(.8)}50%{opacity:1;transform:scale(1)}}
+    @keyframes psspin{to{transform:rotate(360deg)}}</style>`);
+}
+function psButton(busy){
+  const b=document.querySelector('#job-prowlarr_search button[onclick^="arrsRun"]'); if(!b) return;
+  b.disabled=!!busy;
+  b.innerHTML=busy?'<span class="psrun"></span>Running…':'Run now';
+}
+function psApply(ps){
+  _psLast=ps;
+  const live=document.getElementById('psLive'); if(!live) return false;
+  live.innerHTML=psLiveHtml(ps);
+  const st=ps.stats||{};
+  psButton(st.running);
+  const rows=ps.recent||[];
+  const key=rows.length+':'+(rows[0]?rows[0].at:0);
+  if(key!==_psKey){ _psKey=key; _psRows=rows; psPaint();
+    const h=document.getElementById('psHead'); if(h) h.innerHTML=psHead(); }
+  return !!(st.running||(ps.active||[]).length);
+}
+async function psPoll(){
+  clearTimeout(_psTimer);
+  const live=document.getElementById('psLive');
+  if(!live){ _psTimer=null; return; }                  // the card is gone - stop
+  let busy=false;
+  if(live.offsetParent!==null && !document.hidden){
+    try{ busy=psApply(await (await fetch('/api/prowlsearch')).json()); }catch(e){}
+  }
+  const was=_psLast&&_psLast._wasBusy;
+  if(_psLast) _psLast._wasBusy=busy;
+  // a sweep just ended: redraw the whole card once for its last-run line
+  if(was && !busy && typeof arrsRefresh==='function') arrsRefresh();
+  _psTimer=setTimeout(psPoll, busy?3000:15000);
+}
+async function psRunNow(){
+  psButton(true);
+  try{ await fetch('/api/arrguard/run?job=prowlarr_search',{method:'POST'}); }catch(e){}
+  setTimeout(psPoll, 300);
+}
 function psList(ps){
-  banStyle();
+  banStyle(); psStyle();
   _psRows=ps.recent||[];
-  const st=ps.stats||{}, handed=_psRows.filter(r=>r.ok).length;
+  _psKey=_psRows.length+':'+(_psRows[0]?_psRows[0].at:0);
+  setTimeout(()=>{ psButton((ps.stats||{}).running); if(!_psTimer) psPoll(); else { clearTimeout(_psTimer); _psTimer=setTimeout(psPoll, (ps.stats||{}).running||(ps.active||[]).length?3000:15000); } },0);
   return `<div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px">
-    <div style="font-size:11px;font-weight:600">Searched${_psRows.length?` (last ${_psRows.length}${handed?`, <span style="color:#3fb950">${handed} handed</span>`:''})`:''}
-      ${st.running?'<span class="dim" style="font-weight:400"> · running…</span>':''}</div>
+    <div id="psLive">${psLiveHtml(ps)}</div>
+    <div id="psHead" style="font-size:11px;font-weight:600">${psHead()}</div>
     <div id="psTable" style="margin-top:4px">${psTableHtml()}</div>
   </div>`;
 }
@@ -50923,6 +51012,7 @@ async function arrsToggle(job,on){
   loadMetaTvdb();
 }
 async function arrsRun(job){
+  if(job==='prowlarr_search') return psRunNow();
   const el=document.getElementById('arrsBody');
   if(el) el.insertAdjacentHTML('afterbegin','<div class="dim" id="arrsBusy">running…</div>');
   try{ await fetch(`/api/arrguard/run?job=${job}`,{method:'POST'}); }catch(e){}

@@ -43,6 +43,16 @@ SWEEP_MAX = 12         # wanted items looked for per sweep
 STATS: dict = {"last_run": 0.0, "last_result": "", "next_run": 0.0, "running": False,
                "searched": 0, "pushed": 0, "detail": []}
 VIDEO_CATS = range(2000, 6000)   # Newznab movies 2000-2999, TV 5000-5999
+# WHAT IS BEING SEARCHED RIGHT NOW, for the card's progress bar. One entry per
+# search in flight (a refetch can run beside a sweep), keyed by its label;
+# SWEEP is the sweep's own place in its list.
+ACTIVE: dict = {}
+SWEEP: dict = {}
+
+
+def _at(label: str, step: str, **kw) -> None:
+    e = ACTIVE.setdefault(label, {"item": label, "since": time.time()})
+    e.update(step=step, step_at=time.time(), **kw)
 
 
 # ------------------------------------------------------------ prowlarr ----
@@ -283,6 +293,15 @@ async def find(a, want: dict, source: str = "") -> dict:
     client = shared_client(a)
     label = (f"{want['title']} S{int(want['season']):02d}E{int(want['episode']):02d}" if a.kind == "sonarr"
              else f"{want['title']} ({want.get('year') or ''})")
+    _at(label, "reading the quality profile", arr=a.name, source=source)
+    try:
+        return await _find(a, want, source, client, label)
+    finally:
+        ACTIVE.pop(label, None)
+
+
+async def _find(a, want: dict, source: str, client, label: str) -> dict:
+    from .arrqueue import _call
     prof = await asyncio.to_thread(_profile, lambda p: _call(a, p), a, want["profileId"])
     if a.kind == "sonarr":
         qs = [{"query": want["title"], "type": "tvsearch", "season": want["season"], "ep": want["episode"], "limit": 200},
@@ -294,8 +313,10 @@ async def find(a, want: dict, source: str = "") -> dict:
         if want.get("tmdbId"):
             qs.append({"query": want["title"], "type": "movie", "tmdbId": want["tmdbId"], "limit": 200})
     t0 = time.time()
+    _at(label, f"asking Prowlarr ({len(qs)} queries, every indexer)")
     raw = await _searches(qs)
     rows = _prefilter(raw, want.get("season"), want.get("episode"), a.kind)
+    _at(label, f"reading {min(len(rows), PARSE_MAX)} of {len(raw)} names with {a.name}'s parser")
     cands = await _read(client, a, rows, want, prof)
     STATS["searched"] += 1
     blocked = await _blocklisted(client, a, want)
@@ -327,6 +348,7 @@ async def find(a, want: dict, source: str = "") -> dict:
         return {"ok": False, "why": why, "found": 0, "tried": 0}
     refused = []
     for c in order[:TRY_MAX]:
+        _at(label, f"handing {c['title'][:70]} to {a.name}" + (f" (try {len(refused) + 1})" if refused else ""))
         ok, why = await _push(client, a, c)
         if ok:
             kind = "season pack" if c["pack"] else "single"
@@ -386,6 +408,8 @@ async def sweep(limit: int = SWEEP_MAX) -> str:
     from .config import SETTINGS
     from .arr import shared_client
     done, pushed, lines = 0, 0, []
+    SWEEP.clear()
+    SWEEP.update(i=0, n=limit, n_total=limit, started=time.time(), step="reading the arrs' wanted lists")
     for a in [x for x in SETTINGS.arrs if x.enabled and x.kind in ("sonarr", "radarr")]:
         client = shared_client(a)
         try:
@@ -421,6 +445,7 @@ async def sweep(limit: int = SWEEP_MAX) -> str:
             if done >= limit:
                 break
             done += 1
+            SWEEP.update(i=done, n=min(limit, SWEEP.get("n_total") or limit), arr=a.name)
             try:
                 r = await find(a, want, source="wanted sweep")
             except Exception as e:                               # noqa: BLE001
@@ -441,6 +466,7 @@ async def run() -> str:
         res = await sweep()
     finally:
         STATS["running"] = False
+        SWEEP.clear()
     STATS["last_run"] = time.time()
     STATS["last_result"] = res
     joblog.log("prowlarr search sweep: " + res, "ok")
@@ -477,6 +503,17 @@ def _remember(row: dict) -> None:
         pass
 
 
+def start() -> str:
+    """Run now from the page: the sweep goes in the background (it takes
+    minutes) and the card follows it through snapshot()."""
+    if STATS["running"]:
+        return "already running"
+    asyncio.get_running_loop().create_task(run())     # run() marks itself running on its first step
+    return "started"
+
+
 def snapshot() -> dict:
     return {"stats": {k: v for k, v in STATS.items() if k != "detail"} | {"detail": STATS["detail"][:12]},
-            "recent": _recent()[:RECENT_KEEP]}
+            "recent": _recent()[:RECENT_KEEP],
+            "active": [dict(v) for v in ACTIVE.values()],
+            "sweep": dict(SWEEP), "now": time.time()}
