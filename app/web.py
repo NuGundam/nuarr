@@ -49876,22 +49876,63 @@ function tvList(t){
     </table></div></div>`;
 }
 // ---- the Prowlarr searcher's recent searches - see prowlsearch.py --------
+// THE QUEUE JANITOR'S TABLE. Same columns-and-caret layout: one line per
+// search (when, arr, result, item + the reason), sortable by any heading, the
+// caret opens the numbers behind it. Handed rows lead in green.
+let _psRows=[], _psSort={k:'at',d:-1}; const _psOpen=new Set();
+function psSorted(){
+  const k=_psSort.k, d=_psSort.d;
+  const v=r=> k==='at'?(r.at||0) : k==='arr'?(r.arr||'').toLowerCase()
+    : k==='result'?(r.ok?0:(r.found?1:2)) : (r.item||'').toLowerCase();
+  return [..._psRows].sort((a,b)=>{ const x=v(a),y=v(b);
+    const c=(typeof x==='string')?x.localeCompare(y):(x-y); return c?c*d:((b.at||0)-(a.at||0)); });
+}
+function psRowHtml(r,i){
+  const id=String(r.at)+':'+i, open=_psOpen.has(id);
+  const res=r.ok?['#3fb950','handed']:(r.found?['#e3b341','refused']:['#8b949e','none fit']);
+  const line=r.ok?(r.release||''):(r.why||'');
+  const kv=(k,v)=>v?`<div style="display:flex;gap:8px;margin:2px 0"><span class="dim" style="flex:none;width:96px;text-align:right">${k}</span><span style="overflow-wrap:anywhere">${v}</span></div>`:'';
+  return `<tr>
+    <td class="c mono dim" style="font-size:10.5px" title="${esc(new Date((r.at||0)*1000).toLocaleString())}">${qjAgo(r.at||0)}</td>
+    <td class="c dim">${esc(r.arr||'')}</td>
+    <td class="c" style="color:${res[0]};font-size:10.5px">${res[1]}</td>
+    <td class="l" style="cursor:pointer" title="${esc(r.item||'')}" onclick="psOpen('${id}',event)"
+      ><span class="actcaret">${open?'▾':'▸'}</span><b>${esc(r.item||'')}</b>
+      <span class="dim" style="font-size:10.5px"> · ${esc(r.source||'')} · ${fmt(r.raw||0)} offered, ${fmt(r.found||0)} fit</span>
+      <div class="${r.ok?'mono':'dim'}" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:14px${r.ok?';color:#3fb950':''}">${esc(line)}</div></td>
+  </tr>${open?`<tr class="det"><td colspan="4" style="padding:0;border-bottom:1px solid var(--line);white-space:normal;background:rgba(255,255,255,.025)">
+    <div style="font-size:11px;padding:6px 10px 8px 34px">
+      ${kv('item',esc(r.item||''))}
+      ${kv('handed',r.ok?`<span class="mono" style="color:#3fb950">${esc(r.release||'')}</span>`:'')}
+      ${kv(r.ok?'why this one':'why none',esc(r.why||''))}
+      ${kv('also fit',(r.beat&&r.beat.length)?r.beat.map(x=>`<div class="mono">${esc(x)}</div>`).join(''):'')}
+      ${kv('blocked',r.blocked?fmt(r.blocked)+' name(s) on the arr\'s blocklist, skipped':'')}
+      ${kv('searched',`${fmt(r.raw||0)} names from Prowlarr, ${fmt(r.found||0)} fit the profile, in ${fmt(r.secs||0)} s`)}
+      ${kv('started by',esc(r.source||''))}
+      ${kv('when',esc(new Date((r.at||0)*1000).toLocaleString()))}
+    </div></td></tr>`:''}`;
+}
+function psTableHtml(){
+  if(!_psRows.length) return '<div class="dim" style="font-size:11px;margin-top:3px">no searches yet</div>';
+  const mk=k=>_psSort.k===k?`<span style="color:var(--acc)">${_psSort.d>0?'▲':'▼'}</span>`:'';
+  const th=(k,t,cls)=>`<th class="${cls}" onclick="psSortBy('${k}')" title="Sort by ${t}">${t} ${mk(k)}</th>`;
+  return `<div class="rowbox" style="max-height:260px"><table class="sktbl bantbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+    <colgroup><col style="width:62px"><col style="width:58px"><col style="width:70px"><col style="width:auto"></colgroup>
+    <thead><tr class="dim" style="font-size:10.5px">${th('at','when','c')}${th('arr','arr','c')}${th('result','result','c')}${th('item','item · release or why','l')}</tr></thead>
+    <tbody>${psSorted().map(psRowHtml).join('')}</tbody></table></div>`;
+}
+function psPaint(){ keepBox('psTable', psTableHtml()); }
+function psSortBy(k){ if(_psSort.k===k) _psSort.d=-_psSort.d; else _psSort={k, d:k==='at'?-1:1}; psPaint(); }
+function psOpen(id,ev){ if(ev) ev.stopPropagation(); if(_psOpen.has(id)) _psOpen.delete(id); else _psOpen.add(id); psPaint(); }
 function psList(ps){
-  const rows=ps.recent||[];
-  if(!rows.length) return `<div class="dim" style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px;font-size:11px">no searches yet</div>`;
+  banStyle();
+  _psRows=ps.recent||[];
+  const st=ps.stats||{}, handed=_psRows.filter(r=>r.ok).length;
   return `<div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px">
-    <div style="font-size:11px;font-weight:600">Searched (last ${rows.length})</div>
-    <table class="mono" style="font-size:11px;margin-top:4px;width:100%;border-collapse:collapse">
-      ${rows.map(r=>`<tr style="border-top:1px solid var(--line);vertical-align:top">
-        <td class="dim" style="padding:3px 6px 3px 0;white-space:nowrap">${ago(r.at)}</td>
-        <td style="padding:3px 6px 3px 0;white-space:nowrap">${esc(r.arr||'')}</td>
-        <td style="padding:3px 6px 3px 0"><b>${esc(r.item||'')}</b>
-          <span class="dim"> · ${esc(r.source||'')} · ${fmt(r.raw||0)} offered, ${fmt(r.found||0)} fit, ${fmt(r.secs||0)}s</span>
-          ${r.ok?`<div style="color:#3fb950">${esc(r.release||'')}</div><div class="dim">${esc(r.why||'')}</div>`
-               :`<div style="color:#e3b341">${esc(r.why||'')}</div>`}
-          ${(r.beat&&r.beat.length)?`<div class="dim">also fit: ${esc(r.beat.join(' · '))}</div>`:''}</td>
-      </tr>`).join('')}
-    </table></div>`;
+    <div style="font-size:11px;font-weight:600">Searched${_psRows.length?` (last ${_psRows.length}${handed?`, <span style="color:#3fb950">${handed} handed</span>`:''})`:''}
+      ${st.running?'<span class="dim" style="font-weight:400"> · running…</span>':''}</div>
+    <div id="psTable" style="margin-top:4px">${psTableHtml()}</div>
+  </div>`;
 }
 function qjList(qj){
   banStyle();

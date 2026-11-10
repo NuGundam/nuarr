@@ -287,6 +287,36 @@ def _banned(r: dict, strict: bool = False) -> bool:
     return False
 
 
+def _ban_hits(title: str, arr_name: str = "") -> dict:
+    """Which of nuarr's own bans hit this exact name, by kind: {"release":
+    [...], "term": [...], "group": [...]} with the ban's value. Read from the
+    ban list itself rather than from the arr's rejection text, which only
+    quotes a regex."""
+    import re as _re
+    from . import arrban
+    out: dict = {"release": [], "term": [], "group": []}
+    try:
+        grp = arrban.group_of(title).lower()
+        for b in arrban.rows(include_off=False):
+            scope = str(b.get("arrs") or "").lower()
+            if scope and arr_name and arr_name.lower() not in scope:
+                continue
+            k = b.get("kind")
+            if k == "group":
+                if grp and grp == str(b.get("value") or "").strip().lower():
+                    out["group"].append(b["value"])
+                continue
+            pat = arrban.release_pattern(b["value"]) if k == "release" else arrban.term_pattern(b["value"])
+            try:
+                if _re.search(pat, title or "", _re.I):
+                    out.setdefault(k, []).append(b["value"])
+            except _re.error:
+                continue
+    except Exception:                                        # noqa: BLE001
+        pass
+    return out
+
+
 def candidates(file_id: int) -> tuple[list, dict]:
     """Releases that would bring the picture back, best first, and the ids."""
     got = _ids(file_id)
@@ -641,10 +671,26 @@ def _restore(file_id: int, recycle_only: bool = False) -> dict:
     rel = _releases(a, ids, file_id)
     k = _key(old["title"])
     dead = bool(x.get("usenet_dead"))
-    hits = [r for r in rel if _key(r.get("title")) == k and not _banned(r)
-            and not any("blocklisted" in str(j).lower() for j in (r.get("rejections") or []))
-            and (r.get("protocol") == "torrent" and (r.get("seeders") or 0) >= 1 or
-                 r.get("protocol") == "usenet" and not dead)]
+    # A GROUP BAN DOES NOT STAND BETWEEN YOU AND YOUR OWN FILE. Criminal Minds
+    # S18E06's old FLUX release was offered three times (two Usenet indexers,
+    # a torrent with 14 seeders) and dropped every time because nuarr had
+    # since banned FLUX as a group for three bad releases elsewhere - and the
+    # row said "no indexer offers it". This is the exact release the file
+    # used to be, so a group ban is set aside for it; a ban on THIS release's
+    # own name, or a term it contains, still stands - those were about it.
+    same = [r for r in rel if _key(r.get("title")) == k]
+    bans = _ban_hits(old["title"], a.name)
+    own_ban = bans.get("release") or bans.get("term")
+    group_only = bool(bans.get("group")) and not own_ban
+
+    def _usable(r):
+        if _banned(r) and not group_only:
+            return False
+        if any("blocklisted" in str(j).lower() for j in (r.get("rejections") or [])):
+            return False
+        return (r.get("protocol") == "torrent" and (r.get("seeders") or 0) >= 1
+                or r.get("protocol") == "usenet" and not dead)
+    hits = [r for r in same if _usable(r)]
     hits.sort(key=lambda r: (r.get("protocol") != "usenet", -(r.get("seeders") or 0)))
     if not hits and dead:
         # the old release is only on Usenet, and Usenet has lost it - a fuller
@@ -658,17 +704,31 @@ def _restore(file_id: int, recycle_only: bool = False) -> dict:
         set_state(file_id, "none", why)
         return {"ok": False, "why": why}
     if not hits:
-        why = (f"the old release ({old['title']}) is not in the recycle bin and no indexer offers it now")
+        n = len(same)
+        if not n:
+            why = f"the old release ({old['title']}) is not in the recycle bin and no indexer offers it now"
+        elif own_ban:
+            why = (f"the old release ({old['title']}) is offered by {n} indexer(s), but nuarr banned it: "
+                   f"{', '.join((bans.get('release') or []) + (bans.get('term') or []))[:160]} - "
+                   f"lift that ban on the Arrs page to get it back")
+        elif all(any("blocklisted" in str(j).lower() for j in (r.get("rejections") or [])) for r in same):
+            why = (f"the old release ({old['title']}) is offered by {n} indexer(s), but every copy is on "
+                   f"{a.name}'s blocklist - remove it there to get it back")
+        else:
+            why = (f"the old release ({old['title']}) is offered by {n} indexer(s), but none can be grabbed "
+                   f"now (no seeders" + (", Usenet copies taken down" if dead else "") + ")")
         set_state(file_id, "none", why)
         return {"ok": False, "why": why}
     r = hits[0]
-    _step(file_id, f"grabbing {r['title']} again")
+    over = (f" - the {', '.join(bans['group'])} group ban set aside for this one release"
+            if group_only and _banned(r) else "")
+    _step(file_id, f"grabbing {r['title']} again{over}")
     _call(a, "/api/v3/release", "POST", {"guid": r["guid"], "indexerId": r["indexerId"]})
     ids.pop("arr", None)
     set_state(file_id, "grabbed", f"grabbing the old release again: {r['title']} ({r['size'] / 1e9:.2f} GB, "
-                                  f"{r.get('indexer')})", release=r["title"], arr=a.name, ids=ids,
+                                  f"{r.get('indexer')}){over}", release=r["title"], arr=a.name, ids=ids,
               cut_release=_safe_now(file_id))
-    joblog.log(f"bitrate cut: {x['label']} - grabbing the old release again: {r['title']}", "info")
+    joblog.log(f"bitrate cut: {x['label']} - grabbing the old release again: {r['title']}{over}", "info")
     return {"ok": True, "how": "grabbed", "release": r["title"]}
 
 
