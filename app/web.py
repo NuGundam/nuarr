@@ -36239,7 +36239,10 @@ async function loadArrHealth(force){
   if(!el) return;
   let d;
   try{ d=await (await fetch('/api/arrs/health'+(force?'?refresh=true':''))).json(); }
-  catch(e){ el.innerHTML=''; return; }
+  catch(e){ return; }          // keep the last cards: blanking them collapsed the page
+  steadyPaint(el, ()=>_arrHealthPaint(el, d), false);
+}
+function _arrHealthPaint(el, d){
   const rows=(d.arrs||[]);
   if(!rows.length){ el.innerHTML=''; return; }
   arrHealthPoll(true);
@@ -48542,11 +48545,33 @@ async function loadPathMap(){
 // truth: no error, no failure, two answers. The remedy is not more care, it is
 // asking on a schedule and putting the number where it is seen.
 let _arrSync=null, _arrSyncTimer=null;
+// A BLOCK THAT REPAINTS ON A TIMER MUST NOT MOVE THE PAGE. The agreement check
+// redraws every 4 s while it scans and the health cards every few minutes;
+// each redraw changed their height by a line or two (a bar appearing, an ETA,
+// a warning) and everything below them jumped. steadyPaint: while 'hold' is
+// true the block never shrinks (it keeps the tallest it has been), and when
+// the block sits above what is being read, any change in its height is paid
+// back in scroll so the text on screen stays put.
+function steadyPaint(el, paint, hold){
+  if(!el){ paint(); return; }
+  const before=el.offsetHeight, top=el.getBoundingClientRect().top;
+  if(!hold){ el.style.minHeight=''; el._steadyH=0; }
+  paint();
+  let after=el.offsetHeight;
+  if(hold && after<(el._steadyH||0)){ el.style.minHeight=el._steadyH+'px'; after=el.offsetHeight; }
+  if(hold) el._steadyH=Math.max(el._steadyH||0, after);
+  if(after!==before && top<0) window.scrollBy(0, after-before);
+}
 async function loadArrSync(){
   const el=document.getElementById('arrSyncBody');
   if(!el){ if(_arrSyncTimer) clearTimeout(_arrSyncTimer); return; }
   try{ _arrSync=await (await fetch('/api/arrsync')).json(); }
-  catch(e){ el.innerHTML='<span class="dim">could not load</span>'; return; }
+  catch(e){
+    // a poll that fails (a busy server) keeps what is on screen
+    if(!_arrSync) el.innerHTML='<span class="dim">could not load</span>';
+    else if(_arrSync.running||(_arrSync.fixing&&_arrSync.fixing.running)) _arrSyncTimer=setTimeout(loadArrSync, 4000);
+    return;
+  }
   arrSyncPaint();
   if(_arrSyncTimer) clearTimeout(_arrSyncTimer);
   // Faster while it is working, so the bar moves rather than stepping. A
@@ -48561,6 +48586,12 @@ async function loadArrSync(){
   if(busy) _arrSyncTimer=setTimeout(loadArrSync, 4000);
 }
 function arrSyncPaint(){
+  const el=document.getElementById('arrSyncBody');
+  if(!el||!_arrSync) return;
+  const busy=!!(_arrSync.running||(_arrSync.fixing&&_arrSync.fixing.running));
+  steadyPaint(el, _arrSyncPaint, busy);
+}
+function _arrSyncPaint(){
   const el=document.getElementById('arrSyncBody');
   if(!el||!_arrSync) return;
   const d=_arrSync, C=d.checks||{}, n=d.counts||{};
