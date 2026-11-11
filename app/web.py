@@ -11804,6 +11804,32 @@ def api_convert_cfg(on: int = -1, keep: int = 0, m1080: float = 0, m720: float =
     return hevcconvert.progress()
 
 
+@app.post("/api/convert/trial")
+async def api_convert_trial(ids: str = ""):
+    """A conversion trial: these files convert to 10-bit HEVC while their
+    library's switch is off (rules.py asks hevcconvert.trial), queued now.
+    An empty list ends the trial."""
+    from . import hevcconvert
+    want = [int(x) for x in ids.split(",") if x.strip().isdigit()]
+    kv_set(hevcconvert.TRIAL_KV, json.dumps(want))
+    queued, refused = [], {}
+    for fid in want:
+        rows = _rows("SELECT path, title, season, episode FROM files WHERE id=?", (fid,))
+        if not rows:
+            refused[fid] = "no such file"
+            continue
+        try:
+            label = display_label(rows[0]["title"], rows[0]["season"], rows[0]["episode"])
+            if await jobs.enqueue(fid, rows[0]["path"], label, source=hevcconvert.SOURCE, priority=80):
+                queued.append(fid)
+        except Exception as e:                               # noqa: BLE001
+            refused[fid] = f"{type(e).__name__}: {e}"[:160]
+    if queued:
+        await jobs.start()
+    joblog.log(f"HEVC conversion trial: {len(queued)} of {len(want)} file(s) queued", "info")
+    return {"trial": want, "queued": queued, "refused": refused}
+
+
 @app.get("/api/vmaf")
 def api_vmaf():
     from . import vmaftarget

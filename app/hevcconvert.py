@@ -105,6 +105,27 @@ def wants(library: str | None, vcodec: str, ten_bit: bool, hdr: bool,
     return mbps >= floors.get(tier(height or 0), 99.0)
 
 
+# A TRIAL. Files picked by hand (kv convert.hevc10.trial, a list of file ids)
+# convert while their library's switch is still off and whatever their
+# bitrate - a handful of results to look at before a whole library goes.
+# Same limits as the real thing: 8-bit H.264, SDR, and the 20% saving gate.
+# The list lives in kv because a plan is decided again when the job starts.
+TRIAL_KV = "convert.hevc10.trial"
+
+
+def trial_ids() -> set:
+    try:
+        return {int(x) for x in json.loads(kv_get(TRIAL_KV) or "[]")}
+    except Exception:                                    # noqa: BLE001
+        return set()
+
+
+def trial(file_id, vcodec: str, ten_bit: bool, hdr: bool) -> bool:
+    if not file_id or vcodec != "h264" or ten_bit or hdr or not cfg()["on"]:
+        return False
+    return int(file_id) in trial_ids()
+
+
 # A CONVERSION IS KNOWN BY WHAT ITS PLAN SAYS, not by who queued it: a
 # re-plan sweep ("subtitle rules changed") queued 100 of them on 2026-10-22,
 # and the panel, the pace and the do-not-retry list all missed them.

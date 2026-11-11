@@ -1827,6 +1827,9 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
     try:
         from . import hevcconvert as _hc
         _conv = _hc.wants(library, vcodec, bool(ten_bit), bool(hdr), int(height or 0), float(overall_mbps or 0))
+        # or a file on the hand-picked trial list - see hevcconvert.trial
+        if not _conv and _hc.trial(file_id, vcodec, bool(ten_bit), bool(hdr)):
+            _conv = True
         # Tried on this very file and discarded for not saving enough - see
         # hevcconvert.gave_up. Asking again only throws the rest of the plan
         # away with it; without the conversion a subtitle strip is a remux.
