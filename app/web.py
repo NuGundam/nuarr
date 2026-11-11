@@ -27340,6 +27340,12 @@ function paintRunning(j){
       // bars jumped instead of gliding. Watched live: nogrow on nearly every
       // repaint of every subread, listen and decode card.
       const reset = barReset(w, pct);
+      // THE VISION MODEL SITTING LOADED is not work: one slim line, no
+      // spinner, bar, ETA or Cancel - see qwenvlIdleCard().
+      if(w.idle && w.pool==='qwenvl'){
+        const c=qwenvlIdleCard(w); _cardHtml.set(w.job_id, c);
+        return _lastRunIds.has(w.job_id) ? c : c.replace('<div class="wk', '<div class="wk arriving');
+      }
       // data-job lets Watch/Hide find and edit THIS card without a full
       // repaint - see watchLive().
       const card = `<div class="wk" data-job="${esc(w.job_id)}">
@@ -27676,6 +27682,26 @@ function wkStatsHtml(w, pct, indet){
 // unchanged, only numbers moved - so write the numbers into the existing
 // nodes and leave the structure alone. Any structural change (job started or
 // ended, watch opened, ghost fading) falls back to the full rebuild.
+// The Qwen-VL model loaded and idle, waiting out Ollama's keep-alive. It
+// looked like a running job on the file it last read, so it is drawn as what
+// it is: a dim strip with what it read, when, and when it lets the card go.
+function qwenvlIdleText(w){
+  const ago = w.last_at ? Math.max(0, Math.round(Date.now()/1000 - w.last_at)) : null;
+  const agoTxt = ago==null ? '' : ago<90 ? `${ago}s ago` : `${Math.round(ago/60)} min ago`;
+  const read = w.last_asked ? `read ${w.last_got} of ${w.last_asked} doubted cue${w.last_asked===1?'':'s'}` : 'last read';
+  return `${read}${w.title?` for <b style="color:var(--fg)">${esc(w.title)}</b>`:''}${agoTxt?` · ${agoTxt}`:''}`
+    + ` · unloads in ${w.idle_left}s${w.vram_gb?` · ${w.vram_gb} GB on the card`:''}`;
+}
+function qwenvlIdleCard(w){
+  const col=poolColor('qwenvl');
+  return `<div class="wk qvidle" data-job="${esc(w.job_id)}" style="padding-top:7px;padding-bottom:7px;opacity:.78">
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:11.5px">
+      <span class="pill" style="color:var(--dim);border-color:#3b4a5e">qwenvl · idle</span>
+      <span class="dim" title="The vision model stays loaded for three minutes after its last read, in case another picture subtitle needs it. Nothing is running.">model loaded, nothing running</span>
+      <span class="dim qvidletxt">${qwenvlIdleText(w)}</span>
+    </div>
+  </div>`;
+}
 function tryPatchCards(j){
   if(_fading.size || watchId) return false;
   const host = document.getElementById('jobsRun');
@@ -27687,6 +27713,10 @@ function tryPatchCards(j){
       return false;
   for(const w of j.running){
     const card = host.querySelector(`.wk[data-job="${CSS.escape(w.job_id)}"]`);
+    if(w.idle && w.pool==='qwenvl'){
+      const t=card.querySelector('.qvidletxt'); if(t) t.innerHTML=qwenvlIdleText(w);
+      continue;
+    }
     const poolCol = poolColor(w.pool);
     const bs = barState(w, poolCol);
     const bar = card.querySelector('.bar.big > i');

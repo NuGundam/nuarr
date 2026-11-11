@@ -426,11 +426,19 @@ def as_running() -> list:
         stage = (f"loaded, idle - unloads in {int(max(0, left))}s"
                  + (f" · {vram / 1e9:.1f} GB on the card" if vram else ""))
         pct = max(0.0, min(1.0, left / 180.0))
-        extra = {"eta_s": round(max(0, left)), "eta_est": False}
+        # IDLE IS NOT A JOB. Drawn as a running card (bar, ETA, Cancel) the
+        # unload countdown read as a second task on the file it last read -
+        # 13 Hours on 2026-11-11, whose passthrough had already finished.
+        # A different job_id, so the page rebuilds the card on the switch
+        # instead of patching a reading card's bar into an idle one.
+        extra = {"eta_s": round(max(0, left)), "eta_est": False, "idle": True,
+                 "idle_left": int(max(0, left)), "vram_gb": round(vram / 1e9, 1),
+                 "last_asked": int(live.get("asked") or 0), "last_got": int(live.get("got") or 0),
+                 "last_at": float(live.get("at") or 0)}
         el = 0
     if not reading and shown:
         stage = f"last read for {_nice(shown)} · " + stage
-    return [{"job_id": "qwenvl", "pool": "qwenvl", "kind": "qwenvl",
+    return [{"job_id": "qwenvl" if reading else "qwenvl-idle", "pool": "qwenvl", "kind": "qwenvl",
              "title": _nice(shown) if shown else "Qwen-VL reader",
              "file": shown or "(nothing read since nuarr started)",
              "stage": stage, "progress": pct, "elapsed_s": el, "eta_est": True,
