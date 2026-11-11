@@ -27222,9 +27222,52 @@ const IDLE_WHERE = {decode:['the decode check','#health'],
                     audio:['audio tag fixes','#alang'],
                     subread:['subtitle reads','#lang'],
                     submake:['the subtitle maker','#subs']};
-function whyIdleHtml(j){
+// ONE STATUS SECTION, above the cards and outside their scroll box: why the
+// queue is held, why it is idle, and the vision model sitting loaded. Every
+// row is the same bubble, a headline, and the reason in a line under it -
+// the old HELD and IDLE lines said the same thing twice in two styles, and
+// the idle model was a card among the running jobs.
+const ST_COL='#e8a33d';
+function statusRow(tag, head, why){
+  return `<div style="display:grid;grid-template-columns:64px 1fr;gap:2px 10px;align-items:baseline;
+      padding:7px 14px;border-bottom:1px solid var(--line);font-size:12px">
+    <span class="pill" style="grid-row:span 2;justify-self:start;font-size:9.5px;color:${ST_COL};border-color:#4a3a12">${tag}</span>
+    <span style="color:var(--fg);font-weight:600">${head}</span>
+    <span class="dim" style="font-size:11.5px;line-height:1.45">${why||''}</span>
+  </div>`;
+}
+// "plex: 1 session transcoding [encode only]" -> a name and what it says
+const HOLD_NAMES={manual:'Paused by you', plex:'Plex', buffering:'A viewer is buffering', newviewer:'A viewer just started',
+  disks:'Disks are busy', cache:'Cache drive', drivepool:'DrivePool is moving files', arrs:'Sonarr / Radarr are busy'};
+function holdParts(txt){
+  const m=/^([a-z_]+):\s*(.*)$/i.exec(String(txt||''));
+  if(!m) return [esc(txt||''), ''];
+  const k=m[1].toLowerCase();
+  return [HOLD_NAMES[k] || (k.charAt(0).toUpperCase()+k.slice(1)), esc(m[2].replace(/\s*\[encode only\]/i,''))];
+}
+function statusHtml(j, models){
+  let out='';
+  const idle = whyIdleParts(j);
+  if(j.paused_reason){
+    const [name, what] = holdParts(j.paused_reason);
+    const same = idle && idle.hold && String(j.why_idle.hold)===String(j.paused_reason);
+    out += statusRow('HELD', name + (what && name!=='Paused by you' ? ` <span class="dim" style="font-weight:400">- ${what}</span>` : ''),
+      (name==='Paused by you' ? `${what||'Paused from the dashboard'}. ` : '')
+      + (/\[encode only\]/i.test(j.paused_reason) ? 'Only new encodes wait; every other kind of job keeps running.'
+         : 'Jobs already running finish; nothing new starts until this clears.')
+      + (same ? idle.tail.replace('<span class="dim">', '<span class="dim">· ') : ''));
+    if(idle && !same) out += statusRow('IDLE', idle.head, idle.why);
+  } else if(idle){
+    out += statusRow('IDLE', idle.head, idle.why);
+  }
+  for(const w of (models||[]))
+    out += statusRow('MODEL', 'Vision model loaded, nothing running',
+      qwenvlIdleText(w) + ' <span title="It stays loaded for three minutes after its last read, in case another picture subtitle needs it.">· kept ready for the next read</span>');
+  return out;
+}
+function whyIdleParts(j){
   const w = j && j.why_idle;
-  if(!w || !Object.keys(w).length) return '';           // something is running
+  if(!w || !Object.keys(w).length) return null;         // something is running
   const bits = [];
   let lead = '', tone = 'dim';
   if((w.paused||[]).length){
@@ -27257,14 +27300,13 @@ function whyIdleHtml(j){
     ? `<span class="dim"> · other systems are working: ${els.map(([k,n])=>
         `<span style="color:${poolColor(k)}">${esc(k)} ${n}</span>`).join(', ')}</span>`
     : (w.queued_all ? `<span class="dim"> · ${fmt(w.queued_all)} queued across every pool</span>` : '');
-  return `<div style="padding:8px 14px;border-bottom:1px solid var(--line);
-      font-size:12px">
-      <span class="pill ${tone==='warn'?'p-warn':'p-ok'}"
-        style="font-size:9.5px">IDLE</span>
-      <span class="${tone==='warn'?'warn':'dim'}" style="margin-left:6px">${lead}</span>
-      ${bits.length?`<span class="dim"> — </span>${bits.join('<span class="dim">, </span>')}`:''}
-      ${elsTxt}
-    </div>`;
+  const tail = elsTxt.replace(/^<span class="dim"> · /, ' <span class="dim">');
+  const why = (bits.length ? 'Waiting: '+bits.join(', ')+'. ' : '')
+    + (elsTxt ? tail.replace(/^ <span class="dim">(.)/, (m,c)=>'<span class="dim">'+c.toUpperCase()) : '')
+    || (w.hold ? 'Nothing new starts until this clears.' : '');
+  const hp = w.hold && !(w.paused||[]).length ? holdParts(w.hold) : null;
+  return {head: hp ? hp[0]+(hp[1]?` <span class="dim" style="font-weight:400">- ${hp[1]}</span>`:'') : lead,
+          why, tail, tone, hold: !!w.hold && !(w.paused||[]).length};
 }
 function paintRunning(j){
   // The Processing-now tile and its panel ride this payload rather than
@@ -27297,11 +27339,11 @@ function paintRunning(j){
   try{ if(typeof _drillRows!=='undefined' && _drillRows.length) patchSteps(_drillRows); }
   catch(_){ }
   // Same rule as the cards below it.
-  idleEl('jobsHeld').innerHTML =
-    (j.paused_reason
-      ? `<div style="padding:10px 14px;border-bottom:1px solid var(--line)">
-         <span class="pill p-warn">HELD</span> <span class="dim">${esc(j.paused_reason)}</span></div>`
-      : '') + whyIdleHtml(j);
+  // The idle vision model is a status line up here, not a card in the
+  // scroll box below - taken out of the list before the cards are built.
+  const _models = (j.running||[]).filter(w=>w.idle && w.pool==='qwenvl');
+  if(_models.length) j.running = j.running.filter(w=>!(w.idle && w.pool==='qwenvl'));
+  idleEl('jobsHeld').innerHTML = statusHtml(j, _models);
 
   // Feed the interpolator FIRST, so barState() below - in either the patch or
   // the rebuild path - reads this sample rather than the previous one.
@@ -27340,12 +27382,6 @@ function paintRunning(j){
       // bars jumped instead of gliding. Watched live: nogrow on nearly every
       // repaint of every subread, listen and decode card.
       const reset = barReset(w, pct);
-      // THE VISION MODEL SITTING LOADED is not work: one slim line, no
-      // spinner, bar, ETA or Cancel - see qwenvlIdleCard().
-      if(w.idle && w.pool==='qwenvl'){
-        const c=qwenvlIdleCard(w); _cardHtml.set(w.job_id, c);
-        return _lastRunIds.has(w.job_id) ? c : c.replace('<div class="wk', '<div class="wk arriving');
-      }
       // data-job lets Watch/Hide find and edit THIS card without a full
       // repaint - see watchLive().
       const card = `<div class="wk" data-job="${esc(w.job_id)}">
@@ -27692,16 +27728,6 @@ function qwenvlIdleText(w){
   return `${read}${w.title?` for <b style="color:var(--fg)">${esc(w.title)}</b>`:''}${agoTxt?` · ${agoTxt}`:''}`
     + ` · unloads in ${w.idle_left}s${w.vram_gb?` · ${w.vram_gb} GB on the card`:''}`;
 }
-function qwenvlIdleCard(w){
-  const col=poolColor('qwenvl');
-  return `<div class="wk qvidle" data-job="${esc(w.job_id)}" style="padding-top:7px;padding-bottom:7px;opacity:.78">
-    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:11.5px">
-      <span class="pill" style="color:var(--dim);border-color:#3b4a5e">qwenvl · idle</span>
-      <span class="dim" title="The vision model stays loaded for three minutes after its last read, in case another picture subtitle needs it. Nothing is running.">model loaded, nothing running</span>
-      <span class="dim qvidletxt">${qwenvlIdleText(w)}</span>
-    </div>
-  </div>`;
-}
 function tryPatchCards(j){
   if(_fading.size || watchId) return false;
   const host = document.getElementById('jobsRun');
@@ -27713,10 +27739,6 @@ function tryPatchCards(j){
       return false;
   for(const w of j.running){
     const card = host.querySelector(`.wk[data-job="${CSS.escape(w.job_id)}"]`);
-    if(w.idle && w.pool==='qwenvl'){
-      const t=card.querySelector('.qvidletxt'); if(t) t.innerHTML=qwenvlIdleText(w);
-      continue;
-    }
     const poolCol = poolColor(w.pool);
     const bs = barState(w, poolCol);
     const bar = card.querySelector('.bar.big > i');
