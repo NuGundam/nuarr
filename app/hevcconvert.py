@@ -180,18 +180,25 @@ def candidates(force: bool = False) -> list:
     if not force and STATE["cands"] and time.time() - STATE["cand_at"] < 1800:
         return STATE["cands"]
     libs = libraries()
+    # THE HAND-PICKED LIST IS FED TOO, a few at a time like a library. For
+    # TV Shows it is the files Sonarr scores the same or better as 10-bit
+    # HEVC (2026-11-11: 511 of 1,332; the other 821 are h264 WEB-DLs that
+    # lose the profile's "1080p WEB-DL (Efficient)" 860,000 once converted,
+    # fall under the profile minimum and would be downloaded again).
+    picked = sorted(trial_ids())
     out = []
-    if not libs:
+    if not libs and not picked:
         STATE.update(cands=[], cand_at=time.time())
         return out
     with cursor() as cur:
         tried = _done_ids(cur)
         busy = {r["file_id"] for r in cur.execute(
             "SELECT file_id FROM jobs WHERE state IN ('queued','running') AND file_id IS NOT NULL")}
-        q = ",".join("?" * len(libs))
+        q = ",".join("?" * len(libs)) or "''"
+        pq = ",".join(str(int(x)) for x in picked) or "0"
         for r in cur.execute(
                 f"SELECT f.id, f.path, f.title, f.size, f.duration, f.height, f.pool_disk, f.library, p.json probe "
-                f"FROM files f JOIN file_probes p ON p.file_id=f.id WHERE f.library IN ({q}) "
+                f"FROM files f JOIN file_probes p ON p.file_id=f.id WHERE (f.library IN ({q}) OR f.id IN ({pq})) "
                 f"AND f.state NOT IN ('deleted','duplicate') AND f.duration>240 AND f.size>0",
                 tuple(libs)):
             if r["id"] in tried or r["id"] in busy:
@@ -204,7 +211,8 @@ def candidates(force: bool = False) -> list:
             mbps = r["size"] * 8 / r["duration"] / 1e6
             hdr = str(vs.get("color_transfer") or "") in ("smpte2084", "arib-std-b67")
             ten = "10" in (vs.get("pix_fmt") or "")
-            if wants(r["library"], vs.get("codec_name") or "", ten, hdr, r["height"] or 0, mbps):
+            if (wants(r["library"], vs.get("codec_name") or "", ten, hdr, r["height"] or 0, mbps)
+                    or trial(r["id"], vs.get("codec_name") or "", ten, hdr)):
                 out.append({"id": r["id"], "path": r["path"], "title": r["title"] or "",
                             "mbps": round(mbps, 2), "gb": r["size"] / 1e9, "disk": r["pool_disk"] or ""})
     out.sort(key=lambda x: -x["mbps"])

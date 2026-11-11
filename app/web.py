@@ -11805,13 +11805,16 @@ def api_convert_cfg(on: int = -1, keep: int = 0, m1080: float = 0, m720: float =
 
 
 @app.post("/api/convert/trial")
-async def api_convert_trial(ids: str = ""):
+async def api_convert_trial(ids: str = "", queue: int = 1):
     """A conversion trial: these files convert to 10-bit HEVC while their
     library's switch is off (rules.py asks hevcconvert.trial), queued now.
     An empty list ends the trial."""
     from . import hevcconvert
     want = [int(x) for x in ids.split(",") if x.strip().isdigit()]
     kv_set(hevcconvert.TRIAL_KV, json.dumps(want))
+    hevcconvert.STATE["cand_at"] = 0.0
+    if not queue:                 # a long list: the feeder takes it a few at a time
+        return {"trial": len(want), "queued": [], "fed": True}
     queued, refused = [], {}
     for fid in want:
         rows = _rows("SELECT path, title, season, episode FROM files WHERE id=?", (fid,))
