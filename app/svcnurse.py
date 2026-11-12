@@ -61,6 +61,9 @@ RETEST_EVERY_S = 86400.0
 DOCKER_COOLDOWN_S = 3600.0              # one Docker start an hour, at most
 CONTAINER_COOLDOWN_S = 1800.0
 PORT_WAIT_S = 300.0                     # how long a started Docker gets
+DOCKER_VERSION_FILE = r"C:\Program Files\Docker\Docker\resources\componentsVersion.json"
+DOCKER_UPDATER_NAMES = ("docker desktop installer", "docker desktop updater")
+FAST_POLL_S = 60.0                      # while Docker updates, and right after
 
 NO_WINDOW = 0x08000000
 
@@ -163,6 +166,48 @@ def docker_up() -> bool:
     return docker_state() == "up"
 
 
+def docker_version() -> str:
+    """Docker Desktop's own version ('4.98.0.245422'), read from its install -
+    it changes the moment an update lands, whether the engine runs or not."""
+    try:
+        d = json.load(open(DOCKER_VERSION_FILE, encoding="utf-8"))
+        v = str(d.get("appVersion") or "")
+        return f"{v}.{d['buildNumber']}" if v and d.get("buildNumber") else v
+    except Exception:                                    # noqa: BLE001
+        return ""
+
+
+def docker_updating() -> bool:
+    """Docker Desktop's installer/updater is running. 2026-11-12 07:43 it
+    updated itself to 4.98: the engine pipe vanished, Byparr's port stayed
+    bound by wslrelay but closed every connection, and 1337x failed until a
+    person re-tested it. Restarting Docker in the middle of that would fight
+    the installer."""
+    try:
+        import psutil
+        for p in psutil.process_iter(["name"]):
+            n = (p.info.get("name") or "").lower()
+            if n.startswith(DOCKER_UPDATER_NAMES):
+                return True
+    except Exception:                                    # noqa: BLE001
+        pass
+    return False
+
+
+def _http_answers(url: str, timeout: float = 8.0) -> bool:
+    """A proxy is up when it ANSWERS, not when its port is open: wslrelay
+    keeps a container's port bound while the engine behind it is gone."""
+    import urllib.error
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url, timeout=timeout):
+            return True
+    except urllib.error.HTTPError:
+        return True                                      # any HTTP reply is a live server
+    except Exception:                                    # noqa: BLE001
+        return False
+
+
 def _restart_docker() -> tuple[bool, str]:
     """End Docker Desktop (task, app, backend, its WSL distro) and start it
     again through the scheduled task in the signed-in session. Containers
@@ -256,16 +301,42 @@ async def check(act: bool | None = None) -> dict:
             host_url = next((f.get("value") for f in p.get("fields") or [] if f.get("name") == "host"), "") or ""
             host, port = _host_port(str(host_url))
             up = bool(host) and await asyncio.to_thread(_port_open, host, port)
+            if up and str(host_url).startswith("http"):
+                up = await asyncio.to_thread(_http_answers, str(host_url))
             row = {"name": p.get("name"), "impl": p.get("implementation"), "host": host_url, "up": up,
-                   "local": _local(host), "port": port}
+                   "local": _local(host), "port": port, "tags": list(p.get("tags") or [])}
             prows.append(row)
             if not up:
                 down.append(row)
         STATE["proxies"] = prows
         # 3. WHY A PROXY IS DOWN, and the fix in order: Docker, then the container
-        dstate = await asyncio.to_thread(docker_state)
+        # 3-. DOCKER DESKTOP UPDATING ITSELF: hands off until the installer
+        # is gone; then (step 4b) wait for the proxy and re-test what uses it.
+        # A version change seen with no updater caught running (it finished
+        # between two passes) counts the same.
+        dk = mem.setdefault("docker", {})
+        updating = await asyncio.to_thread(docker_updating)
+        ver = await asyncio.to_thread(docker_version)
+        if updating:
+            dstate = "updating"
+            if not dk.get("updating_since"):
+                dk["updating_since"] = now
+                dk["from"] = dk.get("version") or ver
+                _remember(mem)
+                _act(f"Docker Desktop is updating itself (from {dk['from'] or '?'}) - leaving it alone until it finishes")
+            findings.append({"what": "Docker Desktop is updating itself",
+                             "detail": f"since {time.strftime('%H:%M', time.localtime(float(dk['updating_since'])))}; "
+                                       "its proxy and every Cloudflare-protected indexer are down until it is back - "
+                                       "the nurse re-tests them when it is", "fix": "", "level": "info"})
+        else:
+            dstate = await asyncio.to_thread(docker_state)
+        if ver and not dk.get("version"):
+            dk["version"] = ver
+        post_update = (not updating and dstate == "up" and bool(ver)
+                       and (bool(dk.get("updating_since")) or ver != dk.get("version")))
         STATE["docker"] = dstate == "up"
         STATE["docker_state"] = dstate
+        STATE["docker_version"] = ver
         fixed_proxy = False
         # 3a. A WEDGED DOCKER: the app runs, the engine does not answer. Not
         # the same as stopped - starting the task again is a no-op - and it
@@ -292,6 +363,8 @@ async def check(act: bool | None = None) -> dict:
             elif act:
                 f["detail"] += " - restarted it less than an hour ago, waiting before trying again"
         for row in down:
+            if updating:
+                break                                    # the installer's moment, not ours
             if not row["local"]:
                 findings.append({"what": f"proxy {row['name']} is not answering", "detail": f"{row['host']} - not on this machine, nothing to restart here",
                                  "fix": "", "level": "error"})
@@ -358,6 +431,12 @@ async def check(act: bool | None = None) -> dict:
                 m["down_s"] = float(m.get("down_s") or 0) + max(0.0, now - float(m["down_since"]))
                 m["last_ok"] = now
                 m["down_since"] = 0
+        # 4b. AFTER A DOCKER UPDATE: wait for the local proxies to answer,
+        # then test every indexer that goes through them - in Prowlarr (the
+        # ones it marked down) and on the arrs (all of them, so marks the arrs
+        # took during the outage clear now, not hours later).
+        if post_update:
+            await _after_docker_update(mem, dk, ver, prows, idx, failing)
         # 5. AFTER A PROXY FIX, TEST WHAT WAS DOWN so the arrs clear now
         if fixed_proxy and failing:
             STATE["stage"] = "re-testing indexers"
@@ -453,6 +532,47 @@ async def check(act: bool | None = None) -> dict:
     return snapshot()
 
 
+async def _after_docker_update(mem: dict, dk: dict, ver: str, prows: list, idx: list, failing: dict) -> None:
+    frm = dk.get("from") or dk.get("version") or "?"
+    local = [r for r in prows if r.get("local") and str(r.get("host") or "").startswith("http")]
+    answering = []
+    for r in local:
+        t0 = time.time()
+        while time.time() - t0 < PORT_WAIT_S:
+            STATE["stage"] = f"Docker updated - waiting for {r['name']} ({int(time.time() - t0)}s)"
+            if await asyncio.to_thread(_http_answers, str(r["host"])):
+                answering.append(r)
+                r["up"] = True
+                break
+            await asyncio.sleep(10)
+    if local and not answering:
+        _act(f"Docker Desktop updated {frm} -> {ver}, but "
+             f"{', '.join(r['name'] for r in local)} did not answer within {int(PORT_WAIT_S / 60)} minutes", ok=False)
+        return                                           # stays pending: tried again next pass
+    tags = {t for r in answering for t in r.get("tags") or []}
+    users = [i for i in idx if i.get("enable") and (not tags or tags & set(i.get("tags") or []))]
+    STATE["stage"] = "Docker updated - re-testing indexers"
+    back, still = [], []
+    for i in users:
+        if i["name"] not in failing:
+            continue
+        if await asyncio.to_thread(_test_indexer, i):
+            back.append(i["name"])
+            failing.pop(i["name"], None)
+        else:
+            still.append(i["name"])
+    if users:
+        await _retest_arrs([i["name"] for i in users])
+    dk.update(version=ver, updating_since=0, last_update={"at": time.time(), "from": frm, "to": ver})
+    dk.pop("from", None)
+    _remember(mem)
+    _act(f"Docker Desktop updated {frm} -> {ver}; "
+         + (", ".join(r["name"] for r in answering) + " answers; " if answering else "")
+         + f"re-tested {len(users)} indexer(s) on the arrs"
+         + (f"; back in Prowlarr: {', '.join(back)}" if back else "")
+         + (f"; still failing: {', '.join(still)}" if still else ""), ok=not still)
+
+
 async def _wait_port(host: str, port: int, limit: float = PORT_WAIT_S) -> bool:
     t0 = time.time()
     while time.time() - t0 < limit:
@@ -532,6 +652,9 @@ def indexer_set(name: str, on: bool) -> dict:
 def snapshot() -> dict:
     d = {k: STATE[k] for k in ("running", "at", "checked", "findings", "actions", "prowlarr", "proxies", "docker", "stage")}
     d["mode"] = mode()
+    d["docker_state"] = STATE.get("docker_state") or ""
+    d["docker_version"] = STATE.get("docker_version") or ""
+    d["docker_last_update"] = (_memory().get("docker") or {}).get("last_update")
     d["prowlarr_url"] = prowlarr_url()
     d["has_key"] = bool(prowlarr_key())
     d["key_from_config"] = not (kv_get(KV_KEY) or "") and bool(prowlarr_key())
@@ -557,7 +680,11 @@ async def watch() -> None:
             schedules.REG["svcnurse"]["last_result"] = (f"{r['open']} open" if r["open"] else "all up")
         except Exception as e:                           # noqa: BLE001
             joblog.log(f"services nurse: {type(e).__name__}: {e}", "warn", system="nurse")
-        await asyncio.sleep(POLL_S)
+        # a minute at a time while Docker updates (or its re-test is still
+        # pending), so the indexers come back within a minute of Docker
+        dk = (_memory().get("docker") or {})
+        await asyncio.sleep(FAST_POLL_S if (STATE.get("docker_state") == "updating" or dk.get("updating_since"))
+                            else POLL_S)
 
 
 # ------------------------------------------------- the indexers page ----
