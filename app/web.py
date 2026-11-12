@@ -11833,6 +11833,25 @@ async def api_convert_trial(ids: str = "", queue: int = 1):
     return {"trial": want, "queued": queued, "refused": refused}
 
 
+@app.get("/api/vmaf/held")
+def api_vmaf_held():
+    """Encodes held for a low final VMAF - see vmafhold.py."""
+    from . import vmafhold
+    return {"items": vmafhold.items()}
+
+
+@app.post("/api/vmaf/held/accept")
+async def api_vmaf_held_accept(job_id: str):
+    from . import vmafhold
+    return await vmafhold.accept(job_id)
+
+
+@app.post("/api/vmaf/held/discard")
+def api_vmaf_held_discard(job_id: str):
+    from . import vmafhold
+    return vmafhold.discard(job_id)
+
+
 @app.get("/api/vmaf")
 def api_vmaf():
     from . import vmaftarget
@@ -27260,10 +27279,48 @@ function statusHtml(j, models){
   } else if(idle){
     out += statusRow('IDLE', idle.head, idle.why);
   }
+  out += heldRows();
   for(const w of (models||[]))
     out += statusRow('MODEL', 'Vision model loaded, nothing running',
       qwenvlIdleText(w) + ' <span title="It stays loaded for three minutes after its last read, in case another picture subtitle needs it.">· kept ready for the next read</span>');
   return out;
+}
+// ENCODES HELD FOR A LOW FINAL VMAF (vmafhold.py): the original stayed, the
+// encode is parked. One REVIEW row per file with what it scored, and the two
+// answers - swap it in anyway, or throw it away. Fetched on its own slow clock
+// (they change when a job finishes or you press a button, not every 2 s).
+let _held=[], _heldAt=0, _heldBusy={};
+async function heldLoad(force){
+  if(!force && Date.now()-_heldAt < 30000) return;
+  _heldAt=Date.now();
+  try{ _held=(await (await fetch('/api/vmaf/held')).json()).items||[]; }catch(e){ return; }
+}
+function heldRows(){
+  heldLoad(false);
+  return _held.map(m=>{
+    const gb=x=>(x/1e9).toFixed(2)+' GB';
+    const saved=m.size_before? Math.round((1-m.size_after/m.size_before)*100) : 0;
+    const name=esc((m.target||'').split(/[\\/]/).pop()||m.title||m.job_id);
+    const busy=_heldBusy[m.job_id];
+    const btns = busy ? `<span class="dim">${esc(busy)}</span>`
+      : `${m.target_ok?`<button onclick="heldAct('${esc(m.job_id)}','accept')" title="Swap this encode in for the original now, whatever the score said">Accept anyway</button>`:''}
+         <button onclick="heldAct('${esc(m.job_id)}','discard')" title="Delete the held encode; the original stays as it is">Discard</button>`;
+    return statusRow('REVIEW', `${esc(m.title||'')} <span class="dim" style="font-weight:400">- held at VMAF ${m.vmaf}</span>`,
+      `${name}<br>final VMAF ${m.vmaf}, worst sample ${m.worst}${m.sample_vmaf!=null?`, the samples predicted ${m.sample_vmaf}`:''}`
+      + ` · ${gb(m.size_before)} → ${gb(m.size_after)} (${saved}% smaller) · the original is untouched`
+      + (m.target_ok?'':` · <span class="warn">${esc(m.why_not)}</span>`)
+      + `<div style="margin-top:5px;display:flex;gap:6px">${btns}</div>`);
+  }).join('');
+}
+async function heldAct(id, what){
+  if(what==='discard' && !confirm('Delete the held encode? The original stays as it is.')) return;
+  _heldBusy[id] = what==='accept' ? 'swapping it in…' : 'discarding…';
+  try{
+    const r=await (await fetch(`/api/vmaf/held/${what}?job_id=${encodeURIComponent(id)}`,{method:'POST'})).json();
+    if(!r.ok) alert(r.why||'could not do that');
+  }catch(e){ alert('could not reach nuarr'); }
+  delete _heldBusy[id];
+  await heldLoad(true);
 }
 function whyIdleParts(j){
   const w = j && j.why_idle;

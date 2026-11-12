@@ -6830,6 +6830,30 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
                                + (f" - the samples predicted {_pv}, banding {_pc}" if _pv is not None else "")
                                + f"; {_fv['note']} in {_fv['secs']:.0f}s{_short}",
                                "warn" if _short else "ok", job.id)
+                    # HELD, NOT SHIPPED: a final this far under is either a
+                    # ruined encode or a measurement worth a person's eyes,
+                    # and neither should replace a good original. 2026-11-11:
+                    # a SmackDown conversion scored 63 and was committed.
+                    if _fv["vmaf"] < _vt2.HOLD_BELOW:
+                        # PARKED, not deleted: Accept anyway on the dashboard
+                        # swaps it in through the deferred-commit queue.
+                        from . import vmafhold as _vh
+                        _parked = await asyncio.to_thread(
+                            _vh.park, job.id, job.file_id, job.path, job.title or "", out, _fv,
+                            size_before, size_after, SETTINGS.cache_dir)
+                        if not _parked:
+                            await asyncio.to_thread(_rm, out)
+                        msg = (f"held: the final file scored VMAF {_fv['vmaf']} (worst {_fv['worst']}) against "
+                               f"its samples, under the {_vt2.HOLD_BELOW:.0f} hold line - the original is kept"
+                               + (f"; the samples predicted {_pv}" if _pv is not None else "")
+                               + ("; the encode is held for review (Accept anyway on the dashboard)" if _parked else "")
+                               + ("; cuts and scores kept in vmaf-low to look at" if _fv.get("kept") else ""))
+                        joblog.log(msg, "warn", job.id)
+                        with cursor() as cur:
+                            cur.execute("UPDATE files SET state='done', state_reason=? WHERE id=?",
+                                        ("held: final VMAF under the hold line", job.file_id))
+                        _finish(job, "skipped", size_before, size_after, msg)
+                        return
                     try:
                         job.plan.add("video", f"final file checked: VMAF {_fv['vmaf']}, worst sample {_fv['worst']}, banding {_fv['cambi']}",
                                      (f"the samples predicted VMAF {_pv}, banding {_pc}; " if _pv is not None else "") + _fv["note"])

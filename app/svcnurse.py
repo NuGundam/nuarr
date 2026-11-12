@@ -142,8 +142,47 @@ def _local(host: str) -> bool:
     return host in ("127.0.0.1", "localhost", "::1", "host.docker.internal") or host == socket.gethostname().lower()
 
 
+def docker_state() -> str:
+    """'up', 'wedged' or 'down'.
+
+    NOT os.path.exists(pipe): a named pipe whose instances are all busy - the
+    engine hung - reads as absent, which is how a wedged Docker showed up as
+    "not running" for three days. The pipe being LISTED says Docker Desktop is
+    there; the engine answering `docker version` says it works."""
+    try:
+        listed = os.path.basename(DOCKER_PIPE).lower() in {p.lower() for p in os.listdir("\\\\.\\pipe\\")}
+    except OSError:
+        listed = os.path.exists(DOCKER_PIPE)
+    if not listed:
+        return "down"
+    rc, out = _run(["docker", "version", "--format", "{{.Server.Version}}"], timeout=25)
+    return "up" if rc == 0 and out.strip() and "error" not in out.lower() else "wedged"
+
+
 def docker_up() -> bool:
-    return os.path.exists(DOCKER_PIPE)
+    return docker_state() == "up"
+
+
+def _restart_docker() -> tuple[bool, str]:
+    """End Docker Desktop (task, app, backend, its WSL distro) and start it
+    again through the scheduled task in the signed-in session. Containers
+    with a restart policy come back on their own."""
+    steps = []
+    for args in (["schtasks", "/End", "/TN", DOCKER_TASK],
+                 ["taskkill", "/F", "/IM", "Docker Desktop.exe", "/IM", "com.docker.backend.exe",
+                  "/IM", "com.docker.build.exe"],
+                 ["wsl", "--terminate", "docker-desktop"]):
+        rc, out = _run(args, timeout=60)
+        steps.append(f"{args[0]} {rc}")
+    time.sleep(5)
+    rc, out = _run(["schtasks", "/Run", "/TN", DOCKER_TASK])
+    if rc:
+        return False, f"could not start it again: {out.strip()[:140]}"
+    for _ in range(int(PORT_WAIT_S / 10)):
+        time.sleep(10)
+        if docker_state() == "up":
+            return True, ", ".join(steps)
+    return False, f"restarted, but the engine did not answer within {int(PORT_WAIT_S / 60)} minutes"
 
 
 def _run(args: list, timeout: float = 60.0) -> tuple[int, str]:
@@ -224,8 +263,34 @@ async def check(act: bool | None = None) -> dict:
                 down.append(row)
         STATE["proxies"] = prows
         # 3. WHY A PROXY IS DOWN, and the fix in order: Docker, then the container
-        STATE["docker"] = await asyncio.to_thread(docker_up)
+        dstate = await asyncio.to_thread(docker_state)
+        STATE["docker"] = dstate == "up"
+        STATE["docker_state"] = dstate
         fixed_proxy = False
+        # 3a. A WEDGED DOCKER: the app runs, the engine does not answer. Not
+        # the same as stopped - starting the task again is a no-op - and it
+        # matters even while the proxy still answers: every docker command
+        # (container checks, updates) hangs behind it.
+        if dstate == "wedged":
+            f = {"what": "Docker Desktop is running but its engine does not answer",
+                 "detail": "every docker command hangs; containers may still serve, but none can be checked, "
+                           "started or updated", "fix": "restart Docker Desktop", "level": "error"}
+            findings.append(f)
+            if act and now - float(mem["cool"].get("docker") or 0) > DOCKER_COOLDOWN_S:
+                mem["cool"]["docker"] = now
+                _remember(mem)
+                STATE["stage"] = "restarting a hung Docker Desktop"
+                ok, how = await asyncio.to_thread(_restart_docker)
+                if ok:
+                    _act("restarted a hung Docker Desktop (" + how + ")")
+                    f["fixed"] = True
+                    STATE["docker"], STATE["docker_state"] = True, "up"
+                    await _notify("nuarr: Docker Desktop restarted",
+                                  "Its engine had stopped answering; restarted it and it answers again.")
+                else:
+                    _act("Docker Desktop hung and the restart did not bring it back: " + how, ok=False)
+            elif act:
+                f["detail"] += " - restarted it less than an hour ago, waiting before trying again"
         for row in down:
             if not row["local"]:
                 findings.append({"what": f"proxy {row['name']} is not answering", "detail": f"{row['host']} - not on this machine, nothing to restart here",

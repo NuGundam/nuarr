@@ -989,6 +989,15 @@ def sweep(cache_dir: str, max_age_s: float = 3 * 86400) -> int:
 # their own folder: sweep() reads only "vmaf", so they outlive the three days.
 # ~0.5-1 GB a file, so only the newest KEEP_MAX stay.
 KEEP_BELOW = 90.0
+# A FINAL UNDER THIS IS HELD, NOT SHIPPED - jobs.py keeps the original and
+# discards the encode (the cuts stay in vmaf-low to look at). Same line as the
+# one that keeps the cuts: under it the number is either a ruined encode or a
+# measurement worth a person's eyes, and neither should replace a good file.
+HOLD_BELOW = 90.0
+# Below this mean at the three plain alignments, a sample is re-scored frame
+# by frame across +/-WIDE_FRAMES - see _wide_align().
+WIDE_BELOW = 95.0
+WIDE_FRAMES = 3
 KEEP_MAX = 30
 
 
@@ -1011,6 +1020,55 @@ def _keep_cuts(cache_dir: str, job_id: str, work_dir: str, facts: dict) -> str:
     for old in kept[:-KEEP_MAX]:
         _sh.rmtree(old, ignore_errors=True)
     return dest
+
+
+def _wide_align(ff, cut, ref, fmt, threads, card, R: int = WIDE_FRAMES):
+    """FRAME-BY-FRAME ALIGNMENT across +/-R frames: (mean, 5th pct, cambi) or None.
+
+    The three plain alignments assume one offset holds for the whole cut. A
+    source that drops or doubles a frame mid-cut (a 59.998 fps WEBRip:
+    WWE SmackDown 2026-11-06, 2026-11-11) changes the offset part-way, and
+    every single offset scores the half it does not fit at 0-20: three of its
+    four samples read 19-72 and the whole file 63, on a picture that was clean.
+    Scored at every offset from -R to +R and mapped back to the final file's
+    own frame numbers, each final frame keeps its best match. A wrong pairing
+    can only score lower than the right one, so this finds the true score
+    wherever the slip falls; a genuinely soft encode stays soft (a real 82 was
+    still 82 at +/-12)."""
+    best: dict = {}
+    cambis = []
+    hw = _NVDEC if card else []
+    for off in range(-R, R + 1):
+        d, r = (off, 0) if off >= 0 else (0, -off)
+        log = cut + f".w{off}.json"
+        lav = (f"[0:v]format={fmt},trim=start_frame={d},setpts=PTS-STARTPTS[d];"
+               f"[1:v]format={fmt},trim=start_frame={r},setpts=PTS-STARTPTS[r];"
+               f"[d][r]libvmaf=log_fmt=json:log_path='{log.replace(chr(92), '/').replace(':', chr(92) + ':')}'"
+               f":n_threads={threads}{TS_SYNC}")      # every frame (a subsample breaks the per-frame pairing); no cambi: the plain pass measured banding
+        rc, _err = _run([ff, "-hide_banner", "-nostdin", "-v", "error"] + hw + ["-i", cut] + hw + ["-i", ref,
+                         "-lavfi", lav, "-f", "null", "-"], 600)
+        if rc != 0 or not os.path.exists(log):
+            continue
+        try:
+            dd = json.load(open(log, encoding="utf-8"))
+            for f in dd.get("frames") or []:
+                v = (f.get("metrics") or {}).get("vmaf")
+                if v is None:
+                    continue
+                i = int(f.get("frameNum", 0)) + d          # the final cut's own frame number
+                if v > best.get(i, -1.0):
+                    best[i] = float(v)
+        except Exception:                                # noqa: BLE001
+            continue
+        finally:
+            try:
+                os.remove(log)
+            except OSError:
+                pass
+    if len(best) < 10:
+        return None
+    vals = sorted(best.values())
+    return statistics.mean(vals), vals[max(0, len(vals) // 20)], (min(cambis) if cambis else 0.0)
 
 
 def verify_final(job_id: str, final: str, cache_dir: str, tick=None) -> dict | None:
@@ -1088,6 +1146,10 @@ def verify_final(job_id: str, final: str, cache_dir: str, tick=None) -> dict | N
                     continue
                 if best is None or mean > best[0]:
                     best = (mean, float(low), cambi, dskip, rskip)
+            if best is None or best[0] < WIDE_BELOW:
+                wide = _wide_align(ff, cut, ref, fmt, threads, card)
+                if wide and (best is None or wide[0] > best[0]):
+                    best = (wide[0], wide[1], best[2] if best else wide[2], "wide", "wide")
             if best:
                 # as in the search: the dark cut speaks for banding only, or the
                 # sample-minus-final gap headroom learns from would mean nothing
