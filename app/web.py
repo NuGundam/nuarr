@@ -27281,8 +27281,13 @@ function statusHtml(j, models){
   }
   out += heldRows();
   for(const w of (models||[]))
-    out += statusRow('MODEL', 'Vision model loaded, nothing running',
-      qwenvlIdleText(w) + ' <span title="It stays loaded for three minutes after its last read, in case another picture subtitle needs it.">· kept ready for the next read</span>');
+    out += (w.owner && w.owner!=='nuarr')
+      ? statusRow('MODEL', `Vision model loaded by ${esc(w.owner)}, not nuarr`,
+          `${esc(w.owner)}'s advisor uses the same model (qwen3-vl) and keeps it 3 min after its own last call`
+          + ` · unloads in ${w.idle_left}s${w.vram_gb?` · ${w.vram_gb} GB on the card`:''}`
+          + (w.last_at?` · nuarr last read ${Math.round((Date.now()/1000-w.last_at)/60)} min ago`:''))
+      : statusRow('MODEL', 'Vision model loaded, nothing running',
+          qwenvlIdleText(w) + ' <span title="It stays loaded for a minute after its last read, in case another picture subtitle needs it.">· kept ready for the next read</span>');
   return out;
 }
 // ENCODES HELD FOR A LOW FINAL VMAF (vmafhold.py): the original stayed, the

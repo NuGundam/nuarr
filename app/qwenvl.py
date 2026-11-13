@@ -32,7 +32,13 @@ MODEL_DEFAULT = "qwen3-vl:8b-instruct"
 VL_MAX_DEFAULT = 200           # cues per track it may be asked about
 DOUBT_SCORE = 0.72             # mean Paddle confidence under this is a doubt
 LOAD_GB = 6.6                  # free GPU memory needed to LOAD it (5.6 + the 1 GB margin gpubudget keeps)
-KEEP_ALIVE = "3m"              # Ollama unloads it after this long idle; loading again costs about a second
+# Ollama unloads it after this long idle; loading again costs about 5 s.
+# 60 s, not 3 min - from the Ollama server logs 11-02..11-12: nuarr's reads come
+# in tight bursts (5,673 of 6,067 follow-ups within 5 s, 99 % within 30 s), so
+# a minute costs ~24 extra reloads in ten days and gives 5.5 GB of VRAM back
+# about 10 hours sooner over the same days.
+KEEP_ALIVE = "60s"
+KEEP_S = 60
 
 PROMPT = ("This image is one subtitle cue cut from a video. Transcribe the text "
           "exactly as written, one line per line of text, keeping the original "
@@ -431,7 +437,12 @@ def as_running() -> list:
         # 13 Hours on 2026-11-11, whose passthrough had already finished.
         # A different job_id, so the page rebuilds the card on the switch
         # instead of patching a reading card's bar into an idle one.
-        extra = {"eta_s": round(max(0, left)), "eta_est": False, "idle": True,
+        # WHOSE LOAD IS IT. NuSentry's advisor uses the same qwen3-vl model
+        # (its own 3 min keep-alive, calls 45-180 s apart); nuarr reading 90
+        # minutes ago is not why it is on the card now.
+        last_at = float(live.get("at") or 0)
+        owner = "nuarr" if last_at and now - last_at < KEEP_S + 30 else "NuSentry"
+        extra = {"eta_s": round(max(0, left)), "eta_est": False, "idle": True, "owner": owner,
                  "idle_left": int(max(0, left)), "vram_gb": round(vram / 1e9, 1),
                  "last_asked": int(live.get("asked") or 0), "last_got": int(live.get("got") or 0),
                  "last_at": float(live.get("at") or 0)}
@@ -443,7 +454,7 @@ def as_running() -> list:
              "file": shown or "(nothing read since nuarr started)",
              "stage": stage, "progress": pct, "elapsed_s": el, "eta_est": True,
              "plan": "the reader of last resort: a subtitle picture OCR doubted, read by a vision model",
-             "why_pool": "GPU through Ollama - loaded on demand, let go after three idle minutes",
+             "why_pool": "GPU through Ollama - loaded on demand, let go after a minute idle",
              "doing": {"tool": (live.get("model") or model()) if reading else model(), "hw": "GPU",
                        "why": "reading" if reading else "waiting to unload"},
              "disk": "", "dest_disk": "", "fps": 0.0, "speed": 0.0,
