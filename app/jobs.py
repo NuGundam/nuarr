@@ -7935,6 +7935,34 @@ def _filter_path(path: str) -> str:
     return esc(esc(path.replace("\\", "/"), "\\':"), "\\'[],;")
 
 
+def venc_tail(plan, tgt: dict, fam: str) -> list:
+    r"""The bitrate cap and the NVENC extras: what follows the quality flags.
+
+    ONE PLACE, BECAUSE THE SAMPLES MUST BE THE SAME ENCODE AS THE FILE. The
+    quality search used to encode its samples with the quality flags alone,
+    while the job added B-frames, spatial and temporal AQ and a 20-frame
+    lookahead. Measured on ZENSHU S01E03 (2026-11-14): the samples came out at
+    1.2 Mbps at CQ 27 and the file at 2.5 - the search was scoring, and
+    sizing, an encode nobody ran.
+    """
+    a: list = []
+    C = rules.CONFIG
+    src_mbps = getattr(plan, "source_mbps", 0) or 0
+    mf = float(tgt.get("maxrate_factor", C["maxrateFactor"]) or 0)
+    mfl = float(tgt.get("maxrate_floor_mbps", C["maxrateFloorMbps"]) or 0)
+    if mf > 0 and src_mbps > 0:
+        cap = max(src_mbps * mf, mfl)
+        a += ["-maxrate:v", f"{cap:.1f}M", "-bufsize", f"{cap * 2:.1f}M"]
+    # NVENC-ONLY EXTRAS. -b_ref_mode, -spatial-aq and -rc-lookahead are
+    # NVENC option names; libx265 rejects them outright and the encode
+    # dies before the first frame. They only ever meant "tune NVENC", so
+    # they only ever go to NVENC.
+    extra = tgt.get("extra") or C["nvencExtra"].get(plan.target or "h264", "")
+    if extra and fam == "nvenc":
+        a += shlex.split(extra)
+    return a
+
+
 def build_ffmpeg(src: str, dst: str, plan, duration: float,
                  probe: dict | None = None) -> list[str]:
     """Translate a plan into an ffmpeg command.
@@ -8123,19 +8151,9 @@ def build_ffmpeg(src: str, dst: str, plan, duration: float,
         # efficient source balloons, because NVENC needs more bits than x264 for
         # the same CQ. The source is the quality ceiling anyway - bits above
         # ~1.5x add nothing. Without this, "shrink" jobs came out 30-50% LARGER.
-        src_mbps = getattr(plan, "source_mbps", 0) or 0
-        mf = float(tgt.get("maxrate_factor", C["maxrateFactor"]) or 0)
-        mfl = float(tgt.get("maxrate_floor_mbps", C["maxrateFloorMbps"]) or 0)
-        if mf > 0 and src_mbps > 0:
-            cap = max(src_mbps * mf, mfl)
-            a += ["-maxrate:v", f"{cap:.1f}M", "-bufsize", f"{cap * 2:.1f}M"]
-        # NVENC-ONLY EXTRAS. -b_ref_mode, -spatial-aq and -rc-lookahead are
-        # NVENC option names; libx265 rejects them outright and the encode
-        # dies before the first frame. They only ever meant "tune NVENC", so
-        # they only ever go to NVENC.
-        extra = tgt.get("extra") or C["nvencExtra"].get(plan.target or "h264", "")
-        if extra and _fam == "nvenc":
-            a += shlex.split(extra)
+        # ... and the NVENC extras - see venc_tail, which the quality search's
+        # sample encodes use too, so both are the same encode.
+        a += venc_tail(plan, tgt, _fam)
     else:
         a += ["-map", "0:v:0", "-c:v", "copy"]
         # Remove the Dolby Vision RPU NAL so it direct-plays as HDR10. This is

@@ -327,7 +327,7 @@ def init() -> None:
         # real encode exists. NULL until then - and forever, for a file that
         # was searched before this existed or with the check switched off.
         for col in ("final_vmaf REAL", "final_vmaf_min REAL", "final_cambi REAL", "final_at REAL", "final_note TEXT",
-                    "final_samples TEXT", "vmaf_low REAL", "kind TEXT", "head REAL", "ssimu REAL"):
+                    "final_samples TEXT", "vmaf_low REAL", "kind TEXT", "head REAL", "ssimu REAL", "pred_saving REAL"):
             if col.split()[0] not in have:
                 cur.execute(f"ALTER TABLE vmaf_log ADD COLUMN {col}")
         # ONCE: a learned start CQ that only pre-fix searches taught (the
@@ -586,7 +586,8 @@ def _cut_reference_burned(ff, src, t, length, out, burn: int, image: bool, ten: 
     return rc == 0 and os.path.exists(out) and os.path.getsize(out) > 0
 
 
-def _encode_sample(ff, ref, family, codec, cq, preset, ten, out, card: bool = False, src10: bool = False) -> int:
+def _encode_sample(ff, ref, family, codec, cq, preset, ten, out, card: bool = False, src10: bool = False,
+                   tail: list | None = None) -> int:
     """One sample at one CQ, from the reference cut; its size in bytes (0 on failure).
 
     `card`: the reference is NVDEC-able and the frames stay on the card into
@@ -600,6 +601,8 @@ def _encode_sample(ff, ref, family, codec, cq, preset, ten, out, card: bool = Fa
     if card and ten and not src10:
         args += ["-vf", "scale_cuda=format=p010le"]
     args += encoders.video_args(family, codec, int(cq), preset, ten, card)
+    # the job's own bitrate cap and NVENC extras - see jobs.venc_tail
+    args += list(tail or [])
     args += [out]
     rc, err = _run(args, 300)
     return os.path.getsize(out) if rc == 0 and os.path.exists(out) else 0
@@ -682,6 +685,48 @@ def _ssimu(ref: str, enc: str) -> float | None:
             pass
 
 
+# ------------------------------------------------- will it be kept at all ----
+# A SIZE JOB THAT WILL NOT SAVE ENOUGH IS NOT WORTH ENCODING TO FIND OUT.
+# ZENSHU S01E03 (2026-11-14): six minutes of encode, 90 % of the original,
+# thrown away by the 20 % gate. The samples knew: encoded with the job's own
+# settings they were 1.63 Mbps against 1.77 Mbps of SOURCE IN THE SAME WINDOWS,
+# 8 % smaller; the whole file then came out 5-10 % smaller.
+#
+# THE SAME WINDOWS, not the file's average: the cuts avoid the credits and
+# landed on 1.77 Mbps of a 2.61 Mbps file, and comparing the samples with the
+# average is how a "56 % smaller" was predicted for that episode.
+#
+# The prediction is of the VIDEO alone; audio and subtitles are copied, so
+# the file saves a little less than this says. With PRED_MARGIN on top, an
+# encode is skipped only when the samples fall well short of the bar.
+PRED_MARGIN = 0.08
+
+
+def _src_window_bytes(src: str, t: float, length: float) -> int:
+    """Bytes of the source's video packets inside one sample window."""
+    try:
+        from . import jobs
+        fp = jobs._ffprobe_exe()
+        rc, out = _run([fp, "-v", "error", "-select_streams", "v:0", "-read_intervals", f"{t:.3f}%{t + length + 1.0:.3f}",
+                        "-show_entries", "packet=pts_time,size", "-of", "csv=p=0", src], 120)
+        if rc != 0:
+            return 0
+        # ONLY THE PACKETS INSIDE THE WINDOW. The read starts at the keyframe
+        # before `t`, which can be ten seconds earlier; counting those would
+        # make the source look bigger and every encode look like a saving.
+        n = 0
+        for line in out.splitlines():
+            a = line.strip().split(",")
+            try:
+                if len(a) >= 2 and t <= float(a[0]) < t + length:
+                    n += int(a[1])
+            except ValueError:
+                continue
+        return n
+    except Exception:                                    # noqa: BLE001
+        return 0
+
+
 # --------------------------------------------------------------- choose ----
 def skip_reason(plan, probe: dict | None, duration: float) -> str:
     if not getattr(plan, "encode", False):
@@ -742,6 +787,10 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
     if family == "cpu":
         lo, hi = max(lo, 14), min(hi, 34)
     ff = jobs._ffmpeg_exe()
+    try:
+        tail = jobs.venc_tail(plan, venc, family)
+    except Exception:                                    # noqa: BLE001
+        tail = []
     try:
         from .langpolicy import kind_for
         kind = kind_for(path=src, library=library or "")
@@ -855,7 +904,7 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
             _report(f"CQ {cq}: sample {k + 1}/{len(refs)}", 1 + len(tried) + k / len(refs))
             out = os.path.join(work_dir, f"enc-{cq}-{k}.mkv")
             try:
-                sz = _encode_sample(ff, ref, family, codec, cq, preset, ten, out, card, src10)
+                sz = _encode_sample(ff, ref, family, codec, cq, preset, ten, out, card, src10, tail)
                 if not sz:
                     raise RuntimeError("sample encode failed")
                 sc = _score(ff, ref, out, ten, threads, card)
@@ -947,6 +996,27 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
                 # library's own setting is better left at it than inflated.
                 best = fixed
         chosen = tried.get(best) or probe_cq(best)
+        # WILL THE RESULT BE KEPT? - see _src_window_bytes. Only where the job
+        # is judged on size: a compatibility rebuild has to happen anyway.
+        pred = need = None
+        try:
+            need = float(venc.get("min_saving") or 0) or (0.0 if getattr(plan, "grow_ok", False) else float(jobs.MIN_SAVING))
+            if need and getattr(plan, "burn_index", None) is None:
+                _report("comparing the samples with the source's own size", 1 + len(tried))
+                src_win = 0
+                for ref in refs:
+                    if ref == dark_ref:
+                        continue
+                    k0 = int(os.path.basename(ref)[4:-4])
+                    b0 = _src_window_bytes(src, times[k0], length)
+                    if not b0:
+                        src_win = 0
+                        break
+                    src_win += b0
+                if src_win and chosen.get("size"):
+                    pred = round(1.0 - chosen["size"] / src_win, 3)
+        except Exception:                                # noqa: BLE001
+            pred = None
         # A SCORE THAT CANNOT BE RIGHT IS A BROKEN MEASUREMENT, not a verdict.
         # A modern encoder at the library's CQ does not score under 70 on a
         # clean source; when the library's CQ (or the start point) does, the
@@ -962,6 +1032,8 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
         secs = round(time.time() - t0, 1)
         note = ("reached the target" if chosen["ok"] else
                 f"could not reach {aim:g} ({tried[best]['fail'] if best in tried else 'target'}) within CQ {lo}-{hi}")
+        if pred is not None:
+            note += f" · samples {abs(pred) * 100:.0f}% {'smaller' if pred >= 0 else 'LARGER'} than the source there"
         if chosen.get("ssimu") is not None:
             note += f" · SSIMULACRA2 {chosen['ssimu']:g}" + (f" (floor {s2_floor:g})" if s2_floor else "")
         if dark:
@@ -985,11 +1057,12 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
                 pass
         with cursor() as cur:
             cur.execute("INSERT INTO vmaf_log(at,file_id,job_id,path,library,target,family,cq_fixed,cq_chosen,"
-                        "vmaf,vmaf_min,want,saved_pct,probes,secs,note,cambi,vmaf_low,kind,head,ssimu) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "vmaf,vmaf_min,want,saved_pct,probes,secs,note,cambi,vmaf_low,kind,head,ssimu,pred_saving) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (time.time(), file_id, job_id, src, library, target, family, fixed, best,
                          chosen["vmaf"], chosen["worst"], want, saved, len(tried), secs, note, chosen["cambi"],
-                         chosen["low"], kind, head, chosen.get("ssimu")))
+                         chosen["low"], kind, head, chosen.get("ssimu"),
+                         None if pred is None else round(pred * 100, 1)))
         # AN ENCODE THAT BANDS AT EVERY CQ DAMAGES THE PICTURE. For a size job
         # that is a reason not to encode: the caller keeps the original. A
         # compatibility rebuild still has to happen and goes at the library CQ.
@@ -997,9 +1070,17 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
         if not chosen["ok"] and chosen.get("fail") == "banding" and not getattr(plan, "grow_ok", False):
             refuse = (f"the encode adds banding at every CQ tried ({chosen['cambi']} against the source's "
                       f"{chosen.get('src_cambi')}) - original kept")
+        # "discarded" is the word hevcconvert.gave_up() looks for, so the
+        # planner does not ask for this conversion again.
+        if not refuse and pred is not None and need and pred < need - PRED_MARGIN:
+            refuse = (f"at CQ {best} the samples are only {max(pred, 0) * 100:.0f}% smaller than the source in the same "
+                      f"windows{' (they are LARGER)' if pred < 0 else ''}; it has to save {need * 100:.0f}% to be kept, "
+                      f"so the encode would be discarded - not run, original kept")
+            keep_refs[0] = False
         return {"cq": best, "fixed": fixed, "vmaf": chosen["vmaf"], "worst": chosen["worst"], "saved": saved,
                 "cambi": chosen["cambi"], "low": chosen["low"], "kind": kind, "head": head, "want": want,
                 "refuse": refuse, "ssimu": chosen.get("ssimu"), "ssimu_floor": s2_floor,
+                "pred_saving": None if pred is None else round(pred * 100, 1),
                 "probes": len(tried), "secs": secs, "note": note,
                 "src_cambi": chosen.get("src_cambi"), "band_added": chosen.get("band_added"),
                 "dark": (dark or {}).get("t"), "dark_risk": (dark or {}).get("risk"),
@@ -1280,7 +1361,7 @@ def snapshot() -> dict:
     with cursor() as cur:
         rows = [dict(r) for r in cur.execute(
             "SELECT at,file_id,job_id,path,library,target,family,cq_fixed,cq_chosen,vmaf,vmaf_min,vmaf_low,kind,head,want,"
-            "saved_pct,probes,secs,note,cambi,final_vmaf,final_vmaf_min,final_cambi,final_note,ssimu FROM vmaf_log "
+            "saved_pct,probes,secs,note,cambi,final_vmaf,final_vmaf_min,final_cambi,final_note,ssimu,pred_saving FROM vmaf_log "
             "ORDER BY id DESC LIMIT 100")]
         # BEFORE AND AFTER. The job row has the real file sizes, and the plan
         # text the search wrote has the source's banding ("banding 1.2 (source

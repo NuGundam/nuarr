@@ -35952,6 +35952,8 @@ function vmafRow(r,sz){
     <td class="mono" title="${esc(vmafTip(r))}">${vmafCellV(r)}</td>
     <td class="mono" title="banding (CAMBI) - under 5 is not visible; an encode should add no more than about 1 to the source's own">${vmafCellB(r)}</td>
     <td class="mono" title="SSIMULACRA2 - a second opinion on fine detail (grain, line texture) that VMAF does not mind losing. 70 is high quality, 80 very high, 90 visually lossless. Measured on the samples, only where the kind has a floor set.">${r.ssimu==null?'<span class="dim">—</span>':vmNum((+r.ssimu).toFixed(1), r.ssimu>=80?'good':r.ssimu>=70?'mid':'bad', false)}</td>
+    <td class="mono" title="what the samples predict for the VIDEO: the sample encodes against the source's own size in the same windows. A size job well short of what it must save is not encoded. Audio and subtitles are copied, so the file saves a little less.">${r.pred_saving==null?'<span class="dim">—</span>'
+        :`<span style="color:${r.pred_saving>=20?'var(--ok)':r.pred_saving>=0?'var(--warn)':'#ff7b72'}">${Math.abs(r.pred_saving).toFixed(0)}% ${r.pred_saving>=0?'smaller':'larger'}</span>`}</td>
     <td class="mono">${vmafSizes(r)}</td><td>${sz(r.saved_pct)}</td>
     <td class="dim">${r.probes} · ${Math.round(r.secs)}s</td>
     <td class="vmafWhen" style="white-space:nowrap" title="${esc(new Date(r.at*1000).toLocaleString())}" data-ago="${r.at}">${esc(agoFine(r.at))}</td></tr>`;
@@ -36067,7 +36069,7 @@ async function loadVmaf(){
       <style>.vmafTbl td{white-space:nowrap;padding:4px 6px}.vmafTbl td:first-child{width:100%;max-width:0;overflow:hidden;text-overflow:ellipsis;padding-left:8px}
         @keyframes vmafNew{from{background:rgba(111,176,255,.22)}to{background:transparent}}.vmafNew td{animation:vmafNew 2.5s ease-out}</style>
       <table class="vmafTbl" style="width:100%;border-collapse:collapse">
-        <tr class="dim" style="font-size:10.5px;position:sticky;top:0;background:var(--panel);z-index:1"><td style="padding:5px 8px">FILE</td><td>CQ</td><td>VMAF <span style="font-weight:400">samples → final</span></td><td>BANDING <span style="font-weight:400">source → samples → final</span></td><td>DETAIL <span style="font-weight:400">SSIMULACRA2</span></td><td>FILE SIZE</td><td>VS FIXED CQ</td><td>PROBES · TIME</td><td>WHEN</td></tr>
+        <tr class="dim" style="font-size:10.5px;position:sticky;top:0;background:var(--panel);z-index:1"><td style="padding:5px 8px">FILE</td><td>CQ</td><td>VMAF <span style="font-weight:400">samples → final</span></td><td>BANDING <span style="font-weight:400">source → samples → final</span></td><td>DETAIL <span style="font-weight:400">SSIMULACRA2</span></td><td>PREDICTED <span style="font-weight:400">vs source</span></td><td>FILE SIZE</td><td>VS FIXED CQ</td><td>PROBES · TIME</td><td>WHEN</td></tr>
         ${d.recent.map(r=>vmafRow(r,sz)).join('')}
       </table></div></details>`:''}
   </div>`;
