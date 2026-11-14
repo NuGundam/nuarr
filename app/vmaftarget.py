@@ -50,6 +50,15 @@ DEFAULTS = {"on": True, "target": 95.0, "samples": 4, "sample_s": 6.0, "floor": 
             # mean hides a bad second: the 5th-percentile frame across all the
             # samples may sit at most this far under the target.
             "low": 5.0,
+            # A SECOND OPINION ON DETAIL: the samples' mean SSIMULACRA2 must be
+            # at least this (0 = not measured). VMAF does not mind grain and
+            # line texture being smoothed away; SSIMULACRA2 does. Measured on
+            # 20 lean anime episodes (2026-11-14): at VMAF 95 the digital shows
+            # scored 79-84, the cel-era ones (Sailor Moon, Dragon Ball Z,
+            # Gundam Wing) 71 at CQ 31-32, worst frames 45-55. 70 is "high
+            # quality", 80 "very high", 90 visually lossless. Off here and set
+            # per kind: untested on live action, where grain reads low.
+            "ssimu": 0.0,
             # ONE BAR DOES NOT FIT EVERY KIND. VMAF reads a flat cel the same
             # as grainy film, but the viewer does not: film needs its worst
             # moments held closer. Each kind (langpolicy: anime / animation /
@@ -68,7 +77,7 @@ DEFAULTS = {"on": True, "target": 95.0, "samples": 4, "sample_s": 6.0, "floor": 
             # before it is committed - see verify_final()
             "verify": True}
 KINDS = ("anime", "animation", "live")
-KIND_KEYS = ("target", "floor", "low", "banding")
+KIND_KEYS = ("target", "floor", "low", "banding", "ssimu")
 CQ_DOWN = 4            # at most this many CQ steps BELOW the library's CQ
 CQ_UP = 14             # at most this many above it (was 10; burn-heavy anime passed VMAF 96-98 at the old cap of +10)
 MIN_MINUTES = 4.0
@@ -165,6 +174,8 @@ def _clamp(k: str, v):
         return max(0.0, min(20.0, float(v)))
     if k == "banding":
         return max(1.0, min(20.0, float(v)))
+    if k == "ssimu":
+        return max(0.0, min(95.0, float(v)))
     return v
 
 
@@ -316,7 +327,7 @@ def init() -> None:
         # real encode exists. NULL until then - and forever, for a file that
         # was searched before this existed or with the check switched off.
         for col in ("final_vmaf REAL", "final_vmaf_min REAL", "final_cambi REAL", "final_at REAL", "final_note TEXT",
-                    "final_samples TEXT", "vmaf_low REAL", "kind TEXT", "head REAL"):
+                    "final_samples TEXT", "vmaf_low REAL", "kind TEXT", "head REAL", "ssimu REAL"):
             if col.split()[0] not in have:
                 cur.execute(f"ALTER TABLE vmaf_log ADD COLUMN {col}")
         # ONCE: a learned start CQ that only pre-fix searches taught (the
@@ -634,6 +645,43 @@ def _score(ff, ref, enc, ten, threads, card: bool = False) -> tuple[float, float
             pass
 
 
+# ---------------------------------------------------------- SSIMULACRA2 ----
+# Vship's FFVship (MIT, codeberg.org/Line-fr/Vship) scores two clips on the
+# card: 144 frames in about 2.5 s. It is an outside tool, so everything here
+# answers None when it is missing or fails and the search goes on without it.
+_VSHIP = {"warned": False}
+
+
+def vship_exe() -> str | None:
+    exe = os.path.join(os.environ.get("ProgramData") or "C:/ProgramData", "nuarr", "vship", "FFVship.exe")
+    return exe if os.path.exists(exe) else None
+
+
+def _ssimu(ref: str, enc: str) -> float | None:
+    """Mean SSIMULACRA2 of an encoded sample against its reference cut."""
+    exe = vship_exe()
+    if not exe:
+        if not _VSHIP["warned"]:
+            _VSHIP["warned"] = True
+            joblog.log("VMAF target: SSIMULACRA2 is asked for but FFVship.exe is not in ProgramData/nuarr/vship - "
+                       "searching without it", "warn")
+        return None
+    log = enc + ".s2.json"
+    try:
+        rc, err = _run([exe, "-s", ref, "-e", enc, "-m", "SSIMULACRA2", "--json", log], 180)
+        if rc != 0 or not os.path.exists(log):
+            return None
+        xs = [float(x[0]) for x in json.load(open(log, encoding="utf-8")) if x]
+        return sum(xs) / len(xs) if xs else None
+    except Exception:                                    # noqa: BLE001
+        return None
+    finally:
+        try:
+            os.remove(log)
+        except OSError:
+            pass
+
+
 # --------------------------------------------------------------- choose ----
 def skip_reason(plan, probe: dict | None, duration: float) -> str:
     if not getattr(plan, "encode", False):
@@ -701,6 +749,7 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
         kind = "live"
     kc = for_kind(c, kind)
     want, floor, banding, low_floor = float(kc["target"]), float(kc["floor"]), float(kc["banding"]), float(kc["low"])
+    s2_floor = float(kc.get("ssimu") or 0.0)
     head = headroom(library, is_dvd(src)) if c.get("headroom") else 0.0
     aim = want + head                       # what the samples must reach for the file to land on `want`
     n, length = int(c["samples"]), float(c["sample_s"])
@@ -749,7 +798,7 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
         if not tick:
             return
         total = 1 + est["probes"]                    # 1 unit for cutting, 1 per probe
-        info = {"tried": sorted(({"cq": k2, "vmaf": v["vmaf"], "cambi": v["cambi"], "ok": v["ok"]}
+        info = {"tried": sorted(({"cq": k2, "vmaf": v["vmaf"], "cambi": v["cambi"], "ok": v["ok"], "ssimu": v.get("ssimu")}
                                  for k2, v in tried.items()), key=lambda x: x["cq"]),
                 "want": want, "banding": banding, "probes_est": est["probes"],
                 "kind": kind, "head": head, "low": low_floor, "floor": floor,
@@ -800,7 +849,7 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
         if cq in tried:
             return tried[cq]
         STATE[job_id].update(probe=len(tried) + 1, cq=cq)
-        sizes, means, lows, bands = 0, [], [], []
+        sizes, means, lows, bands, s2s = 0, [], [], [], []
         est["probes"] = max(est["probes"], len(tried) + 1)
         for k, ref in enumerate(refs):
             _report(f"CQ {cq}: sample {k + 1}/{len(refs)}", 1 + len(tried) + k / len(refs))
@@ -817,6 +866,10 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
                     sizes += sz
                     means.append(sc[0])
                     lows.append(sc[1])
+                    if s2_floor > 0:
+                        s2 = _ssimu(ref, out)
+                        if s2 is not None:
+                            s2s.append(s2)
             finally:
                 try:
                     os.remove(out)
@@ -832,12 +885,18 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
         # people notice - AND no sample bands visibly.
         band_ok = all(b <= max(banding, sb + BAND_MARGIN)
                       for b, sb in zip(bands, src_band or [0.0] * len(bands)))
+        # ... AND, where a kind asks for it, the samples' mean SSIMULACRA2 holds
+        # the floor. A sample the tool could not score leaves the gate open:
+        # a missing second opinion is not a failed one.
+        r["ssimu"] = round(statistics.mean(s2s), 2) if s2s and len(s2s) == len(means) else None
+        s2_ok = r["ssimu"] is None or r["ssimu"] >= s2_floor
         r["ok"] = (r["vmaf"] >= aim and r["worst"] >= aim - floor
-                   and r["low"] >= aim - low_floor and band_ok)
+                   and r["low"] >= aim - low_floor and band_ok and s2_ok)
         r["fail"] = ("" if r["ok"] else
                      "banding" if not band_ok else
                      "mean" if r["vmaf"] < aim else
-                     "worst sample" if r["worst"] < aim - floor else "worst frame")
+                     "worst sample" if r["worst"] < aim - floor else
+                     "worst frame" if r["low"] < aim - low_floor else "detail")
         tried[cq] = r
         return r
 
@@ -901,6 +960,8 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
         secs = round(time.time() - t0, 1)
         note = ("reached the target" if chosen["ok"] else
                 f"could not reach {aim:g} ({tried[best]['fail'] if best in tried else 'target'}) within CQ {lo}-{hi}")
+        if chosen.get("ssimu") is not None:
+            note += f" · SSIMULACRA2 {chosen['ssimu']:g}" + (f" (floor {s2_floor:g})" if s2_floor else "")
         if dark:
             note += f" · dark scene sampled at {int(dark['t'] // 60)}:{int(dark['t'] % 60):02d}"
         _remember(library, target, family, best)
@@ -922,11 +983,11 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
                 pass
         with cursor() as cur:
             cur.execute("INSERT INTO vmaf_log(at,file_id,job_id,path,library,target,family,cq_fixed,cq_chosen,"
-                        "vmaf,vmaf_min,want,saved_pct,probes,secs,note,cambi,vmaf_low,kind,head) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "vmaf,vmaf_min,want,saved_pct,probes,secs,note,cambi,vmaf_low,kind,head,ssimu) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (time.time(), file_id, job_id, src, library, target, family, fixed, best,
                          chosen["vmaf"], chosen["worst"], want, saved, len(tried), secs, note, chosen["cambi"],
-                         chosen["low"], kind, head))
+                         chosen["low"], kind, head, chosen.get("ssimu")))
         # AN ENCODE THAT BANDS AT EVERY CQ DAMAGES THE PICTURE. For a size job
         # that is a reason not to encode: the caller keeps the original. A
         # compatibility rebuild still has to happen and goes at the library CQ.
@@ -936,12 +997,12 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
                       f"{chosen.get('src_cambi')}) - original kept")
         return {"cq": best, "fixed": fixed, "vmaf": chosen["vmaf"], "worst": chosen["worst"], "saved": saved,
                 "cambi": chosen["cambi"], "low": chosen["low"], "kind": kind, "head": head, "want": want,
-                "refuse": refuse,
+                "refuse": refuse, "ssimu": chosen.get("ssimu"),
                 "probes": len(tried), "secs": secs, "note": note,
                 "src_cambi": chosen.get("src_cambi"), "band_added": chosen.get("band_added"),
                 "dark": (dark or {}).get("t"), "dark_risk": (dark or {}).get("risk"),
                 "tried": sorted(({"cq": k, "vmaf": v["vmaf"], "worst": v["worst"], "low": v["low"], "cambi": v["cambi"],
-                                  "ok": v["ok"], "fail": v.get("fail", "")}
+                                  "ok": v["ok"], "fail": v.get("fail", ""), "ssimu": v.get("ssimu")}
                                  for k, v in tried.items()), key=lambda x: x["cq"])}
     except Exception as e:                               # noqa: BLE001
         joblog.log(f"VMAF search failed ({type(e).__name__}: {e}) - encoding at the library's CQ {fixed}",
@@ -1217,7 +1278,7 @@ def snapshot() -> dict:
     with cursor() as cur:
         rows = [dict(r) for r in cur.execute(
             "SELECT at,file_id,job_id,path,library,target,family,cq_fixed,cq_chosen,vmaf,vmaf_min,vmaf_low,kind,head,want,"
-            "saved_pct,probes,secs,note,cambi,final_vmaf,final_vmaf_min,final_cambi,final_note FROM vmaf_log "
+            "saved_pct,probes,secs,note,cambi,final_vmaf,final_vmaf_min,final_cambi,final_note,ssimu FROM vmaf_log "
             "ORDER BY id DESC LIMIT 100")]
         # BEFORE AND AFTER. The job row has the real file sizes, and the plan
         # text the search wrote has the source's banding ("banding 1.2 (source

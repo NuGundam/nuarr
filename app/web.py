@@ -11887,10 +11887,10 @@ def api_vmaf_cfg(on: int = -1, target: float = 0, samples: int = 0, floor: float
 
 
 @app.post("/api/vmaf/kind/{kind}")
-def api_vmaf_kind(kind: str, target: str = "", floor: str = "", low: str = "", banding: str = ""):
+def api_vmaf_kind(kind: str, target: str = "-", floor: str = "-", low: str = "-", banding: str = "-", ssimu: str = "-"):
     """One kind's overrides. A blank value clears that figure back to the global one."""
     from . import vmaftarget
-    sent = {k: v for k, v in (("target", target), ("floor", floor), ("low", low), ("banding", banding)) if v != "-"}
+    sent = {k: v for k, v in (("target", target), ("floor", floor), ("low", low), ("banding", banding), ("ssimu", ssimu)) if v != "-"}
     c = vmaftarget.set_kind(kind, **sent)
     joblog.log(f"VMAF target for {kind}: {vmaftarget.for_kind(c, kind)}", "info")
     return c
@@ -25843,7 +25843,7 @@ function vmafCell(w){
     const sv = r.saved;
     const svt = sv==null ? '' : (sv>=0 ? `<span style="color:#7fd4a3">samples ${sv.toFixed(0)}% smaller</span> than at CQ ${r.fixed}`
                                        : `<span style="color:#ff7b72">samples ${(-sv).toFixed(0)}% larger</span> than at CQ ${r.fixed}`);
-    const chips = (r.tried||[]).map(t => `<span class="vmafcq" title="CQ ${t.cq}: VMAF ${t.vmaf}, worst sample ${t.worst}${t.low!=null?`, worst frame ${t.low}`:''}, banding ${t.cambi}${t.fail?` - failed on ${t.fail}`:''}"
+    const chips = (r.tried||[]).map(t => `<span class="vmafcq" title="CQ ${t.cq}: VMAF ${t.vmaf}, worst sample ${t.worst}${t.low!=null?`, worst frame ${t.low}`:''}, banding ${t.cambi}${t.ssimu!=null?`, SSIMULACRA2 ${t.ssimu}`:''}${t.fail?` - failed on ${t.fail}`:''}"
         style="color:${t.ok?'#7fd4a3':'#e0575b'};border-color:${t.ok?'rgba(127,212,163,.45)':'rgba(224,87,91,.45)'};${t.cq===r.cq?'font-weight:700;background:rgba(162,224,94,.12)':''}">CQ ${t.cq} ${t.ok?'✓':'✗'} ${t.vmaf}${t.fail?` <span style="font-size:9.5px;opacity:.8">${t.fail}</span>`:''}</span>`).join('');
     return `<div class="socr vmafrow">
       <span class="pill" style="color:${col};border-color:${col}">quality ✓</span>
@@ -36484,10 +36484,10 @@ function vmafKindsHtml(d){
       onchange="vmafKind('${k}','${f}',this.value)"></td>`;
   const heads=Object.entries(d.headroom||{}).filter(([l,h])=>h>0).map(([l,h])=>`${esc(l)} +${h}`).join(' · ');
   return `<table style="font-size:11px;border-collapse:collapse;margin-top:6px">
-    <tr class="dim" style="font-size:10.5px"><td style="padding:2px 8px 2px 0">KIND</td><td>TARGET</td><td>WORST SAMPLE WITHIN</td><td>WORST FRAME WITHIN</td><td>BANDING AT MOST</td><td style="padding-left:10px">MUST SCORE</td></tr>
+    <tr class="dim" style="font-size:10.5px"><td style="padding:2px 8px 2px 0">KIND</td><td>TARGET</td><td>WORST SAMPLE WITHIN</td><td>WORST FRAME WITHIN</td><td>BANDING AT MOST</td><td title="SSIMULACRA2, a second opinion on detail: the samples' mean must reach this. 70 is high quality, 80 very high, 90 visually lossless. Empty or 0 = not measured.">DETAIL AT LEAST</td><td style="padding-left:10px">MUST SCORE</td></tr>
     ${['anime','animation','live'].map(k=>`<tr><td style="padding:2px 8px 2px 0"><b>${k}</b></td>
-      ${cell(k,'target',80,99,0.5)}${cell(k,'floor',0,10,0.5)}${cell(k,'low',0,20,0.5)}${cell(k,'banding',1,20,0.5)}
-      <td class="mono dim" style="padding-left:10px">mean ≥ ${K[k].target} · sample ≥ ${(K[k].target-K[k].floor).toFixed(1)} · frame ≥ ${(K[k].target-K[k].low).toFixed(1)}</td></tr>`).join('')}
+      ${cell(k,'target',80,99,0.5)}${cell(k,'floor',0,10,0.5)}${cell(k,'low',0,20,0.5)}${cell(k,'banding',1,20,0.5)}${cell(k,'ssimu',0,95,1)}
+      <td class="mono dim" style="padding-left:10px">mean ≥ ${K[k].target} · sample ≥ ${(K[k].target-K[k].floor).toFixed(1)} · frame ≥ ${(K[k].target-K[k].low).toFixed(1)}${K[k].ssimu>0?' · SSIMULACRA2 ≥ '+K[k].ssimu:''}</td></tr>`).join('')}
   </table>${heads?`<div class="dim" style="font-size:10.5px;margin-top:3px">headroom now: ${heads}</div>`:''}`;
 }
 async function vmafKind(kind, f, v){
@@ -48287,7 +48287,7 @@ function codecSet(lib,side,key,val,on){
     // just because two equivalent selections sorted differently.
     cur[key]=f.choices.filter(c=>s.has(c));
   }else if(f.type==='int'){
-    let n=parseInt(val,10);
+    let n=f.frac?Math.round(parseFloat(val)*10)/10:parseInt(val,10);
     if(isNaN(n)) n=f.default;
     cur[key]=Math.max(f.min,Math.min(f.max,n));
   }else if(f.type==='bool'){
@@ -48366,7 +48366,7 @@ function codecStep(lib,side,key,dir){
   const cur=((_cod.policy||{})[lib]||{})[side];
   const f=((_cod.fields||{})[side]||[]).find(x=>x.key===key);
   if(!cur||!f) return;
-  codecSet(lib,side,key,(parseInt(cur[key],10)||0)+dir*(f.step||1));
+  codecSet(lib,side,key,(parseFloat(cur[key])||0)+dir*(f.step||1));
 }
 
 async function codecReset(lib,side,key){

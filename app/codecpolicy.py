@@ -229,14 +229,14 @@ FIELDS: dict[str, list[dict]] = {
                  "penalise x265 - the Anime profile rewards it; the Nu "
                  "profiles score sub-4K x265 from non-tier groups -999999."},
         {"parent": "hevc10_convert", "key": "hevc10_1080_mbps", "label": "Convert from — 1080p",
-         "type": "int", "min": 1, "max": 100, "step": 1, "default": 4, "unit": "Mbps",
+         "type": "int", "min": 0.5, "max": 100, "step": 0.5, "frac": True, "default": 4, "unit": "Mbps",
          "what": "8-bit H.264 at 1080p below this is left alone: it is already "
                  "lean, has little to give, and a re-encode costs a generation."},
         {"parent": "hevc10_convert", "key": "hevc10_720_mbps", "label": "Convert from — 720p",
-         "type": "int", "min": 1, "max": 100, "step": 1, "default": 3, "unit": "Mbps",
+         "type": "int", "min": 0.5, "max": 100, "step": 0.5, "frac": True, "default": 3, "unit": "Mbps",
          "what": "The same floor for 720p."},
         {"parent": "hevc10_convert", "key": "hevc10_sd_mbps", "label": "Convert from — SD",
-         "type": "int", "min": 1, "max": 100, "step": 1, "default": 2, "unit": "Mbps",
+         "type": "int", "min": 0.5, "max": 100, "step": 0.5, "frac": True, "default": 2, "unit": "Mbps",
          "what": "The same floor for SD."},
     ],
     "audio": [
@@ -430,7 +430,8 @@ def _coerce(field: dict, value):
                 return value.strip().lower() in ("1", "true", "yes", "on")
             return bool(value)
         if t == "int":
-            n = int(round(float(value)))
+            # "frac": a figure that takes halves (a bitrate floor of 2.5 Mbps)
+            n = round(float(value), 1) if field.get("frac") else int(round(float(value)))
             lo, hi = field.get("min"), field.get("max")
             if lo is not None:
                 n = max(lo, n)
