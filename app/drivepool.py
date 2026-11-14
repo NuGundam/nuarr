@@ -1019,15 +1019,23 @@ def _tgt_history_save(v: dict) -> None:
 
 
 def _read_targets() -> dict:
-    import base64
     import json as _j
     import subprocess
+    import tempfile
     script = _PS_TARGETS % {"install": INSTALL, "store": STORE}
-    enc = base64.b64encode(script.encode("utf-16-le")).decode()
-    out = subprocess.run(
-        ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-         "-EncodedCommand", enc],
-        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, creationflags=0x08000000)
+    # a .ps1 file, not -EncodedCommand: an encoded command line is what malware uses and what NuSentry flags
+    fd, path = tempfile.mkstemp(prefix="nuarr_dp_", suffix=".ps1")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8-sig") as fh:
+            fh.write(script)
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, creationflags=0x08000000)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
     txt = (out.stdout or "").strip()
     if not txt:
         raise RuntimeError((out.stderr or "no output").strip()[:200])

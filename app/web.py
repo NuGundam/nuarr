@@ -36026,7 +36026,7 @@ async function loadVmaf(){
       Left at the library's CQ: a burned-in subtitle, HDR, anything under ${b.min_minutes} minutes. The output is an ordinary file - playback is unchanged.</div>
     <div id="vmafRun">${run}</div>
     <div style="display:flex;gap:18px;flex-wrap:wrap;font-size:11.5px;margin-top:8px">
-      <span><b>${fmt(d.count)}</b> <span class="dim">files measured</span></span>
+      <span><b>${fmt(d.count)}</b> <span class="dim">files measured</span>${d.hidden_prefix?` <span class="dim" title="Searches made before the 3 Nov 2026 scorer fix, when frame slips read good encodes as poor. Still in the last-100 list; left out of these figures and the table.">(${fmt(d.hidden_prefix)} older searches left out - before the scorer fix)</span>`:''}</span>
       <span><span class="dim">samples vs the fixed CQ:</span> ${sz(d.avg_saved)}</span>
       <span><span class="dim">CQ moved</span> <b>${d.avg_shift==null?'—':(d.avg_shift>0?'+':'')+d.avg_shift}</b> <span class="dim">on average</span></span>
       <span class="dim">${d.count?`${d.avg_probes} probes · ${d.avg_secs}s per file`:''}</span>

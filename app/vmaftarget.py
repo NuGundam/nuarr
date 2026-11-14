@@ -319,6 +319,20 @@ def init() -> None:
                     "final_samples TEXT", "vmaf_low REAL", "kind TEXT", "head REAL"):
             if col.split()[0] not in have:
                 cur.execute(f"ALTER TABLE vmaf_log ADD COLUMN {col}")
+        # ONCE: a learned start CQ that only pre-fix searches taught (the
+        # scorer's frame slips) would start the next such encode at a CQ the
+        # broken scores chose - Anime Shows h264 at 17. Drop those groups; any
+        # group with a search after the fix keeps what it learned.
+        if not kv_get("vmaf.learn_prefix_dropped"):
+            keep = {_lkey(r["library"], r["target"], r["family"]) for r in cur.execute(
+                "SELECT DISTINCT library, target, family FROM vmaf_log WHERE at >= ?", (SCORER_FIXED_AT,))}
+            d = _learn()
+            gone = [k for k in d if k not in keep]
+            for k in gone:
+                d.pop(k, None)
+            if gone:
+                kv_set(KV_LEARN, json.dumps(d))
+            kv_set("vmaf.learn_prefix_dropped", json.dumps({"at": time.time(), "dropped": gone}))
 
 
 def _learn() -> dict:
@@ -1214,11 +1228,19 @@ def snapshot() -> dict:
             ph = ",".join("?" * len(ids))
             jobs_by = {j["job_id"]: dict(j) for j in cur.execute(
                 f"SELECT job_id,state,size_before,size_after,plan_json FROM jobs WHERE job_id IN ({ph})", ids)}
+        # ONLY SEARCHES THE FIXED SCORER MADE. Before SCORER_FIXED_AT a frame
+        # slip read good encodes as poor, so those searches pushed CQ down for
+        # nothing: an "Anime Shows h264 - 57% larger" row (three episodes of
+        # 2026-10-21) and "Animated Shows h264 - 0% smaller" (Sonic Underground
+        # DVDs) stood in the table for groups nothing encodes any more. They
+        # stay in vmaf_log and in the last-100 list; the averages skip them.
         tot = cur.execute("SELECT COUNT(*) n, AVG(saved_pct) s, AVG(secs) t, AVG(probes) p, "
-                          "AVG(cq_chosen - cq_fixed) d FROM vmaf_log").fetchone()
+                          "AVG(cq_chosen - cq_fixed) d FROM vmaf_log WHERE at >= ?", (SCORER_FIXED_AT,)).fetchone()
+        hidden = cur.execute("SELECT COUNT(*) n FROM vmaf_log WHERE at < ?", (SCORER_FIXED_AT,)).fetchone()["n"]
         by = [dict(r) for r in cur.execute(
             "SELECT library, target, family, COUNT(*) n, AVG(cq_chosen) cq, AVG(cq_fixed) fixed, "
-            "AVG(saved_pct) saved, AVG(vmaf) vmaf FROM vmaf_log GROUP BY library, target, family ORDER BY n DESC")]
+            "AVG(saved_pct) saved, AVG(vmaf) vmaf FROM vmaf_log WHERE at >= ? "
+            "GROUP BY library, target, family ORDER BY n DESC", (SCORER_FIXED_AT,))]
     for r in rows:
         r["name"] = os.path.basename(r.pop("path") or "")
         j = jobs_by.get(r.pop("job_id", None)) or {}
@@ -1244,7 +1266,7 @@ def snapshot() -> dict:
     except Exception:                                    # noqa: BLE001
         pass
     return {"cfg": c, "kinds": {k: for_kind(c, k) for k in KINDS}, "headroom": heads,
-            "recent": rows, "count": int(tot["n"] or 0),
+            "recent": rows, "count": int(tot["n"] or 0), "hidden_prefix": int(hidden or 0),
             "avg_saved": round(tot["s"], 1) if tot["s"] is not None else None,
             "avg_secs": round(tot["t"] or 0, 1), "avg_probes": round(tot["p"] or 0, 1),
             "avg_shift": round(tot["d"], 1) if tot["d"] is not None else None,
