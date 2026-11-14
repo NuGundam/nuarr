@@ -214,9 +214,32 @@ def candidates(force: bool = False) -> list:
             if (wants(r["library"], vs.get("codec_name") or "", ten, hdr, r["height"] or 0, mbps)
                     or trial(r["id"], vs.get("codec_name") or "", ten, hdr)):
                 out.append({"id": r["id"], "path": r["path"], "title": r["title"] or "",
-                            "mbps": round(mbps, 2), "gb": r["size"] / 1e9, "disk": r["pool_disk"] or ""})
+                            "mbps": round(mbps, 2), "gb": r["size"] / 1e9, "disk": r["pool_disk"] or "",
+                            "library": r["library"] or ""})
     out.sort(key=lambda x: -x["mbps"])
     STATE.update(cands=out, cand_at=time.time())
+    return out
+
+
+def left_list() -> list:
+    """The files behind the panel's "left" figure, in the order they will be
+    taken: the ones encoding, the ones queued, then the backlog (highest
+    bitrate first)."""
+    out = []
+    with cursor() as cur:
+        for r in cur.execute(
+                "SELECT j.state, f.id, f.path, f.title, f.size, f.duration, f.pool_disk, f.library "
+                "FROM jobs j JOIN files f ON f.id=j.file_id "
+                "WHERE (j.source=? OR j.plan_json LIKE ?) AND j.state IN ('queued','running') "
+                "ORDER BY j.state='running' DESC, j.priority DESC, j.id", (SOURCE, PLAN_MARK)):
+            mbps = (r["size"] or 0) * 8 / r["duration"] / 1e6 if r["duration"] else 0
+            out.append({"id": r["id"], "path": r["path"], "title": r["title"] or "", "state": r["state"],
+                        "mbps": round(mbps, 2), "gb": round((r["size"] or 0) / 1e9, 2),
+                        "disk": r["pool_disk"] or "", "library": r["library"] or ""})
+    seen = {x["id"] for x in out}
+    for x in STATE["cands"]:
+        if x["id"] not in seen:
+            out.append({**x, "gb": round(x["gb"], 2), "state": "waiting", "library": x.get("library", "")})
     return out
 
 
@@ -260,11 +283,39 @@ async def feed() -> int:
     return n
 
 
+def _scan() -> None:
+    try:
+        with cursor() as cur:
+            rows = [dict(r) for r in cur.execute(
+                "SELECT state, size_before, size_after, started_at, finished_at FROM jobs "
+                "WHERE source=? OR plan_json LIKE ?", (SOURCE, PLAN_MARK))]
+        STATE.update(prog_rows=rows, prog_at=time.time())
+    except Exception as e:                               # noqa: BLE001
+        joblog.log(f"HEVC conversion progress: {type(e).__name__}: {e}", "warn")
+        if STATE.get("prog_rows") is None:
+            STATE["prog_rows"] = []
+    finally:
+        STATE["prog_busy"] = False
+
+
+def warm() -> None:
+    """Both slow reads done ahead of the page: the backlog and the progress scan."""
+    candidates()
+    _scan()
+
+
 def progress() -> dict:
-    with cursor() as cur:
-        rows = [dict(r) for r in cur.execute(
-            "SELECT state, size_before, size_after, started_at, finished_at FROM jobs "
-            "WHERE source=? OR plan_json LIKE ?", (SOURCE, PLAN_MARK))]
+    # THE SCAN IS NEVER WAITED FOR TWICE. It reads plan_json of every job ever
+    # run (180,000 rows, 125 MB) - 2-4 s on a quiet disk and 11-21 s measured
+    # beside four encodes - and the panel asks on every repaint. The last
+    # answer is served at once; one older than a minute is refreshed behind it.
+    if STATE.get("prog_rows") is None:
+        _scan()
+    elif time.time() - STATE.get("prog_at", 0) > 60 and not STATE.get("prog_busy"):
+        STATE["prog_busy"] = True
+        import threading
+        threading.Thread(target=_scan, daemon=True, name="hevcconvert-progress").start()
+    rows = STATE["prog_rows"] or []
     done = [r for r in rows if r["state"] == "done" and r["size_after"]]
     b = sum(r["size_before"] or 0 for r in done) / 1e9
     a = sum(r["size_after"] or 0 for r in done) / 1e9
@@ -297,7 +348,13 @@ async def watch() -> None:
     from . import schedules
     schedules.register("hevcconvert", "HEVC conversion feeder", "Processing", TICK_S,
                        what="Keeps a few library conversions to 10-bit HEVC queued, highest bitrate first.")
-    await asyncio.sleep(90)
+    # the panel's two slow reads, before anyone opens the page
+    await asyncio.sleep(8)
+    try:
+        await asyncio.to_thread(warm)
+    except Exception as e:                               # noqa: BLE001
+        joblog.log(f"HEVC conversion warm-up: {type(e).__name__}: {e}", "warn")
+    await asyncio.sleep(80)
     while True:
         try:
             schedules.beat("hevcconvert")

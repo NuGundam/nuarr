@@ -11793,6 +11793,15 @@ def api_convert():
     return hevcconvert.progress()
 
 
+@app.get("/api/convert/left")
+def api_convert_left():
+    """The files still to convert, in the order they will be taken."""
+    from . import hevcconvert
+    if not hevcconvert.STATE["cands"]:
+        hevcconvert.candidates()
+    return {"list": hevcconvert.left_list()}
+
+
 @app.post("/api/convert/cfg")
 def api_convert_cfg(on: int = -1, keep: int = 0, m1080: float = 0, m720: float = 0, msd: float = 0):
     from . import hevcconvert
@@ -36054,14 +36063,130 @@ async function loadVmaf(){
   again();
 }
 // ---- library conversion to 10-bit HEVC (hevcconvert.py) ----
-async function loadConvert(){
+// THE FILES BEHIND "LEFT": shut by default, a scroll box when open. A list
+// being read is not repainted under the reader - hovering it or scrolling it
+// down holds the refresh, the same rule as the arr drift list.
+//
+// NOTHING HERE WAITS ON THE SERVER TO DRAW. The panel paints its last answer
+// (or a skeleton) at once and the figures land behind it; the list opens on
+// what it last held, or skeleton rows, while its own fetch runs - it does not
+// wait for the panel's. Sorting is for reading only: the # column stays the
+// order the files will be taken in.
+let _cvOpen=false, _cvHover=false, _cvList=null, _cvT=null, _cvData=null, _cvBusy=false, _cvSort={k:'n',dir:1};
+const CV_COLS=[['n','#'],['file','FILE'],['library','LIBRARY'],['mbps','BITRATE'],['gb','SIZE'],['disk','DISK'],['state','STATE']];
+const CV_STATE={running:0,queued:1,waiting:2};
+function convName(r){ const p=String(r.path||''); const i=Math.max(p.lastIndexOf('/'),p.lastIndexOf(String.fromCharCode(92))); return i<0?p:p.slice(i+1); }
+function convLeftPaused(){
+  const b=document.getElementById('convLeftScroll');
+  return _cvHover || (b && b.scrollTop>4);
+}
+function convLeftToggle(){
+  _cvOpen=!_cvOpen; _cvHover=false;
+  convLeftPaint(true);
+  clearTimeout(_cvT);
+  if(_cvOpen){ convLeftLoad(); _cvT=setTimeout(()=>loadConvert(), 30000); }
+}
+function convLeftSort(k){
+  if(_cvSort.k===k) _cvSort.dir*=-1; else _cvSort={k, dir:(k==='mbps'||k==='gb')?-1:1};
+  convLeftPaint(true);
+  const sc=document.getElementById('convLeftScroll'); if(sc) sc.scrollTop=0;
+  _cvHover=true; convLeftNote();
+}
+async function convLeftLoad(){
+  if(_cvBusy) return;
+  _cvBusy=true; convLeftNote();
+  try{
+    const l=(await (await fetch('/api/convert/left')).json()).list||[];
+    l.forEach((r,i)=>{ r.n=i+1; r.file=convName(r); });
+    _cvList=l;
+  }catch(e){}
+  _cvBusy=false;
+  convLeftPaint(); convLeftNote();
+}
+function convLeftPaint(force){
+  const el=document.getElementById('convLeft'); if(!el) return;
+  if(!force && _cvOpen && convLeftPaused()) return;
+  const keep=document.getElementById('convLeftScroll'), top=keep?keep.scrollTop:0;
+  const bar=`<div onclick="convLeftToggle()" style="display:flex;gap:7px;align-items:center;cursor:pointer;
+      user-select:none;padding:4px 8px;font-size:11.5px;background:#161b22;border-bottom:${_cvOpen?'1px solid var(--line)':'0'}">
+      <span class="dim" style="display:inline-block;width:9px;transform:rotate(${_cvOpen?90:0}deg);transition:transform .15s">▶</span>
+      <b>${_cvOpen?'Hide':'Show'} the files left</b>
+      <span class="dim">${_cvOpen?(_cvList?fmt(_cvList.length)+' files · # is the order they will be taken · click a column to sort':'')
+        :'— which files, and in what order'}</span>
+      <span class="dim" id="convLeftNote" style="margin-left:auto"></span></div>`;
+  const wrap=h=>`<div style="border:1px solid var(--line);border-radius:6px;overflow:hidden">${h}</div>`;
+  if(!_cvOpen){ el.innerHTML=wrap(bar); return; }
+  const cols=`<colgroup><col style="width:5%"><col><col style="width:13%"><col style="width:8%"><col style="width:8%"><col style="width:9%"><col style="width:7%"></colgroup>`;
+  const css=`<style>.cvT{width:100%;font-size:11.5px;border-collapse:collapse;table-layout:fixed}
+    .cvT td,.cvT th{padding:4px 12px 4px 0;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;vertical-align:middle;border-bottom:0}
+    .cvT td{border-top:1px solid var(--line)}
+    .cvT th{position:sticky;top:0;z-index:1;background:var(--bg2,#12161c);font-size:10.5px;font-weight:600;color:var(--dim);cursor:pointer;user-select:none}
+    .cvT th:hover{color:var(--fg)}</style>`;
+  const arrow=k=>_cvSort.k===k?(_cvSort.dir>0?' ▲':' ▼'):'';
+  const head=`<tr>${CV_COLS.map(([k,l])=>`<th onclick="convLeftSort('${k}')" title="sort by this column - for reading only, it does not change the order the files are taken in">${l}${arrow(k)}</th>`).join('')}</tr>`;
+  let body;
+  if(!_cvList){
+    body=[70,55,62,48,66,58].map(w=>`<tr class="skelrow"><td><span class="skelbar" style="width:18px"></span></td>
+      <td><span class="skelbar" style="width:${w}%"></span></td>${'<td><span class="skelbar" style="width:60%"></span></td>'.repeat(5)}</tr>`).join('');
+  }else{
+    const k=_cvSort.k, dir=_cvSort.dir, col={running:'#7fd4a3',queued:'#6fb0ff',waiting:'var(--dim)'};
+    const val=r=>k==='state'?CV_STATE[r.state]:(k==='n'||k==='mbps'||k==='gb')?Number(r[k]||0):String(r[k]||'').toLowerCase();
+    const rows=_cvList.slice().sort((a,b)=>{
+      const x=val(a), y=val(b);
+      if(x<y) return -dir; if(x>y) return dir;
+      return a.n-b.n;
+    });
+    body=rows.map(r=>`<tr>
+      <td class="dim">${r.n}</td>
+      <td title="${esc(r.path||'')}">${esc(r.file)}</td>
+      <td class="dim">${esc(r.library||'')}</td>
+      <td>${Number(r.mbps||0).toFixed(1)} Mbps</td><td>${Number(r.gb||0).toFixed(2)} GB</td>
+      <td>${r.disk?diskTag(r.disk):''}</td><td style="color:${col[r.state]||'var(--dim)'}">${esc(r.state||'')}</td></tr>`).join('');
+  }
+  el.innerHTML=wrap(`${bar}${css}
+    <div id="convLeftScroll" style="max-height:320px;overflow:auto;padding:0 10px"
+         onmouseenter="_cvHover=true;convLeftNote()" onmouseleave="_cvHover=false;convLeftNote()" onscroll="convLeftNote()">
+      <table class="cvT">${cols}${head}${body}</table></div>`);
+  const sc=document.getElementById('convLeftScroll'); if(sc) sc.scrollTop=top;
+  convLeftNote();
+}
+function convLeftNote(){
+  const n=document.getElementById('convLeftNote'); if(!n) return;
+  n.innerHTML=_cvBusy?'<span class="loaddot"></span>'+(_cvList?'refreshing':'loading the list')
+    :(_cvOpen&&convLeftPaused()?'paused while you read — move off the list and scroll back up to resume':'');
+}
+function convBusy(on){
+  const b=document.getElementById('convBusy');
+  if(b) b.innerHTML=on?'<span class="loaddot" style="margin:0 0 0 8px"></span>':'';
+}
+async function loadConvert(force){
   const el=document.getElementById('convBox'); if(!el) return;
-  let d; try{ d=await (await fetch('/api/convert')).json(); }catch(e){ return; }
+  clearTimeout(_cvT);
+  // an open list refreshes itself; a shut one costs nothing
+  if(_cvOpen) _cvT=setTimeout(()=>loadConvert(), 30000);
+  if(!force && _cvOpen && convLeftPaused()) return;
+  // SOMETHING ON SCREEN BEFORE THE FIRST BYTE: the last answer, or a skeleton.
+  if(!el.firstElementChild){
+    if(_cvData) convPaint(_cvData);
+    else el.innerHTML=`<div class="lkind" style="padding:10px 12px"><b style="color:#6fb0ff">Convert to 10-bit HEVC</b>
+      <span class="dim" style="font-size:11.5px;margin-left:10px"><span class="loaddot"></span>reading the conversion's progress</span>
+      <div class="skel" style="padding:4px 0 0"><i style="width:94%"></i><i style="width:72%"></i><i style="width:46%"></i></div></div>`;
+  }
+  convBusy(true);
+  if(_cvOpen) convLeftLoad();
+  let d; try{ d=await (await fetch('/api/convert')).json(); }catch(e){ convBusy(false); return; }
+  _cvData=d;
+  if(!force && _cvOpen && convLeftPaused()){ convBusy(false); return; }
+  convPaint(d);
+}
+function convPaint(d){
+  const el=document.getElementById('convBox'); if(!el) return;
+  const sc0=document.getElementById('convLeftScroll'), top0=sc0?sc0.scrollTop:0;
   const c=d.cfg, mm=c.min_mbps, saved=d.before_gb-d.after_gb;
   const eta = d.eta_h==null ? 'pace measured after the first few' : (d.eta_h<48 ? `~${d.eta_h} h left` : `~${(d.eta_h/24).toFixed(1)} days left`);
   el.innerHTML=`<div class="lkind" style="padding:10px 12px">
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-      <b style="color:#6fb0ff">Convert to 10-bit HEVC</b>
+      <b style="color:#6fb0ff">Convert to 10-bit HEVC</b><span id="convBusy"></span>
       <span class="pill ${c.on?'p-ok':'p-dim'}" style="cursor:pointer" onclick="convSet({on:${c.on?0:1}})"
         title="${c.on?'running - click to pause every library':'paused - click to let the libraries that are switched on convert'}">${c.on?'running':'paused'}</span>
       <span class="dim" style="font-size:11.5px">${(d.libraries||[]).length
@@ -36084,7 +36209,10 @@ async function loadConvert(){
       <span class="dim">${d.per_hour?d.per_hour+' an hour · ':''}${eta}</span>
       ${d.kept_original?`<span class="dim">${d.kept_original} kept as they were (would not save ${Math.round(d.min_saving*100)}%)</span>`:''}
       ${d.failed?`<span style="color:#e2b341">${d.failed} failed</span>`:''}
-    </div></div>`;
+    </div>
+    <div id="convLeft" style="margin-top:8px"></div></div>`;
+  convLeftPaint(true);
+  const sc1=document.getElementById('convLeftScroll'); if(sc1) sc1.scrollTop=top0;
 }
 // ---- release group scorecard (groupscore.py) ----
 let _grp=null, _grpLib='', _grpSort='score', _grpMin=1, _grpQ='';
@@ -36289,7 +36417,7 @@ async function grpTierRun(btn){
 }
 async function convSet(o){
   const q=Object.entries(o).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');
-  await fetch('/api/convert/cfg?'+q,{method:'POST'}); loadConvert();
+  await fetch('/api/convert/cfg?'+q,{method:'POST'}); loadConvert(true);
 }
 // PER KIND. anime / animation / live (the same split the language policy
 // uses). A blank cell inherits the figure in the row above; a typed one
