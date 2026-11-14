@@ -62,6 +62,59 @@ def _live_ids() -> set:
         return set()
 
 
+# A FILE THAT IS LISTENED TO AGAIN AND AGAIN IS NOT GETTING ANY BETTER HEARD.
+#
+# Chicken Little (2005), 2026-11-14: 6,031 listen jobs in eight days, one a
+# minute, each over in 0 s with "heard 1 of 1". The file sat on TWO pool disks
+# with different bytes (NU-DRIVE-2: 1,943,404,558 bytes from September;
+# NU-DRIVE-7: 1,946,269,789 from 6 November) and the pool answered a stat with
+# one copy's size and the other's date. The scanner walks the disks and stored
+# the September date; the worker asked P: and saw the November one. So the
+# feeder (verdict against the files row) said stale every minute, and the
+# worker (verdict against the pool) said fresh every minute.
+#
+# Whatever makes the two disagree, a third listen in six hours has nothing new
+# to hear. The file is held for a week and named once in the log.
+LOOP_KV = "listen.loop"
+LOOP_N, LOOP_WINDOW_S, LOOP_HOLD_S = 3, 6 * 3600, 7 * 86400
+
+
+def _loop_held(ids: list) -> set:
+    """The file ids, among these, that are being listened to in a loop."""
+    from .db import kv_get, kv_set
+    try:
+        held = {int(k): float(v) for k, v in json.loads(kv_get(LOOP_KV) or "{}").items()}
+    except Exception:                                            # noqa: BLE001
+        held = {}
+    now = time.time()
+    live = {k: v for k, v in held.items() if now - v < LOOP_HOLD_S}
+    fresh = []
+    ids = [int(i) for i in ids if int(i) not in live]
+    if ids:
+        try:
+            with cursor() as cur:
+                q = ",".join(str(i) for i in ids)
+                fresh = [(int(r["file_id"]), int(r["n"]), r["path"]) for r in cur.execute(
+                    f"SELECT j.file_id, COUNT(*) n, MAX(j.path) path FROM jobs j "
+                    f" WHERE j.kind='listen' AND j.state='done' AND j.finished_at > ? "
+                    f"   AND j.file_id IN ({q}) GROUP BY j.file_id HAVING COUNT(*) >= ?",
+                    (now - LOOP_WINDOW_S, LOOP_N))]
+        except Exception:                                        # noqa: BLE001
+            fresh = []
+    for fid, n, path in fresh:
+        live[fid] = now
+        joblog.log(f"audio language: {os.path.basename(path or '')[:90]} was listened to {n} times in "
+                   f"{LOOP_WINDOW_S // 3600} h and is asked for again - the verdict and the file's size or date "
+                   f"never agree (two copies of the file on the pool do this). Held for "
+                   f"{LOOP_HOLD_S // 86400} days.", "warn")
+    if fresh or len(live) != len(held):
+        try:
+            kv_set(LOOP_KV, json.dumps({str(k): v for k, v in live.items()}))
+        except Exception:                                        # noqa: BLE001
+            pass
+    return set(live)
+
+
 def _have(kind: str) -> int:
     with cursor() as cur:
         return int(cur.execute(
@@ -385,6 +438,9 @@ async def topup_listen(depth: int | None = None) -> dict:
         files = await jobs.in_work(_listen_pending, max(room * 6, 300))
         live = await asyncio.to_thread(_live_ids)
         files = [f for f in files if f["file_id"] not in live]
+        if files:
+            loop = await asyncio.to_thread(_loop_held, [f["file_id"] for f in files])
+            files = [f for f in files if f["file_id"] not in loop]
         # THE BLOCKING ONES ARE DEALT FIRST AND KEEP THEIR OWN ROOM, so a
         # round robin over twelve spindles cannot spend the whole allowance
         # on files nobody is waiting for.
