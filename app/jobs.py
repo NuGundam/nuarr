@@ -6279,11 +6279,16 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
                             f"samples {_sv:.0f}% smaller than at CQ {_fixed}" if _sv >= 0
                             else f"samples {-_sv:.0f}% larger than at CQ {_fixed}")
                     _tried = " · ".join(f"CQ {t['cq']} {'✓' if t['ok'] else '✗'} {t['vmaf']}"
+                                        + (f" (SSIMULACRA2 {t['ssimu']})" if t.get("ssimu") is not None else "")
                                         for t in (_vr.get("tried") or []))
+                    _s2t = ("" if _vr.get("ssimu") is None else
+                            f", SSIMULACRA2 {_vr['ssimu']}"
+                            + (f" (floor {_vr['ssimu_floor']:g})" if _vr.get("ssimu_floor") else ""))
                     w.vmaf_result = {"cq": int(_vr["cq"]), "fixed": _fixed, "vmaf": _vr.get("vmaf"),
                                      "worst": _vr.get("worst"), "cambi": _vr.get("cambi"),
                                      "saved": _sv, "probes": _vr.get("probes"), "secs": _vr.get("secs"),
                                      "src_cambi": _vr.get("src_cambi"), "dark": _vr.get("dark"),
+                                     "ssimu": _vr.get("ssimu"), "ssimu_floor": _vr.get("ssimu_floor"),
                                      "note": _vr.get("note"), "tried": _vr.get("tried") or []}
                     joblog.log(f"VMAF target: CQ {_vr['cq']} chosen instead of the library's {_fixed} - "
                                f"VMAF {_vr['vmaf']} (worst sample {_vr['worst']}), banding {_vr.get('cambi')}"
@@ -6301,6 +6306,7 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
                         job.plan.add("video", f"quality search chose CQ {_vr['cq']} (the library's is {_fixed})",
                                      f"VMAF {_vr['vmaf']}, worst sample {_vr['worst']}, banding {_vr.get('cambi')}"
                                      + (f" (source {_vr.get('src_cambi')})" if _vr.get("src_cambi") is not None else "")
+                                     + _s2t
                                      + (f", {_svt}" if _svt else ""),
                                      _tried)
                         with cursor() as _cur:

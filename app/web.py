@@ -25844,11 +25844,12 @@ function vmafCell(w){
     const svt = sv==null ? '' : (sv>=0 ? `<span style="color:#7fd4a3">samples ${sv.toFixed(0)}% smaller</span> than at CQ ${r.fixed}`
                                        : `<span style="color:#ff7b72">samples ${(-sv).toFixed(0)}% larger</span> than at CQ ${r.fixed}`);
     const chips = (r.tried||[]).map(t => `<span class="vmafcq" title="CQ ${t.cq}: VMAF ${t.vmaf}, worst sample ${t.worst}${t.low!=null?`, worst frame ${t.low}`:''}, banding ${t.cambi}${t.ssimu!=null?`, SSIMULACRA2 ${t.ssimu}`:''}${t.fail?` - failed on ${t.fail}`:''}"
-        style="color:${t.ok?'#7fd4a3':'#e0575b'};border-color:${t.ok?'rgba(127,212,163,.45)':'rgba(224,87,91,.45)'};${t.cq===r.cq?'font-weight:700;background:rgba(162,224,94,.12)':''}">CQ ${t.cq} ${t.ok?'✓':'✗'} ${t.vmaf}${t.fail?` <span style="font-size:9.5px;opacity:.8">${t.fail}</span>`:''}</span>`).join('');
+        style="color:${t.ok?'#7fd4a3':'#e0575b'};border-color:${t.ok?'rgba(127,212,163,.45)':'rgba(224,87,91,.45)'};${t.cq===r.cq?'font-weight:700;background:rgba(162,224,94,.12)':''}">CQ ${t.cq} ${t.ok?'✓':'✗'} ${t.vmaf}${t.ssimu!=null?` <span style="font-size:9.5px;color:#c9a0ff">S2 ${(+t.ssimu).toFixed(1)}</span>`:''}${t.fail?` <span style="font-size:9.5px;opacity:.8">${t.fail}</span>`:''}</span>`).join('');
+    const s2t = r.ssimu==null ? '' : ` · <span title="SSIMULACRA2 - a second opinion on fine detail (grain, line texture) that VMAF does not mind losing. 70 is high quality, 80 very high, 90 visually lossless.${r.ssimu_floor?' The samples must reach '+r.ssimu_floor+'.':''}">SSIMULACRA2 <b style="color:#c9a0ff">${(+r.ssimu).toFixed(1)}</b>${r.ssimu_floor?` <span class="dim">(floor ${r.ssimu_floor})</span>`:''}</span>`;
     return `<div class="socr vmafrow">
       <span class="pill" style="color:${col};border-color:${col}">quality ✓</span>
       <span><b style="color:${col}">CQ ${r.cq}</b> <span class="dim">chosen (library ${r.fixed})</span> · VMAF <b>${r.vmaf}</b>
-        <span class="dim">(worst ${r.worst})</span> · banding <b>${r.cambi}</b>${r.src_cambi!=null?` <span class="dim" title="the source's own banding on the same samples - an encode passes if it adds no more than 1 point to it">(source ${r.src_cambi})</span>`:''}${svt?' · '+svt:''}</span>
+        <span class="dim">(worst ${r.worst})</span> · banding <b>${r.cambi}</b>${r.src_cambi!=null?` <span class="dim" title="the source's own banding on the same samples - an encode passes if it adds no more than 1 point to it">(source ${r.src_cambi})</span>`:''}${s2t}${svt?' · '+svt:''}</span>
       <span>${chips}</span>
       <span class="dim">${r.probes||''} probes in ${Math.round(r.secs||0)}s${r.dark!=null?` · dark scene at ${vmafMmss(r.dark)}`:''}</span></div>`;
   }
@@ -25859,15 +25860,21 @@ function vmafCell(w){
   const mmss = s => s >= 90 ? Math.round(s/60)+'m' : Math.round(s)+'s';
   const info = w.vmaf_info||{}, tried = info.tried||[];
   const col = poolColor('quality');
-  const chips = tried.map(t => `<span class="vmafcq" title="CQ ${t.cq}: VMAF ${t.vmaf}, banding ${t.cambi}"
-      style="color:${t.ok?'#7fd4a3':'#e0575b'};border-color:${t.ok?'rgba(127,212,163,.45)':'rgba(224,87,91,.45)'}">CQ ${t.cq} ${t.ok?'✓':'✗'} ${t.vmaf}</span>`).join('');
+  const chips = tried.map(t => `<span class="vmafcq" title="CQ ${t.cq}: VMAF ${t.vmaf}, banding ${t.cambi}${t.ssimu!=null?`, SSIMULACRA2 ${t.ssimu}`:''}"
+      style="color:${t.ok?'#7fd4a3':'#e0575b'};border-color:${t.ok?'rgba(127,212,163,.45)':'rgba(224,87,91,.45)'}">CQ ${t.cq} ${t.ok?'✓':'✗'} ${t.vmaf}${t.ssimu!=null?` <span style="font-size:9.5px;color:#c9a0ff">S2 ${(+t.ssimu).toFixed(1)}</span>`:''}</span>`).join('');
+  // THE SECOND OPINION, WHILE IT RUNS: its own pill with the working dots, so
+  // "SSIMULACRA2" on the card means it is being measured right now.
+  const s2now = /SSIMULACRA2/.test(w.vmaf_stage||'');
+  const s2pill = info.ssimu_floor>0 ? `<span class="pill" title="SSIMULACRA2 - a second opinion on fine detail (grain, line texture) that VMAF does not mind losing. 70 is high quality, 80 very high, 90 visually lossless. The samples must reach ${info.ssimu_floor}."
+      style="color:#c9a0ff;border-color:${s2now?'#c9a0ff':'rgba(201,160,255,.35)'};${s2now?'':'opacity:.7'}">${s2now?'<span class="spin" style="color:#c9a0ff"><i></i><i></i><i></i></span>':''}SSIMULACRA2 ≥ ${info.ssimu_floor}</span>` : '';
   return `<div class="socr vmafrow">
     <span class="pill" style="color:${col};border-color:${col}">quality</span>
     <span class="vmafbar"><i style="width:${pct.toFixed(1)}%"></i><b></b></span>
     <span class="mono socrpct" style="color:${col};min-width:40px">${pct.toFixed(0)}%</span>
     <span class="dim">${esc(w.vmaf_stage)} · ${mmss(el)}${left!=null?' · ~'+mmss(left)+' left':''}${info.dark!=null?` · <span title="${Math.round((info.dark_risk||0)*100)}% of the picture there is a dark gradient">dark scene at ${vmafMmss(info.dark)}</span>`:''}</span>
+    ${s2pill}
     <span>${chips}</span>
-    <span class="dim">· looking for the smallest file that still scores VMAF ${info.want??95} without adding banding</span></div>`;
+    <span class="dim">· looking for the smallest file that still scores VMAF ${info.want??95} without adding banding${info.ssimu_floor>0?' or losing detail':''}</span></div>`;
 }
 function subFixCell(w){
   if(!w.sub_fix_stage) return '';
@@ -35944,6 +35951,7 @@ function vmafRow(r,sz){
     <td class="mono">CQ ${r.cq_fixed} → <b>${r.cq_chosen}</b></td>
     <td class="mono" title="${esc(vmafTip(r))}">${vmafCellV(r)}</td>
     <td class="mono" title="banding (CAMBI) - under 5 is not visible; an encode should add no more than about 1 to the source's own">${vmafCellB(r)}</td>
+    <td class="mono" title="SSIMULACRA2 - a second opinion on fine detail (grain, line texture) that VMAF does not mind losing. 70 is high quality, 80 very high, 90 visually lossless. Measured on the samples, only where the kind has a floor set.">${r.ssimu==null?'<span class="dim">—</span>':vmNum((+r.ssimu).toFixed(1), r.ssimu>=80?'good':r.ssimu>=70?'mid':'bad', false)}</td>
     <td class="mono">${vmafSizes(r)}</td><td>${sz(r.saved_pct)}</td>
     <td class="dim">${r.probes} · ${Math.round(r.secs)}s</td>
     <td class="vmafWhen" style="white-space:nowrap" title="${esc(new Date(r.at*1000).toLocaleString())}" data-ago="${r.at}">${esc(agoFine(r.at))}</td></tr>`;
@@ -36033,6 +36041,12 @@ async function loadVmaf(){
       indistinguishable on a TV) and runs the encode at the <b>highest CQ that still scores the target</b>. Never more than ${b.down} below
       or ${b.up} above the library's CQ below, and the bitrate cap still applies. It learns where each library lands, so the next file starts there.
       Left at the library's CQ: a burned-in subtitle, HDR, anything under ${b.min_minutes} minutes. The output is an ordinary file - playback is unchanged.</div>
+    <div class="dim" style="font-size:11px;margin-top:6px"><b style="color:#c9a0ff">Detail at least (SSIMULACRA2)</b> is a second opinion on the same samples.
+      VMAF does not mind film grain and fine line texture being smoothed away; SSIMULACRA2 does. A kind with a figure in that column must
+      also average at least that score, or the CQ fails on <b>detail</b> and the search steps back. <b>70</b> is high quality, <b>80</b> very high, <b>90</b> visually lossless;
+      empty or 0 means it is not measured. Measured here on 20 lean anime episodes: at VMAF 95 the digital shows scored 79-84, but cel-era shows
+      (Sailor Moon, Dragon Ball Z, Gundam Wing) only 71 - which is why anime is held to 75. Scored on the graphics card by Vship, about 10 s extra per CQ tried;
+      if the tool is missing the search carries on without it. Not yet tested on western animation or live action, where grain reads low.</div>
     <div id="vmafRun">${run}</div>
     <div style="display:flex;gap:18px;flex-wrap:wrap;font-size:11.5px;margin-top:8px">
       <span><b>${fmt(d.count)}</b> <span class="dim">files measured</span>${d.hidden_prefix?` <span class="dim" title="Searches made before the 3 Nov 2026 scorer fix, when frame slips read good encodes as poor. Still in the last-100 list; left out of these figures and the table.">(${fmt(d.hidden_prefix)} older searches left out - before the scorer fix)</span>`:''}</span>
@@ -36053,7 +36067,7 @@ async function loadVmaf(){
       <style>.vmafTbl td{white-space:nowrap;padding:4px 6px}.vmafTbl td:first-child{width:100%;max-width:0;overflow:hidden;text-overflow:ellipsis;padding-left:8px}
         @keyframes vmafNew{from{background:rgba(111,176,255,.22)}to{background:transparent}}.vmafNew td{animation:vmafNew 2.5s ease-out}</style>
       <table class="vmafTbl" style="width:100%;border-collapse:collapse">
-        <tr class="dim" style="font-size:10.5px;position:sticky;top:0;background:var(--panel);z-index:1"><td style="padding:5px 8px">FILE</td><td>CQ</td><td>VMAF <span style="font-weight:400">samples → final</span></td><td>BANDING <span style="font-weight:400">source → samples → final</span></td><td>FILE SIZE</td><td>VS FIXED CQ</td><td>PROBES · TIME</td><td>WHEN</td></tr>
+        <tr class="dim" style="font-size:10.5px;position:sticky;top:0;background:var(--panel);z-index:1"><td style="padding:5px 8px">FILE</td><td>CQ</td><td>VMAF <span style="font-weight:400">samples → final</span></td><td>BANDING <span style="font-weight:400">source → samples → final</span></td><td>DETAIL <span style="font-weight:400">SSIMULACRA2</span></td><td>FILE SIZE</td><td>VS FIXED CQ</td><td>PROBES · TIME</td><td>WHEN</td></tr>
         ${d.recent.map(r=>vmafRow(r,sz)).join('')}
       </table></div></details>`:''}
   </div>`;

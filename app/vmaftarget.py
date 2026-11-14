@@ -800,7 +800,7 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
         total = 1 + est["probes"]                    # 1 unit for cutting, 1 per probe
         info = {"tried": sorted(({"cq": k2, "vmaf": v["vmaf"], "cambi": v["cambi"], "ok": v["ok"], "ssimu": v.get("ssimu")}
                                  for k2, v in tried.items()), key=lambda x: x["cq"]),
-                "want": want, "banding": banding, "probes_est": est["probes"],
+                "want": want, "banding": banding, "probes_est": est["probes"], "ssimu_floor": s2_floor,
                 "kind": kind, "head": head, "low": low_floor, "floor": floor,
                 "dark": (dark or {}).get("t"), "dark_risk": (dark or {}).get("risk")}
         try:
@@ -867,6 +867,8 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
                     means.append(sc[0])
                     lows.append(sc[1])
                     if s2_floor > 0:
+                        _report(f"CQ {cq}: sample {k + 1}/{len(refs)} - SSIMULACRA2 detail check",
+                                1 + len(tried) + (k + 0.7) / len(refs))
                         s2 = _ssimu(ref, out)
                         if s2 is not None:
                             s2s.append(s2)
@@ -997,7 +999,7 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
                       f"{chosen.get('src_cambi')}) - original kept")
         return {"cq": best, "fixed": fixed, "vmaf": chosen["vmaf"], "worst": chosen["worst"], "saved": saved,
                 "cambi": chosen["cambi"], "low": chosen["low"], "kind": kind, "head": head, "want": want,
-                "refuse": refuse, "ssimu": chosen.get("ssimu"),
+                "refuse": refuse, "ssimu": chosen.get("ssimu"), "ssimu_floor": s2_floor,
                 "probes": len(tried), "secs": secs, "note": note,
                 "src_cambi": chosen.get("src_cambi"), "band_added": chosen.get("band_added"),
                 "dark": (dark or {}).get("t"), "dark_risk": (dark or {}).get("risk"),
