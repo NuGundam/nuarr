@@ -17923,7 +17923,7 @@ html.mobile #logsPane{height:auto;min-height:60vh}
         <div id="obsBox" style="display:none;padding:8px 14px;
              border-bottom:1px solid var(--line);font-size:11.5px"></div>
         <div id="workers"></div>
-        <div style="padding:9px 14px;border-top:1px solid var(--line)">
+        <div id="wFoot" style="display:none;padding:9px 14px;border-top:1px solid var(--line)">
           <button onclick="resetWorkers()"
                   title="Puts every setting on this page back to its default — not just this tab">Reset all to default</button>
           <span id="wmsg" class="dim" style="margin-left:9px"></span>
@@ -52151,6 +52151,9 @@ function paintWorkers(){
     if(foot && foot.querySelector('button')) foot.style.display='none';
     return;
   }
+  // The reset row is hidden in the HTML so the dashboard never flashes it
+  // before its script runs; only the settings page shows it.
+  { const wf=document.getElementById('wFoot'); if(wf) wf.style.display=''; }
   // ONE ROW PER POOL: the subocr GPU-lane setting rides inside the subocr
   // row rather than wearing the same bubble on a row of its own.
   const rows=Object.entries(w).filter(([k,v])=> k[0]!=='_' && v && v.label
@@ -52212,8 +52215,41 @@ async function encLineFetch(){
     paintWorkers();
   }catch(e){}
 }
+// THE DASHBOARD'S WORKERS PANEL PAINTS AT ONCE. It used to sit empty with the
+// settings page's "Reset all to default" button showing until loadAll's first
+// round got round to /api/workers (0.5-0.7 s headless, longer on a busy page).
+// Now: the reset row is hidden from the start, the last answer this browser
+// saw is painted straight away (or skeleton tiles on a first visit), and the
+// fetch goes out at boot instead of behind loadAll. Erik: "improve this panel
+// loading".
+const W_CACHE='nuarr.workers.v1';
+function workersSkeleton(){
+  const n=17, cells=[];
+  for(let i=0;i<n;i++) cells.push(`<div class="wcell wcskel"><div class="wcname"><span class="skelbar" style="width:${60+((i*37)%35)}%"></span></div>
+      <div class="wcval"><span class="skelbar tall" style="width:16px"></span><span class="skelbar" style="width:62px"></span></div></div>`);
+  return `<div class="wcgrid">${cells.join('')}</div>
+    <div class="wcfoot">how many of each may run at once — hover one for what it costs the box</div>
+    <div class="wclink"><a href="/settings#counts">Concurrency Settings →</a></div>`;
+}
+function workersBoot(){
+  if(location.pathname.startsWith('/settings')) return;
+  const box=document.getElementById('workers'); if(!box) return;
+  const hint=document.getElementById('wtabhint'); if(hint) hint.textContent='· concurrency';
+  const foot=document.querySelector('#wSettings > div:last-child');
+  if(foot && foot.querySelector('button')) foot.style.display='none';
+  if(!box.innerHTML.trim()){
+    let cached=null;
+    try{ cached=JSON.parse(localStorage.getItem(W_CACHE)||'null'); }catch(e){ cached=null; }
+    try{ box.innerHTML = cached ? workersCompact(cached) : workersSkeleton(); }
+    catch(e){ box.innerHTML = workersSkeleton(); }
+  }
+  if(_wdata===null) loadWorkers().catch(()=>{});
+}
 async function loadWorkers(){
   _wdata=await (await fetch('/api/workers')).json();
+  if(!location.pathname.startsWith('/settings')){
+    try{ localStorage.setItem(W_CACHE, JSON.stringify(_wdata)); }catch(e){}
+  }
   // the control poll cadence is one of these settings - adopt it immediately
   if(_wdata.control_poll_s && _wdata.control_poll_s.value){
     _ctlIdleMs = _wdata.control_poll_s.value * 1000;
@@ -52361,6 +52397,7 @@ poll(loadLogs,3000,'logs');
 gated(loadJobs,'jobCap')();
 poll(loadLogJobs,15000,'logJob');
 gated(loadLogs,'logs')(); gated(loadLogJobs,'logJob')();
+workersBoot();
 loadAll();
 // Once at boot and then slowly: the mode changes when a person changes it or
 // when nuarr appears/vanishes on the file server, neither of which is a
