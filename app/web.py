@@ -978,6 +978,10 @@ async def _startup() -> None:
     # custom formats per arr, scored per profile. Writes only once armed.
     from . import grouptier
     asyncio.create_task(grouptier.watch())
+    # Which quality profile a series belongs on, from what is released for it.
+    # Looks things up from the start; moves a series only once armed.
+    from . import profadvisor
+    asyncio.create_task(profadvisor.watch())
     asyncio.create_task(subneed.watch())
     # Twice a day: do nuarr and the arrs still describe the same files? The
     # check existed before this line did, which meant it only ever ran when
@@ -11783,6 +11787,36 @@ async def api_groups_tiers_run():
     from . import grouptier
     plan = await grouptier.run()
     return {"armed": plan["armed"], "would": plan["would"], "pending": plan["pending"]}
+
+
+@app.get("/api/profadv")
+def api_profadv():
+    from . import profadvisor
+    return profadvisor.snapshot()
+
+
+@app.post("/api/profadv/cfg")
+def api_profadv_cfg(armed: int = -1, per_hour: int = 0, max_below: int = -1):
+    from . import profadvisor
+    c = profadvisor.set_cfg(armed=None if armed < 0 else bool(armed), per_hour=per_hour or None,
+                            max_below=None if max_below < 0 else max_below)
+    joblog.log(f"profile advisor: {'armed' if c['armed'] else 'preview only'}, {c['per_hour']} series an hour, "
+               f"asks before a move that puts more than {c['max_below']} files under the minimum", "info")
+    return c
+
+
+@app.post("/api/profadv/run")
+async def api_profadv_run():
+    """Look the next series up now."""
+    from . import profadvisor
+    return await profadvisor.run_one()
+
+
+@app.post("/api/profadv/apply")
+async def api_profadv_apply(series_id: int):
+    """Move one series to the profile its row asks for - the click a big move waits for."""
+    from . import profadvisor
+    return await profadvisor.apply(series_id)
 
 
 @app.get("/api/convert")
@@ -36521,9 +36555,87 @@ async function nurseProwlarr(){
   await fetch('/api/nurse/prowlarr?url='+encodeURIComponent(u)+(k?'&key='+encodeURIComponent(k):''),{method:'POST'});
   nurseRun();
 }
+// ---- profile advisor (profadvisor.py): which quality profile a series belongs on ----
+let _pa=null, _paMsg=null, _paOpen=false, _paT=null;
+async function loadProfAdv(){
+  const el=document.getElementById('profAdv'); if(!el) return;
+  if(!el.firstElementChild) el.innerHTML=`<div class="lkind" style="padding:10px 12px"><b style="color:#8fd0ff">Profile advisor</b>
+    <span class="dim" style="font-size:11.5px;margin-left:10px"><span class="loaddot"></span>reading what it has looked up</span></div>`;
+  try{ _pa=await (await fetch('/api/profadv')).json(); }catch(e){ return; }
+  profAdvPaint();
+  clearTimeout(_paT);
+  _paT=setTimeout(()=>{ if(document.getElementById('profAdv')?.offsetParent) loadProfAdv(); }, 60000);
+}
+function profAdvPaint(){
+  const el=document.getElementById('profAdv'), v=_pa; if(!el||!v) return;
+  const c=v.cfg, n=v.counts||{}, col={would:'#7fd4a3',needs_ok:'#e2b341',moved:'#8fd0ff'};
+  const word={would:c.armed?'moving':'would move',needs_ok:'needs your OK',moved:'moved'};
+  const ev=r=>(r.evidence||[]).map(e=>`${e.ep}: ${e.n4} in 4K from ${e.g4} group${e.g4===1?'':'s'}, ${e.n1080} in 1080p`).join(' · ');
+  const row=r=>`<tr>
+    <td title="${esc(ev(r))}">${esc(r.title)}</td>
+    <td class="dim">${esc(r.profile)}</td>
+    <td>${r.status==='moved'?'<span class="dim">from '+esc(r.applied_from||'')+'</span>':'→ <b>'+esc(r.want)+'</b>'}</td>
+    <td class="dim" title="${esc(ev(r))}">${r.verdict==='4k'?'released in 4K':'1080p only'}</td>
+    <td>${r.impact&&r.impact.files!=null?`<span style="color:${r.impact.below_min>c.max_below?'#e2b341':'var(--dim)'}">${r.impact.below_min} of ${r.impact.files}</span>`:''}</td>
+    <td style="color:${col[r.status]}">${word[r.status]||r.status}</td>
+    <td>${r.status==='would'||r.status==='needs_ok'?`<button class="rmb" onclick="profAdvApply(${r.series_id},this)" title="move this series to ${esc(r.want)} now${r.impact&&r.impact.below_min?` - Sonarr will then look to replace the ${r.impact.below_min} file(s) that fall under its minimum`:''}">Move</button>`:''}</td></tr>`;
+  const rows=(v.rows||[]).slice().sort((a,b)=>(a.status>b.status?1:a.status<b.status?-1:a.title.localeCompare(b.title)));
+  el.innerHTML=`<div class="lkind" style="padding:11px 12px">
+    <div class="lkindhead"><b style="color:#8fd0ff">Profile advisor</b>
+      <span class="dim" style="font-size:11px">${c.armed?'armed - small moves are made on their own':'preview only - nothing is changed in Sonarr until armed'}
+        · looked up ${fmt(v.seen)}${v.total?' of '+fmt(v.total):''} series${v.running?' · <span class="loaddot"></span>looking one up':''}${v.last?' · last: '+esc(v.last):''}</span>
+      <span style="margin-left:auto;display:flex;gap:6px;align-items:center;font-size:11px">
+        <span title="how many series are looked up an hour - each is one to three release searches on every indexer">
+          <input type="number" min="1" max="30" value="${c.per_hour}" style="width:48px;box-sizing:border-box;font-size:11px" onchange="profAdvSet({per_hour:this.value})"> an hour</span>
+        <span title="a move that would put more files than this under the new profile's minimum is never made on its own - it waits for the Move button">ask above
+          <input type="number" min="0" max="500" value="${c.max_below}" style="width:48px;box-sizing:border-box;font-size:11px" onchange="profAdvSet({max_below:this.value})"> files</span>
+        <button class="rmb" onclick="profAdvRun(this)" ${v.running?'disabled':''}>Look one up now</button>
+        <button class="rmb" onclick="profAdvSet({armed:${c.armed?0:1}})" title="${c.armed?'stop moving series; the table keeps filling':'let nuarr move a series when the move puts no more than '+c.max_below+' files under the minimum'}">${c.armed?'Disarm':'Arm'}</button></span></div>
+    ${_paMsg&&Date.now()-_paMsg.at<120000?`<div style="font-size:11.5px;margin:5px 0 0;color:${_paMsg.c}">${_paMsg.t}</div>`:''}
+    ${v.err?`<div style="font-size:11.5px;margin:5px 0 0;color:#ff7b72">${esc(v.err)}</div>`:''}
+    <div class="dim" style="font-size:11px;margin:5px 0 4px">Nothing in TheTVDB or Sonarr says whether a show is released in 4K, so nuarr asks: it runs Sonarr's release search on
+      episodes that have already aired and counts what comes back. 4K web or disc releases from two or more groups mean the show belongs on the 2160p profile; plenty of 1080p and no 4K
+      means the 1080p one. Going up takes ${c.up_eps} episodes that agree, because it re-downloads the show; going down takes ${c.down_eps}. A 1080p-only show left on the 2160p profile grabs nothing
+      - its releases score under that profile's minimum - which is why this is decided early. Before a move, the series' own files are scored against the new profile: the ones that would
+      fall under its minimum are the ones Sonarr will then try to replace, and a move with more than ${c.max_below} of those waits for the Move button. Anime is left alone.</div>
+    <div style="display:flex;gap:16px;flex-wrap:wrap;font-size:11.5px;margin:4px 0">
+      <span><b>${fmt(n.ok||0)}</b> <span class="dim">on the right profile</span></span>
+      <span style="color:${col.would}"><b>${fmt(n.would||0)}</b> ${c.armed?'to move':'would move'}</span>
+      <span style="color:${col.needs_ok}"><b>${fmt(n.needs_ok||0)}</b> need your OK</span>
+      <span style="color:${col.moved}"><b>${fmt(n.moved||0)}</b> moved</span>
+      <span class="dim"><b>${fmt(n.unknown||0)}</b> cannot be told yet</span></div>
+    ${rows.length?`<style>.paT{width:100%;font-size:11.5px;border-collapse:collapse}.paT td,.paT th{padding:4px 12px 4px 0;text-align:left;vertical-align:middle;border-bottom:0;white-space:nowrap}
+        .paT td{border-top:1px solid var(--line)}.paT th{font-size:10.5px;font-weight:600;color:var(--dim)}.paT td:first-child{max-width:320px;overflow:hidden;text-overflow:ellipsis}</style>
+      <div style="max-height:300px;overflow:auto;border:1px solid var(--line);border-radius:6px;padding:0 10px;margin-top:4px"><table class="paT">
+      <tr><th>SERIES</th><th>NOW ON</th><th>BELONGS ON</th><th>WHY</th><th title="files of this series that would fall under the new profile's minimum, which Sonarr would then look to replace">FILES UNDER THE MINIMUM</th><th>STATE</th><th></th></tr>
+      ${rows.map(row).join('')}</table></div>`:`<div class="dim" style="font-size:11px">no series needs a different profile so far</div>`}
+  </div>`;
+}
+async function profAdvSet(o){
+  const q=Object.entries(o).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');
+  await fetch('/api/profadv/cfg?'+q,{method:'POST'});
+  if('armed' in o) _paMsg={at:Date.now(),c:'var(--dim)',t:o.armed?'armed - small moves are made as series are looked up':'disarmed - preview only'};
+  loadProfAdv();
+}
+async function profAdvRun(btn){
+  if(btn) btn.disabled=true;
+  _paMsg={at:Date.now(),c:'var(--dim)',t:'<span class="loaddot"></span>searching the indexers - about a minute an episode'}; profAdvPaint();
+  try{ const d=await (await fetch('/api/profadv/run',{method:'POST'})).json();
+    _paMsg={at:Date.now(),c:d.ok===false?'#ff7b72':'#7fd4a3',t:d.ok===false?esc(d.why||'failed'):(d.title?esc(d.title)+': '+esc(d.verdict||d.status||''):'every series is up to date')};
+  }catch(e){ _paMsg={at:Date.now(),c:'#ff7b72',t:'failed: '+esc(String(e&&e.message||e))}; }
+  loadProfAdv();
+}
+async function profAdvApply(id,btn){
+  if(btn) btn.disabled=true;
+  try{ const d=await (await fetch('/api/profadv/apply?series_id='+id,{method:'POST'})).json();
+    _paMsg={at:Date.now(),c:d.ok?'#7fd4a3':'#ff7b72',t:d.ok?`moved from ${esc(d.from)} to ${esc(d.to)}${d.searched?' · searching '+d.searched+' missed episode(s)':''}`:esc(d.why||'failed')};
+  }catch(e){ _paMsg={at:Date.now(),c:'#ff7b72',t:'failed: '+esc(String(e&&e.message||e))}; }
+  loadProfAdv();
+}
 async function loadArrHealth(force){
   const el=document.getElementById('arrHealth');
   if(!el) return;
+  loadProfAdv();
   let d;
   try{ d=await (await fetch('/api/arrs/health'+(force?'?refresh=true':''))).json(); }
   catch(e){ return; }          // keep the last cards: blanking them collapsed the page
