@@ -77,6 +77,14 @@ def init() -> None:
             height INTEGER, codec TEXT, tenbit INTEGER, mbps REAL,
             banding REAL, banding_max REAL, block REAL, blur REAL,
             at REAL, rev INTEGER, err TEXT)""")
+        # BLUR RE-CHECK (2026-11-14). Rows measured before the nan fix carry
+        # blur from fade-free samples only; brev=0 marks them, their blur is
+        # cleared once, and step() re-measures blur alone when no new file
+        # is waiting. New rows are written with brev=1.
+        cols = {r[1] for r in cur.execute("PRAGMA table_info(group_measure)")}
+        if "brev" not in cols:
+            cur.execute("ALTER TABLE group_measure ADD COLUMN brev INTEGER DEFAULT 0")
+            cur.execute("UPDATE group_measure SET blur=NULL")
 
 
 def paused() -> bool:
@@ -155,6 +163,70 @@ def measure_one(row: dict) -> dict:
             "banding_max": round(max(bands), 2) if bands else None,
             "block": round(statistics.mean(blocks), 3) if blocks else None,
             "blur": round(statistics.mean(blurs), 3) if blurs else None}
+
+
+def blur_one(row: dict) -> float | None:
+    """Blur alone over the same three samples measure_one uses (the re-check)."""
+    ff = _ff()
+    dur = float(row.get("duration") or 0)
+    marks = [dur * f for f in (0.2, 0.5, 0.8)] if dur > 60 else [max(0.0, dur / 2 - 2)]
+    blurs = []
+    for k, t in enumerate(marks):
+        STATE.update(pct=k / len(marks), stage=f"blur re-check - sample {k + 1} of {len(marks)}")
+        pp = subprocess.Popen([ff, "-hide_banner", "-nostdin", "-nostats", "-v", "info", "-threads", "3",
+                               "-ss", f"{t:.2f}", "-t", f"{SAMPLE_S:.1f}", "-i", row["path"], "-an", "-sn", "-dn",
+                               "-vf", r"select='not(mod(n\,3))',blurdetect,metadata=print:key=lavfi.blur",
+                               "-f", "null", "-"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                              errors="replace", creationflags=NO_WINDOW | BELOW_NORMAL, startupinfo=hidden_si())
+        from . import outside as _out
+        _out.set_pid("groups", pp.pid)
+        try:
+            _, err_ = pp.communicate(timeout=240)
+        except subprocess.TimeoutExpired:
+            pp.kill()
+            _, err_ = pp.communicate()
+        fr = [float(x) for x in re.findall(r"lavfi\.blur=([\d.]+)", err_ or "")]
+        if fr:
+            blurs.append(statistics.mean(fr))
+    return round(statistics.mean(blurs), 3) if blurs else None
+
+
+def _recheck_next() -> dict | None:
+    with cursor() as cur:
+        for r in cur.execute(
+                "SELECT f.id, f.path, f.duration, f.pool_disk, m.grp FROM group_measure m JOIN files f ON f.id=m.file_id "
+                "WHERE COALESCE(m.brev,0)=0 AND m.err IS NULL AND f.state NOT IN ('deleted','duplicate') "
+                "ORDER BY m.file_id % 97, m.file_id LIMIT 40"):
+            r = dict(r)
+            if not _busy_disk(r.get("pool_disk") or ""):
+                return r
+    return None
+
+
+async def _recheck_step() -> bool:
+    r = await asyncio.to_thread(_recheck_next)
+    if not r:
+        return False
+    from . import outside as _out
+    _out.start("groups", r["id"])
+    STATE.update(running=True, label=os.path.basename(r["path"]), at=time.time(), pct=0.0,
+                 stage="blur re-check", file_id=r["id"], grp=r["grp"])
+    try:
+        blur = await asyncio.to_thread(blur_one, r) if os.path.exists(r["path"]) else None
+    except Exception:                                    # noqa: BLE001
+        blur = None
+    with cursor() as cur:
+        cur.execute("UPDATE group_measure SET blur=?, brev=1 WHERE file_id=?", (blur, r["id"]))
+    _out.stop("groups")
+    STATE.update(running=False, label="", last=f"{r['grp']}: blur re-check {os.path.basename(r['path'])[:50]}",
+                 done_session=STATE["done_session"] + 1)
+    return True
+
+
+def recheck_left() -> int:
+    with cursor() as cur:
+        return cur.execute("SELECT COUNT(*) n FROM group_measure WHERE COALESCE(brev,0)=0 AND err IS NULL").fetchone()["n"]
 
 
 def as_running() -> list:
@@ -254,7 +326,7 @@ async def step() -> bool:
     cand = await asyncio.to_thread(plan, 20)
     cand = [c for c in cand if not _busy_disk(c.get("pool_disk") or "")]
     if not cand:
-        return False
+        return await _recheck_step()
     r = cand[0]
     from . import outside as _out
     _out.start("groups", r["id"])
@@ -268,7 +340,7 @@ async def step() -> bool:
         codec, ten = _probe_bits(cur, r["id"])
         mbps = (r["size"] or 0) * 8 / max(1.0, float(r["duration"] or 1)) / 1e6
         cur.execute("INSERT OR REPLACE INTO group_measure(file_id,library,grp,show,path,height,codec,tenbit,mbps,"
-                    "banding,banding_max,block,blur,at,rev,err) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "banding,banding_max,block,blur,at,rev,err,brev) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
                     (r["id"], r["library"], r["grp"], _show(r["path"]), r["path"], r["height"], codec, ten,
                      round(mbps, 2), res.get("banding"), res.get("banding_max"), res.get("block"), res.get("blur"),
                      time.time(), REV, res.get("err")))
