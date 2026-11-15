@@ -224,9 +224,36 @@ async def _recheck_step() -> bool:
     return True
 
 
+_RCL: dict = {"at": 0.0, "n": 0}
+
+
 def recheck_left() -> int:
-    with cursor() as cur:
-        return cur.execute("SELECT COUNT(*) n FROM group_measure WHERE COALESCE(brev,0)=0 AND err IS NULL").fetchone()["n"]
+    """Files still waiting for the blur re-check, counted at most once a minute."""
+    if time.time() - _RCL["at"] > 60:
+        with cursor() as cur:
+            _RCL["n"] = cur.execute("SELECT COUNT(*) n FROM group_measure "
+                                    "WHERE COALESCE(brev,0)=0 AND err IS NULL").fetchone()["n"]
+        _RCL["at"] = time.time()
+    return _RCL["n"]
+
+
+def worker_row() -> dict:
+    """The measurer as a row among the workers: one file at a time, its pause switch."""
+    try:
+        rc = recheck_left()
+    except Exception:                                    # noqa: BLE001
+        rc = 0
+    new = STATE.get("left") or 0
+    run = bool(STATE.get("running"))
+    stage = STATE.get("stage") or ""
+    return {"key": "groups", "pool": "groups", "label": "Group scorecard",
+            "running": 1 if run else 0, "cap": 1, "paused": paused(),
+            "now": ("blur re-check" if "re-check" in stage else "measuring") if run else "",
+            "queued": int(new) + int(rc),
+            "hint": ("Release group scorecard: banding, blocking and blur on three short samples of a file, "
+                     "one file at a time on the CPU at low priority, never on a disk Plex is reading. "
+                     + (f"{rc:,} files are waiting for the blur re-check. " if rc else "")
+                     + "Pausing only stops the scorecard; nothing else waits on it.")}
 
 
 def as_running() -> list:
@@ -241,14 +268,17 @@ def as_running() -> list:
         lbl = label_for(file_id=STATE.get("file_id"))
     except Exception:                                    # noqa: BLE001
         lbl = re.sub(r"\.[A-Za-z0-9]{2,4}$", "", STATE.get("label") or "").split(" [")[0][:90]
+    rc = "re-check" in (STATE.get("stage") or "")
     return [{"job_id": "groups-measure", "pool": "groups", "kind": "groups",
              "title": lbl, "file": STATE.get("label") or "",
              "stage": STATE.get("stage") or "measuring", "progress": pct, "elapsed_s": round(el),
              "eta_s": None, "eta_est": True,
-             "plan": f"release group scorecard: how {STATE.get('grp') or 'this group'} encodes - "
-                     "banding (CAMBI), blocking and blur on three samples",
+             "plan": (f"release group scorecard: {STATE.get('grp') or 'this group'} - blur measured again "
+                      "(the reading before the 2026-11-14 fix lost samples with a fade)") if rc else
+                    (f"release group scorecard: how {STATE.get('grp') or 'this group'} encodes - "
+                     "banding (CAMBI), blocking and blur on three samples"),
              "why_pool": "CPU at low priority - one file at a time, only when the disk is free",
-             "doing": {"tool": "ffmpeg libvmaf CAMBI + blockdetect + blurdetect", "hw": "CPU",
+             "doing": {"tool": "ffmpeg blurdetect" if rc else "ffmpeg libvmaf CAMBI + blockdetect + blurdetect", "hw": "CPU",
                        "why": STATE.get("stage") or ""},
              "disk": _out.disk_of(STATE.get("file_id")), "dest_disk": "", "fps": 0.0, "speed": 0.0,
              "paused_for_viewer": False, "paused_for_load": False, "cancelled": False, "by_bytes": False,

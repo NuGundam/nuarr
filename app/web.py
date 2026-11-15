@@ -14506,6 +14506,13 @@ def _outside_live() -> list:
             pass
     except Exception:                                    # noqa: BLE001
         pass
+    # THE GROUP SCORECARD, one file at a time on the CPU - shown with the
+    # other workers so its card in the Processing panel has a home here too.
+    try:
+        from . import groupscore
+        out.append(groupscore.worker_row())
+    except Exception:                                    # noqa: BLE001
+        pass
     return out
 
 
@@ -14534,13 +14541,17 @@ def api_outside_pause(key: str, on: int = 1):
     """Pause or run anything outside the queue."""
     from . import submake, qwenjudge, subverify, vmaftarget, qwenvl, subtiming
     names = {"submake": "Subtitle maker", "qwen": "Qwen judge", "verify": "Second opinion",
-             "quality": "Quality searches", "qwenvl": "Qwen-VL reader", "subtiming": "Subtitle timing"}
+             "quality": "Quality searches", "qwenvl": "Qwen-VL reader", "subtiming": "Subtitle timing",
+             "groups": "Group scorecard"}
     if key not in names:
         raise HTTPException(400, "unknown key")
     if key == "quality":
         vmaftarget.set_cfg(on=not bool(on))           # paused = encodes keep the library's CQ
     elif key == "qwenvl":
         qwenvl.set_on(not bool(on))
+    elif key == "groups":
+        from . import groupscore
+        groupscore.set_paused(bool(on))
     else:
         {"submake": submake, "qwen": qwenjudge, "verify": subverify, "subtiming": subtiming}[key].set_paused(bool(on))
     joblog.log(f"{names[key]} {'paused' if on else 'running again'}", "info")
@@ -30523,7 +30534,8 @@ function outsideRows(list){
   if(!list.length) return '';
   return `<div style="padding:10px 14px 4px"><b style="font-size:12px">Outside the queue</b>
       <div class="dim" style="font-size:11px">Work that is not a queue pool: the quality search runs inside an encode slot
-      before the encode proper, and the Qwen-VL reader is asked by the OCR only when it doubts a picture. The Subtitle
+      before the encode proper, the Qwen-VL reader is asked by the OCR only when it doubts a picture, and the group
+      scorecard measures one file at a time on the CPU. The Subtitle
       maker, the Qwen judge, the second opinion and the timing check are queue pools now - their counts are above.</div></div>
     <table>${list.map(v=>{
       const pc=poolColor(v.pool), off=!!v.paused;
