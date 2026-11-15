@@ -19416,7 +19416,30 @@ function popHtmlFor(key){ const i=key.indexOf(':'); const kind=key.slice(0,i), d
 // bound by, what the middle job of that kind actually took, how many are
 // running right now - in the same card the disk panel opens, because a second
 // kind of hover card would be a second thing to learn.
+// THE WORKERS OUTSIDE THE QUEUE GET THE SAME CARD. Quality searches, the
+// Qwen-VL reader and the group scorecard had only the browser's plain title
+// tooltip; Erik: "make them all like the nice hover boxes without basic ones".
+function wpopOutHtml(key){
+  const outs=(_outLive&&_outLive.length?_outLive:((_wdata||{})._outside||[]));
+  const v=outs.find(o=>o.key===key); if(!v) return '';
+  const col=poolColor(v.pool), cap=v.cap||1;
+  const rows=[];
+  rows.push(`<b>now</b> ${v.paused
+      ? '<span style="color:var(--warn)">paused — what is running finishes, nothing new starts</span>'
+      : `${v.running||0} of ${cap} running`+(v.now?` <span style="color:${col}">· ${esc(v.now)}</span>`:'')}`);
+  rows.push(v.adjust
+      ? `<b>range</b> ${v.adjust[0]} to ${v.adjust[1]} at once`
+      : `<b>one at a time</b> <span class="dim">· no count to set</span>`);
+  rows.push(`<b>waiting</b> ${v.queued?fmt(v.queued):'nothing'}`);
+  const pill=`<span class="pill" style="color:${col};border-color:${col};margin-right:7px;font-size:10.5px">${esc(v.pool)}</span>`;
+  return `<div class="tpop-h" style="color:${col}">${pill}${esc(v.label||key)}</div>
+    <div class="tpop-n">${rows.join('<br>')}</div>
+    <div class="dim" style="font-size:11px;line-height:1.45">${esc(v.hint||'')}</div>
+    ${v.cost?costStrip(v.cost):''}
+    <div class="dim" style="font-size:10.5px;margin-top:7px">click for its pause switch on the Concurrency page</div>`;
+}
 function wpopHtml(k){
+  if(String(k).startsWith('out:')) return wpopOutHtml(String(k).slice(4));
   const v=(_wdata||{})[k]; if(!v) return '';
   const col=v.pool?poolColor(v.pool):'var(--dim)';
   const used=v.pool?(_poolUse[v.pool]||0):null;
@@ -52090,7 +52113,7 @@ function workersCompact(w){
     const used = v.pool ? (_poolUse[v.pool]||0) : null;
     return `<div class="wcell${v.paused?' off':''}" data-wpop="${esc(k)}"
          onclick="location.href='/settings#counts'">
-         <div class="wcname" style="color:${col}" title="${esc(v.label||k)}">${esc(v.label||k)}</div>
+         <div class="wcname" style="color:${col}">${esc(v.label||k)}</div>
          <div class="wcval"><b style="color:${v.value?'var(--fg,#c9d1d9)':'var(--dim)'}">${v.value}</b>`
       + (v.paused
           ? `<span class="wcsub" style="color:var(--warn)">\u23f8 paused</span>`
@@ -52103,8 +52126,8 @@ function workersCompact(w){
   const outs = (_outLive && _outLive.length ? _outLive : (w._outside||[]));
   const ocell = (v)=>{
     const col = poolColor(v.pool);
-    return `<div class="wcell${v.paused?' off':''}" onclick="location.href='/settings#counts'"
-         title="${esc(v.hint||'')}">
+    return `<div class="wcell${v.paused?' off':''}" data-wpop="out:${esc(v.key)}"
+         onclick="location.href='/settings#counts'">
          <div class="wcname" style="color:${col}">${esc(v.label)}</div>
          <div class="wcval"><b style="color:${v.running?col:'var(--dim)'}">${v.cap||1}</b>`
       + (v.paused ? `<span class="wcsub" style="color:var(--warn)">\u23f8 paused</span>`
@@ -52115,9 +52138,7 @@ function workersCompact(w){
       <div class="wcfoot">${off
         ? `<span class="warn">${off} of ${pools.length} pools paused \u2014 what is running finishes, nothing new starts</span>`
         : 'how many of each may run at once \u2014 hover one for what it costs the box'}</div>
-      <div class="wclink"><a href="/settings#counts"
-         title="limits, defaults, the pause switches, what each worker costs, and the holds and timing tab"
-         >Concurrency Settings \u2192</a></div>`;
+      <div class="wclink"><a href="/settings#counts">Concurrency Settings \u2192</a></div>`;
 }
 function paintWorkers(){
   const w=_wdata;
