@@ -64,6 +64,10 @@ PORT_WAIT_S = 300.0                     # how long a started Docker gets
 DOCKER_VERSION_FILE = r"C:\Program Files\Docker\Docker\resources\componentsVersion.json"
 DOCKER_UPDATER_NAMES = ("docker desktop installer", "docker desktop updater")
 FAST_POLL_S = 60.0                      # while Docker updates, and right after
+CONFIRM_WAIT_S = 60.0                   # a hung engine must fail twice, this far apart
+DIAGNOSE_EXE = r"C:\Program Files\Docker\Docker\resources\com.docker.diagnose.exe"
+DIAG_DIR = r"C:\ProgramData\nuarr\docker-diag"   # stacks + bundle taken before each restart
+DIAG_KEEP = 6
 
 NO_WINDOW = 0x08000000
 
@@ -145,21 +149,32 @@ def _local(host: str) -> bool:
     return host in ("127.0.0.1", "localhost", "::1", "host.docker.internal") or host == socket.gethostname().lower()
 
 
-def docker_state() -> str:
+def docker_state(confirm: bool = False) -> str:
     """'up', 'wedged' or 'down'.
 
     NOT os.path.exists(pipe): a named pipe whose instances are all busy - the
     engine hung - reads as absent, which is how a wedged Docker showed up as
     "not running" for three days. The pipe being LISTED says Docker Desktop is
-    there; the engine answering `docker version` says it works."""
-    try:
-        listed = os.path.basename(DOCKER_PIPE).lower() in {p.lower() for p in os.listdir("\\\\.\\pipe\\")}
-    except OSError:
-        listed = os.path.exists(DOCKER_PIPE)
-    if not listed:
-        return "down"
-    rc, out = _run(["docker", "version", "--format", "{{.Server.Version}}"], timeout=25)
-    return "up" if rc == 0 and out.strip() and "error" not in out.lower() else "wedged"
+    there; the engine answering `docker version` says it works.
+
+    confirm=True (the nurse's own check): a failed probe is repeated after
+    CONFIRM_WAIT_S, and only two failures in a row read as 'wedged' - one slow
+    answer while the host is busy is not worth killing every container for.
+    Status pages call it without confirm so they never wait a minute."""
+    def probe() -> str:
+        try:
+            listed = os.path.basename(DOCKER_PIPE).lower() in {p.lower() for p in os.listdir("\\\\.\\pipe\\")}
+        except OSError:
+            listed = os.path.exists(DOCKER_PIPE)
+        if not listed:
+            return "down"
+        rc, out = _run(["docker", "version", "--format", "{{.Server.Version}}"], timeout=25)
+        return "up" if rc == 0 and out.strip() and "error" not in out.lower() else "wedged"
+    st = probe()
+    if st == "wedged" and confirm:
+        time.sleep(CONFIRM_WAIT_S)
+        st = probe()
+    return st
 
 
 def docker_up() -> bool:
@@ -208,10 +223,58 @@ def _http_answers(url: str, timeout: float = 8.0) -> bool:
         return False
 
 
-def _restart_docker() -> tuple[bool, str]:
-    """End Docker Desktop (task, app, backend, its WSL distro) and start it
-    again through the scheduled task in the signed-in session. Containers
-    with a restart policy come back on their own."""
+def _docker_diag() -> str:
+    """Before a restart wipes the evidence: Docker's goroutine stacks (fast)
+    and a diagnostics bundle (slower, capped) into DIAG_DIR, oldest pruned.
+    Returns a short note for the log. Never uploads anything."""
+    if not os.path.exists(DIAGNOSE_EXE):
+        return "no diagnose tool"
+    try:
+        os.makedirs(DIAG_DIR, exist_ok=True)
+    except OSError as e:
+        return f"diag dir: {e}"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    notes = []
+    rc, out = _run([DIAGNOSE_EXE, "getstacks"], timeout=90)
+    try:
+        with open(os.path.join(DIAG_DIR, f"{stamp}-stacks.txt"), "w", encoding="utf-8") as f:
+            f.write(out)
+        notes.append(f"stacks rc {rc}")
+    except OSError as e:
+        notes.append(f"stacks: {e}")
+    t0 = time.time()
+    rc, out = _run([DIAGNOSE_EXE, "gather", os.path.join(DIAG_DIR, f"{stamp}-bundle.zip")], timeout=300)
+    try:
+        with open(os.path.join(DIAG_DIR, f"{stamp}-gather.txt"), "w", encoding="utf-8") as f:
+            f.write(out)
+    except OSError:
+        pass
+    notes.append(f"bundle rc {rc} in {int(time.time() - t0)} s")
+    try:                                                 # keep the newest DIAG_KEEP restarts
+        stamps = sorted({n[:15] for n in os.listdir(DIAG_DIR) if n[:8].isdigit()})
+        for old in stamps[:-DIAG_KEEP]:
+            for n in os.listdir(DIAG_DIR):
+                if n.startswith(old):
+                    os.remove(os.path.join(DIAG_DIR, n))
+    except OSError:
+        pass
+    return f"diagnostics {stamp} ({', '.join(notes)})"
+
+
+def _wsl_distro_stopped(timeout_s: float = 30.0) -> bool:
+    """Wait until `wsl -l -v` no longer shows docker-desktop Running."""
+    end = time.time() + timeout_s
+    while time.time() < end:
+        rc, out = _run(["wsl", "-l", "-v"], timeout=20)
+        txt = out.replace("\x00", "")
+        rows = [ln for ln in txt.splitlines() if "docker-desktop" in ln]
+        if rc == 0 and not any("Running" in ln for ln in rows):
+            return True
+        time.sleep(3)
+    return False
+
+
+def _stop_start_docker() -> tuple[int, str, list]:
     steps = []
     for args in (["schtasks", "/End", "/TN", DOCKER_TASK],
                  ["taskkill", "/F", "/IM", "Docker Desktop.exe", "/IM", "com.docker.backend.exe",
@@ -219,15 +282,30 @@ def _restart_docker() -> tuple[bool, str]:
                  ["wsl", "--terminate", "docker-desktop"]):
         rc, out = _run(args, timeout=60)
         steps.append(f"{args[0]} {rc}")
-    time.sleep(5)
+    # 2026-11-14: starting 5 s after the terminate raced WSL - Docker's own
+    # `wsl --version` failed and it sat on an error dialog. Let the distro
+    # stop and WSL settle first.
+    steps.append("wsl stopped" if _wsl_distro_stopped() else "wsl still running")
+    time.sleep(10)
     rc, out = _run(["schtasks", "/Run", "/TN", DOCKER_TASK])
-    if rc:
-        return False, f"could not start it again: {out.strip()[:140]}"
-    for _ in range(int(PORT_WAIT_S / 10)):
-        time.sleep(10)
-        if docker_state() == "up":
-            return True, ", ".join(steps)
-    return False, f"restarted, but the engine did not answer within {int(PORT_WAIT_S / 60)} minutes"
+    return rc, out, steps
+
+
+def _restart_docker() -> tuple[bool, str]:
+    """End Docker Desktop (task, app, backend, its WSL distro) and start it
+    again through the scheduled task in the signed-in session. Containers
+    with a restart policy come back on their own. Diagnostics are taken
+    first; if the engine is not back within PORT_WAIT_S it is tried once more."""
+    diag = _docker_diag()
+    for attempt in (1, 2):
+        rc, out, steps = _stop_start_docker()
+        if rc:
+            return False, f"{diag}; could not start it again: {out.strip()[:140]}"
+        for _ in range(int(PORT_WAIT_S / 10)):
+            time.sleep(10)
+            if docker_state() == "up":
+                return True, ", ".join(steps) + (" (second try)" if attempt == 2 else "") + "; " + diag
+    return False, f"{diag}; restarted twice, but the engine did not answer within {int(PORT_WAIT_S / 60)} minutes"
 
 
 def _run(args: list, timeout: float = 60.0) -> tuple[int, str]:
@@ -329,7 +407,7 @@ async def check(act: bool | None = None) -> dict:
                                        "its proxy and every Cloudflare-protected indexer are down until it is back - "
                                        "the nurse re-tests them when it is", "fix": "", "level": "info"})
         else:
-            dstate = await asyncio.to_thread(docker_state)
+            dstate = await asyncio.to_thread(docker_state, True)
         if ver and not dk.get("version"):
             dk["version"] = ver
         post_update = (not updating and dstate == "up" and bool(ver)

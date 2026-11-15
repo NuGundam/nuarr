@@ -109,7 +109,8 @@ def measure_one(row: dict) -> dict:
         for k, t in enumerate(marks):
             log = os.path.join(tmp, f"c{k}.json")
             lp = log.replace("\\", "/").replace(":", "\\:")
-            lav = (f"[0:v]select='not(mod(n\\,3))',blockdetect,blurdetect,format=yuv420p10le,split[a][b];"
+            lav = (f"[0:v]select='not(mod(n\\,3))',blockdetect,blurdetect,metadata=print:key=lavfi.blur,"
+                   f"format=yuv420p10le,split[a][b];"
                    f"[a][b]libvmaf=log_fmt=json:log_path='{lp}':n_threads=3:feature=name=cambi")
             STATE.update(pct=k / len(marks), stage=f"sample {k + 1} of {len(marks)} - banding, blocking, blur")
             pp = subprocess.Popen([ff, "-hide_banner", "-nostdin", "-nostats", "-v", "info", "-threads", "3",
@@ -129,11 +130,18 @@ def measure_one(row: dict) -> dict:
                 stderr = err_
             p = _P()
             m1 = re.search(r"block mean:\s*([\d.]+)", p.stderr or "")
-            m2 = re.search(r"blur mean:\s*([\d.]+)", p.stderr or "")
+            # BLUR FROM THE FRAMES THAT HAVE ONE. blurdetect answers "nan" for a
+            # frame with no edges (a fade, a black frame), and a single such
+            # frame turned ffmpeg's own "blur mean" into nan - which the pattern
+            # never matched, so every sample with a fade in it lost its blur
+            # reading and the figures came only from fade-free samples (found
+            # 2026-11-14 measuring 9-1-1 Nashville: 60 of 144 frames nan). The
+            # per-frame values are printed and averaged without the nans.
+            fr = [float(x) for x in re.findall(r"lavfi\.blur=([\d.]+)", p.stderr or "")]
             if m1:
                 blocks.append(float(m1.group(1)))
-            if m2:
-                blurs.append(float(m2.group(1)))
+            if fr:
+                blurs.append(statistics.mean(fr))
             try:
                 bands.append(float(json.load(open(log, encoding="utf-8"))["pooled_metrics"]["cambi"]["mean"]))
             except Exception:                            # noqa: BLE001

@@ -111,6 +111,7 @@ def wants(library: str | None, vcodec: str, ten_bit: bool, hdr: bool,
 # Same limits as the real thing: 8-bit H.264, SDR, and the 20% saving gate.
 # The list lives in kv because a plan is decided again when the job starts.
 TRIAL_KV = "convert.hevc10.trial"
+FIRST_KV = "convert.hevc10.first"
 
 
 def trial_ids() -> set:
@@ -216,7 +217,15 @@ def candidates(force: bool = False) -> list:
                 out.append({"id": r["id"], "path": r["path"], "title": r["title"] or "",
                             "mbps": round(mbps, 2), "gb": r["size"] / 1e9, "disk": r["pool_disk"] or "",
                             "library": r["library"] or ""})
-    out.sort(key=lambda x: -x["mbps"])
+    # FIRST, BY HAND: ids in kv convert.hevc10.first go ahead of everything,
+    # in bitrate order among themselves (2026-11-14: the 815 held TV files
+    # released after the Profilarr fix, put ahead of the movies). A list
+    # emptied by the conversions simply stops mattering.
+    try:
+        first = {int(x) for x in json.loads(kv_get(FIRST_KV) or "[]")}
+    except Exception:                                    # noqa: BLE001
+        first = set()
+    out.sort(key=lambda x: (0 if x["id"] in first else 1, -x["mbps"]))
     STATE.update(cands=out, cand_at=time.time())
     return out
 
@@ -269,7 +278,17 @@ async def feed() -> int:
     room = c["keep"] - queued
     if room <= 0:
         return 0
-    pick = _spread(await asyncio.to_thread(candidates), room)
+    cands = await asyncio.to_thread(candidates)
+    # the hand-picked "first" ids are fed before the round robin over disks
+    try:
+        first = {int(x) for x in json.loads(kv_get(FIRST_KV) or "[]")}
+    except Exception:                                    # noqa: BLE001
+        first = set()
+    head = [x for x in cands if x["id"] in first]
+    pick = _spread(head, room) if head else []
+    if len(pick) < room:
+        rest = [x for x in cands if x["id"] not in first]
+        pick += _spread(rest, room - len(pick))
     n = 0
     for r in pick:
         try:
