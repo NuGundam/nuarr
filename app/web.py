@@ -11796,12 +11796,15 @@ def api_profadv():
 
 
 @app.post("/api/profadv/cfg")
-def api_profadv_cfg(armed: int = -1, per_hour: int = 0, max_below: int = -1):
+def api_profadv_cfg(armed: int = -1, per_hour: int = 0, max_below: int = -1, sure_at: int = 0, mode: str = ""):
     from . import profadvisor
+    if mode in ("auto", "manual"):
+        armed = 1 if mode == "auto" else 0
     c = profadvisor.set_cfg(armed=None if armed < 0 else bool(armed), per_hour=per_hour or None,
-                            max_below=None if max_below < 0 else max_below)
-    joblog.log(f"profile advisor: {'armed' if c['armed'] else 'preview only'}, {c['per_hour']} series an hour, "
-               f"asks before a move that puts more than {c['max_below']} files under the minimum", "info")
+                            max_below=None if max_below < 0 else max_below, sure_at=sure_at or None)
+    joblog.log(f"profile advisor: {'auto' if c['armed'] else 'manual'}, {c['per_hour']} series an hour, "
+               f"auto acts at {c['sure_at']}% sure and asks before a move that puts more than "
+               f"{c['max_below']} files under the minimum", "info")
     return c
 
 
@@ -36577,8 +36580,9 @@ function profAdvPaint(){
     <td class="dim">${esc(r.profile)}</td>
     <td>${r.status==='moved'?'<span class="dim">from '+esc(r.applied_from||'')+'</span>':'→ <b>'+esc(r.want)+'</b>'}</td>
     <td class="dim" title="${esc(ev(r))}">${r.verdict==='4k'?'released in 4K':'1080p only'}</td>
+    <td title="${esc(ev(r))}" style="color:${(r.sure||0)>=c.sure_at?'#7fd4a3':'#e2b341'}">${r.sure!=null?r.sure+'%':''}</td>
     <td>${r.impact&&r.impact.files!=null?`<span style="color:${r.impact.below_min>c.max_below?'#e2b341':'var(--dim)'}">${r.impact.below_min} of ${r.impact.files}</span>`:''}</td>
-    <td style="color:${col[r.status]}">${word[r.status]||r.status}</td>
+    <td style="color:${col[r.status]}" title="${esc(r.note||'')}">${word[r.status]||r.status}${r.status==='needs_ok'&&r.note?`<div class="dim" style="font-size:10px;white-space:normal;max-width:260px">${esc(r.note)}</div>`:''}</td>
     <td>${r.status==='would'||r.status==='needs_ok'?`<button class="rmb" onclick="profAdvApply(${r.series_id},this)" title="move this series to ${esc(r.want)} now${r.impact&&r.impact.below_min?` - Sonarr will then look to replace the ${r.impact.below_min} file(s) that fall under its minimum`:''}">Move</button>`:''}</td></tr>`;
   const all=(v.rows||[]).slice().sort((a,b)=>(a.status>b.status?1:a.status<b.status?-1:a.title.localeCompare(b.title)));
   const rows=all.filter(r=>r.status!=='moved');
@@ -36600,22 +36604,28 @@ function profAdvPaint(){
           <td class="dim">${esc(r.note||'')}</td></tr>`).join('')}</table></div>`:''}</div>`:'';
   el.innerHTML=`<div class="lkind" style="padding:11px 12px">
     <div class="lkindhead"><b style="color:#8fd0ff">Profile advisor</b>
-      <span class="dim" style="font-size:11px">${c.armed?'armed - small moves are made on their own':'preview only - nothing is changed in Sonarr until armed'}
+      <span class="dim" style="font-size:11px">${c.armed?'auto - sure moves are made on their own':'manual - nothing is changed in Sonarr until you press Move'}
         · looked up ${fmt(v.seen)}${v.total?' of '+fmt(v.total):''} series${v.running?' · <span class="loaddot"></span>looking one up':''}${v.last?' · last: '+esc(v.last):''}</span>
       <span style="margin-left:auto;display:flex;gap:6px;align-items:center;font-size:11px">
         <span title="how many series are looked up an hour - each is one to three release searches on every indexer">
           <input type="number" min="1" max="30" value="${c.per_hour}" style="width:48px;box-sizing:border-box;font-size:11px" onchange="profAdvSet({per_hour:this.value})"> an hour</span>
-        <span title="a move that would put more files than this under the new profile's minimum is never made on its own - it waits for the Move button">ask above
-          <input type="number" min="0" max="500" value="${c.max_below}" style="width:48px;box-sizing:border-box;font-size:11px" onchange="profAdvSet({max_below:this.value})"> files</span>
+        <span title="auto moves a series only when the verdict is at least this sure">acts at
+          <input type="number" min="50" max="100" value="${c.sure_at}" style="width:48px;box-sizing:border-box;font-size:11px" onchange="profAdvSet({sure_at:this.value})">% sure</span>
+        <span title="a move that would put more files than this under the new profile's minimum is never made on its own - it waits for the Move button">and up to
+          <input type="number" min="0" max="500" value="${c.max_below}" style="width:48px;box-sizing:border-box;font-size:11px" onchange="profAdvSet({max_below:this.value})"> files to replace</span>
         <button class="rmb" onclick="profAdvRun(this)" ${v.running?'disabled':''}>Look one up now</button>
-        <button class="rmb" onclick="profAdvSet({armed:${c.armed?0:1}})" title="${c.armed?'stop moving series; the table keeps filling':'let nuarr move a series when the move puts no more than '+c.max_below+' files under the minimum'}">${c.armed?'Disarm':'Arm'}</button></span></div>
+        ${modeSeg('', c.armed?'auto':'manual', 'profAdvMode', {
+          auto:'Moves a series on its own when the verdict is at least '+c.sure_at+'% sure and the move puts no more than '+c.max_below+' files under the new minimum. Everything else waits for Move.',
+          manual:'Looks series up and fills the table; nothing is changed in Sonarr until you press Move.'})}</span></div>
     ${_paMsg&&Date.now()-_paMsg.at<120000?`<div style="font-size:11.5px;margin:5px 0 0;color:${_paMsg.c}">${_paMsg.t}</div>`:''}
     ${v.err?`<div style="font-size:11.5px;margin:5px 0 0;color:#ff7b72">${esc(v.err)}</div>`:''}
     <div class="dim" style="font-size:11px;margin:5px 0 4px">Nothing in TheTVDB or Sonarr says whether a show is released in 4K, so nuarr asks: it runs Sonarr's release search on
       episodes that have already aired and counts what comes back. 4K web or disc releases from two or more groups mean the show belongs on the 2160p profile; plenty of 1080p and no 4K
       means the 1080p one. Going up takes ${c.up_eps} episodes that agree, because it re-downloads the show; going down takes ${c.down_eps}. A 1080p-only show left on the 2160p profile grabs nothing
       - its releases score under that profile's minimum - which is why this is decided early. Before a move, the series' own files are scored against the new profile: the ones that would
-      fall under its minimum are the ones Sonarr will then try to replace, and a move with more than ${c.max_below} of those waits for the Move button. Anime is left alone.</div>
+      fall under its minimum are the ones Sonarr will then try to replace. <b>Sure</b> is how firmly the releases say it: each episode that agrees counts by how many
+      releases it had, one episode alone counts for less, and a 1080p-only answer on an episode under a week old counts for less again, because 4K releases often arrive days later.
+      In <b>auto</b>, a move is made on its own when it is at least ${c.sure_at}% sure and puts no more than ${c.max_below} files under the new minimum; the rest wait for Move, with the reason shown. Anime is left alone.</div>
     <div style="display:flex;gap:16px;flex-wrap:wrap;font-size:11.5px;margin:4px 0">
       <span><b>${fmt(n.ok||0)}</b> <span class="dim">on the right profile</span></span>
       <span style="color:${col.would}"><b>${fmt(n.would||0)}</b> ${c.armed?'to move':'would move'}</span>
@@ -36624,7 +36634,7 @@ function profAdvPaint(){
       <span class="dim"><b>${fmt(n.unknown||0)}</b> cannot be told yet</span></div>
     ${tblCss}${rows.length?`
       <div style="max-height:300px;overflow:auto;border:1px solid var(--line);border-radius:6px;padding:0 10px;margin-top:4px"><table class="paT">
-      <tr><th>SERIES</th><th>NOW ON</th><th>BELONGS ON</th><th>WHY</th><th title="files of this series that would fall under the new profile's minimum, which Sonarr would then look to replace">FILES UNDER THE MINIMUM</th><th>STATE</th><th></th></tr>
+      <tr><th>SERIES</th><th>NOW ON</th><th>BELONGS ON</th><th>WHY</th><th title="how sure the verdict is, from how many episodes agree and how many releases each had">SURE</th><th title="files of this series that would fall under the new profile's minimum, which Sonarr would then look to replace">FILES UNDER THE MINIMUM</th><th>STATE</th><th></th></tr>
       ${rows.map(row).join('')}</table></div>`:`<div class="dim" style="font-size:11px">no series is waiting for a different profile</div>`}
     ${movedBox}
   </div>`;
@@ -36632,7 +36642,7 @@ function profAdvPaint(){
 async function profAdvSet(o){
   const q=Object.entries(o).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');
   await fetch('/api/profadv/cfg?'+q,{method:'POST'});
-  if('armed' in o) _paMsg={at:Date.now(),c:'var(--dim)',t:o.armed?'armed - small moves are made as series are looked up':'disarmed - preview only'};
+  if('mode' in o) _paMsg={at:Date.now(),c:'var(--dim)',t:o.mode==='auto'?'auto - sure moves are made as series are looked up':'manual - nothing moves until you press Move'};
   loadProfAdv();
 }
 async function profAdvRun(btn){
@@ -36643,6 +36653,7 @@ async function profAdvRun(btn){
   }catch(e){ _paMsg={at:Date.now(),c:'#ff7b72',t:'failed: '+esc(String(e&&e.message||e))}; }
   loadProfAdv();
 }
+function profAdvMode(m){ profAdvSet({mode:m}); }
 async function profAdvApply(id,btn){
   if(btn) btn.disabled=true;
   try{ const d=await (await fetch('/api/profadv/apply?series_id='+id,{method:'POST'})).json();

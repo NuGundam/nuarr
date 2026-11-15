@@ -52,6 +52,7 @@ DEFAULTS = {
     "armed": False,
     "per_hour": 4,                 # series looked up per hour (each is 1-3 release searches)
     "max_below": 3,                # a move that puts more files than this under the minimum waits for a click
+    "sure_at": 80,                 # auto moves only a verdict at least this sure (%)
     "wait_h": 36,                  # an episode counts once it aired this long ago
     "down_eps": 2, "up_eps": 3,
     "recheck_d": 14, "recheck_ended_d": 120,
@@ -91,6 +92,8 @@ def set_cfg(**kw) -> dict:
             c[k] = max(1, min(30, int(v)))
         elif k == "max_below":
             c[k] = max(0, min(500, int(v)))
+        elif k == "sure_at":
+            c[k] = max(50, min(100, int(v)))
         else:
             c[k] = max(1, int(v))
     kv_set(KV, json.dumps(c))
@@ -103,6 +106,9 @@ def init() -> None:
             series_id INTEGER PRIMARY KEY, title TEXT, root TEXT, profile TEXT, status TEXT,
             verdict TEXT, want TEXT, evidence TEXT, impact TEXT, note TEXT,
             checked_at REAL, seasons INTEGER, applied_at REAL, applied_from TEXT)""")
+        have = [r["name"] for r in cur.execute("PRAGMA table_info(profadv)")]
+        if "sure" not in have:
+            cur.execute("ALTER TABLE profadv ADD COLUMN sure INTEGER")
 
 
 def _raw_client():
@@ -183,6 +189,54 @@ def _impact(efs: list, p: dict) -> dict:
             "not_allowed": sum(1 for e in efs if e["quality"]["quality"]["name"] not in al)}
 
 
+def sure_of(verdict: str, evidence: list) -> int:
+    """HOW SURE, 0-100, from the episodes that were searched.
+
+    Each episode that agrees with the verdict counts for 0.6 to 1.0 by how
+    loud it is: for 4K, two groups is the floor (0.6) and five or more is
+    certain (1.0); for 1080p-only, three releases is the floor and fifteen
+    or more certain. An episode that disagrees counts 0. Then:
+      one episode only            x 0.9   (one week can be a fluke)
+      1080p-only and the newest   x 0.8   (4K releases often land days later)
+      episode aired under 7 days ago
+    So three loud episodes in agreement read 100, a single fresh 1080p
+    episode with a dozen releases reads about 58."""
+    if verdict not in ("4k", "1080") or not evidence:
+        return 0
+    parts = []
+    for e in evidence:
+        if verdict == "4k":
+            ok = (e.get("g4") or 0) >= MIN_4K_GROUPS
+            parts.append(0.6 + 0.4 * min(1.0, ((e.get("g4") or 0) - MIN_4K_GROUPS) / 3.0) if ok else 0.0)
+        else:
+            ok = (e.get("n4") or 0) == 0 and (e.get("n1080") or 0) >= MIN_1080
+            parts.append(0.6 + 0.4 * min(1.0, ((e.get("n1080") or 0) - MIN_1080) / 12.0) if ok else 0.0)
+    s = sum(parts) / len(parts)
+    if len(parts) == 1:
+        s *= 0.9
+    if verdict == "1080":
+        newest = max((e.get("air") or "") for e in evidence)
+        if newest and newest > time.strftime("%Y-%m-%d", time.gmtime(time.time() - 7 * 86400)):
+            s *= 0.8
+    return int(round(100 * s))
+
+
+def gate(row: dict, conf: dict | None = None) -> tuple:
+    """Would auto move this row on its own? (status, why not). Asked again
+    whenever the settings are read, so a new line applies to old rows."""
+    conf = conf or cfg()
+    imp = row.get("impact") or {}
+    sure = int(row.get("sure") or 0)
+    below = int(imp.get("below_min") or 0)
+    why = []
+    if sure < conf["sure_at"]:
+        why.append(f"{sure}% sure, auto acts at {conf['sure_at']}%")
+    if below > conf["max_below"]:
+        why.append(f"{below} of {imp.get('files', 0)} files would fall under the minimum of {row.get('want')} "
+                   f"and Sonarr would look to replace them")
+    return ("needs_ok" if why else "would"), "; ".join(why)
+
+
 def _count(rel: list) -> dict:
     """Distinct releases of one episode by resolution. Season packs and
     upscaled TV captures are not evidence of a 4K show."""
@@ -216,7 +270,7 @@ async def check(series_id: int) -> dict:
     now_name = (profs.get(s.get("qualityProfileId")) or {}).get("name") or "?"
     row = {"series_id": s["id"], "title": s.get("title") or "", "root": root, "profile": now_name, "status": "skip",
            "verdict": "", "want": "", "evidence": [], "impact": {}, "note": "",
-           "seasons": int((s.get("statistics") or {}).get("seasonCount") or 0)}
+           "seasons": int((s.get("statistics") or {}).get("seasonCount") or 0), "sure": 0}
     if not rc or rc["hi"] not in by_name or rc["lo"] not in by_name:
         row["note"] = "this folder has no pair of profiles to choose between"
         return _save(row)
@@ -259,11 +313,8 @@ async def check(series_id: int) -> dict:
         return _save(row)
     efs = await c._get("/episodefile", seriesId=s["id"])
     imp = _impact(efs, by_name[want])
-    row.update(want=want, impact=imp,
-               status="needs_ok" if imp["below_min"] > conf["max_below"] else "would")
-    if row["status"] == "needs_ok":
-        row["note"] = (f"{imp['below_min']} of {imp['files']} files would fall under the minimum of {want} "
-                       f"and Sonarr would look to replace them")
+    row.update(want=want, impact=imp, sure=sure_of(verdict, ev))
+    row["status"], row["note"] = gate(row, conf)
     saved = _save(row)
     if conf["armed"] and row["status"] == "would":
         return await apply(s["id"], auto=True)
@@ -273,13 +324,14 @@ async def check(series_id: int) -> dict:
 def _save(row: dict) -> dict:
     with cursor() as cur:
         cur.execute(
-            "INSERT INTO profadv(series_id,title,root,profile,status,verdict,want,evidence,impact,note,checked_at,seasons) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(series_id) DO UPDATE SET title=excluded.title, "
+            "INSERT INTO profadv(series_id,title,root,profile,status,verdict,want,evidence,impact,note,checked_at,seasons,sure) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(series_id) DO UPDATE SET title=excluded.title, sure=excluded.sure, "
             "root=excluded.root, profile=excluded.profile, status=excluded.status, verdict=excluded.verdict, "
             "want=excluded.want, evidence=excluded.evidence, impact=excluded.impact, note=excluded.note, "
             "checked_at=excluded.checked_at, seasons=excluded.seasons",
             (row["series_id"], row["title"], row["root"], row["profile"], row["status"], row["verdict"], row["want"],
-             json.dumps(row["evidence"]), json.dumps(row["impact"]), row["note"], time.time(), row["seasons"]))
+             json.dumps(row["evidence"]), json.dumps(row["impact"]), row["note"], time.time(), row["seasons"],
+             int(row.get("sure") or 0)))
     return {"ok": True, **row}
 
 
@@ -362,11 +414,33 @@ async def _next() -> int | None:
 async def _apply_pending() -> dict | None:
     """Armed: one series whose row already says "would move" (looked up
     before the switch was on) is moved now, not at its next recheck."""
-    if not cfg()["armed"]:
+    conf = cfg()
+    if not conf["armed"]:
         return None
+    for r in _rows():
+        if r["status"] == "would":
+            return await apply(int(r["series_id"]), auto=True)
+    return None
+
+
+def _rows() -> list:
+    """Every row, with how sure it is and whether auto would act on it worked
+    out again under today's settings."""
+    init()
+    conf = cfg()
     with cursor() as cur:
-        r = cur.execute("SELECT series_id FROM profadv WHERE status='would' ORDER BY checked_at LIMIT 1").fetchone()
-    return await apply(int(r["series_id"]), auto=True) if r else None
+        rows = [dict(r) for r in cur.execute("SELECT * FROM profadv ORDER BY checked_at")]
+    for r in rows:
+        for k in ("evidence", "impact"):
+            try:
+                r[k] = json.loads(r[k] or "null")
+            except Exception:                                    # noqa: BLE001
+                r[k] = None
+        if r["verdict"] in ("4k", "1080"):
+            r["sure"] = sure_of(r["verdict"], r["evidence"] or [])
+        if r["status"] in ("would", "needs_ok"):
+            r["status"], r["note"] = gate(r, conf)
+    return rows
 
 
 async def run_one() -> dict:
@@ -394,15 +468,7 @@ async def run_one() -> dict:
 
 
 def snapshot() -> dict:
-    init()
-    with cursor() as cur:
-        rows = [dict(r) for r in cur.execute("SELECT * FROM profadv ORDER BY checked_at DESC")]
-    for r in rows:
-        for k in ("evidence", "impact"):
-            try:
-                r[k] = json.loads(r[k] or "null")
-            except Exception:                                    # noqa: BLE001
-                r[k] = None
+    rows = sorted(_rows(), key=lambda r: -(r.get("checked_at") or 0))
     counts: dict = {}
     for r in rows:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
