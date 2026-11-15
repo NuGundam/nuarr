@@ -66,6 +66,14 @@ DEFAULTS = {
 MIN_4K_GROUPS = 2                  # distinct release groups with a 2160p web/disc release
 MIN_1080 = 3                       # distinct 1080p releases before "no 4K" means anything
 REAL_SOURCES = ("web", "webRip", "bluray", "blurayRaw")
+# A 4K RELEASE TAGGED WITH A STREAMING SERVICE is the strongest evidence there
+# is: the service itself offers the show in 4K, and the release is a copy of
+# that stream. An untagged 4K web release can be an upscale or a re-encode of
+# a 1080p one, so on its own it counts for less (see sure_of).
+SERVICES = ("AMZN", "NF", "DSNP", "ATVP", "ATV", "HMAX", "MAX", "PCOK", "HULU", "PMTP", "PMNT", "STAN",
+            "CRAV", "iT", "SHO", "STARZ", "ROKU", "VUDU", "MA", "SKST", "NOW", "BCORE", "CRKL", "ITVX", "iP")
+import re as _re
+_SERVICE_RE = _re.compile(r"(?:^|[ ._\-\[(])(" + "|".join(SERVICES) + r")(?=[ ._\-\])]|$)")
 STATE: dict = {"running": False, "last": "", "at": 0.0, "checked": [], "err": ""}
 _CLIENT: dict = {}
 
@@ -189,13 +197,20 @@ def _impact(efs: list, p: dict) -> dict:
             "not_allowed": sum(1 for e in efs if e["quality"]["quality"]["name"] not in al)}
 
 
+def _is4k(e: dict) -> bool:
+    """4K: two groups, or one group copying a streaming service's 4K."""
+    return (e.get("g4") or 0) >= MIN_4K_GROUPS or ((e.get("s4") or 0) >= 1 and (e.get("g4") or 0) >= 1)
+
+
 def sure_of(verdict: str, evidence: list) -> int:
     """HOW SURE, 0-100, from the episodes that were searched.
 
-    Each episode that agrees with the verdict counts for 0.6 to 1.0 by how
-    loud it is: for 4K, two groups is the floor (0.6) and five or more is
-    certain (1.0); for 1080p-only, three releases is the floor and fifteen
-    or more certain. An episode that disagrees counts 0. Then:
+    Each episode that agrees with the verdict counts by how loud it is. For
+    4K, STREAMING SERVICES WEIGH MOST: a 4K release tagged AMZN, NF, DSNP...
+    counts 0.8 from a single group, 0.9 at two groups and 1.0 at three (or
+    at two services); 4K with no service behind it counts 0.5-0.7, which on
+    its own never reaches the default 80 %. For 1080p-only, three releases
+    is the floor (0.6) and fifteen or more certain (1.0). An episode that disagrees counts 0. Then:
       one episode only            x 0.9   (one week can be a fluke)
       1080p-only and the newest   x 0.8   (4K releases often land days later)
       episode aired under 7 days ago
@@ -206,8 +221,19 @@ def sure_of(verdict: str, evidence: list) -> int:
     parts = []
     for e in evidence:
         if verdict == "4k":
-            ok = (e.get("g4") or 0) >= MIN_4K_GROUPS
-            parts.append(0.6 + 0.4 * min(1.0, ((e.get("g4") or 0) - MIN_4K_GROUPS) / 3.0) if ok else 0.0)
+            g4 = e.get("g4") or 0
+            if not _is4k(e):
+                parts.append(0.0)
+            elif "s4" not in e:
+                # looked up before services were counted
+                parts.append(0.6 + 0.4 * min(1.0, (g4 - MIN_4K_GROUPS) / 3.0))
+            elif e["s4"] >= 1:
+                # a streaming service offers it in 4K: strong from the first group,
+                # certain at three groups or two services
+                parts.append(min(1.0, 0.8 + 0.1 * (g4 - 1) + 0.1 * (e["s4"] - 1)))
+            else:
+                # 4K with no service behind it - could be upscales: never enough alone
+                parts.append(0.5 + 0.2 * min(1.0, (g4 - MIN_4K_GROUPS) / 4.0))
         else:
             ok = (e.get("n4") or 0) == 0 and (e.get("n1080") or 0) >= MIN_1080
             parts.append(0.6 + 0.4 * min(1.0, ((e.get("n1080") or 0) - MIN_1080) / 12.0) if ok else 0.0)
@@ -240,7 +266,7 @@ def gate(row: dict, conf: dict | None = None) -> tuple:
 def _count(rel: list) -> dict:
     """Distinct releases of one episode by resolution. Season packs and
     upscaled TV captures are not evidence of a 4K show."""
-    g4, t4, t1 = set(), set(), set()
+    g4, t4, t1, sv = set(), set(), set(), set()
     for r in rel:
         q = (r.get("quality") or {}).get("quality") or {}
         if r.get("fullSeason") or not r.get("episodeRequested", True):
@@ -250,9 +276,13 @@ def _count(rel: list) -> dict:
         if res == 2160 and src in REAL_SOURCES:
             t4.add(title)
             g4.add((r.get("releaseGroup") or "").lower() or title)
+            if src in ("web", "webRip"):
+                m = _SERVICE_RE.search(r.get("title") or "")
+                if m:
+                    sv.add(m.group(1).upper())
         elif res == 1080:
             t1.add(title)
-    return {"n4": len(t4), "g4": len(g4), "n1080": len(t1), "all": len(rel)}
+    return {"n4": len(t4), "g4": len(g4), "n1080": len(t1), "all": len(rel), "s4": len(sv), "services": sorted(sv)}
 
 
 async def check(series_id: int) -> dict:
@@ -289,14 +319,14 @@ async def check(series_id: int) -> dict:
         k = _count(rel)
         k.update(ep=f"S{e['seasonNumber']:02}E{e['episodeNumber']:02}", air=e["airDateUtc"][:10])
         ev.append(k)
-        has4 = k["g4"] >= MIN_4K_GROUPS
+        has4 = _is4k(k)
         # one answer is enough when it agrees with where the series already is
         if on_hi and has4:
             break
         if not on_hi and not has4:
             break
     row["evidence"] = ev
-    with4 = [k for k in ev if k["g4"] >= MIN_4K_GROUPS]
+    with4 = [k for k in ev if _is4k(k)]
     no4 = [k for k in ev if k["n4"] == 0 and k["n1080"] >= MIN_1080]
     if on_hi:
         verdict = "4k" if with4 else "1080" if len(no4) == len(ev) == need else "unknown"

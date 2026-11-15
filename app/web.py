@@ -36574,7 +36574,7 @@ function profAdvPaint(){
   const el=document.getElementById('profAdv'), v=_pa; if(!el||!v) return;
   const c=v.cfg, n=v.counts||{}, col={would:'#7fd4a3',needs_ok:'#e2b341',moved:'#8fd0ff'};
   const word={would:c.armed?'moving':'would move',needs_ok:'needs your OK',moved:'moved'};
-  const ev=r=>(r.evidence||[]).map(e=>`${e.ep}: ${e.n4} in 4K from ${e.g4} group${e.g4===1?'':'s'}, ${e.n1080} in 1080p`).join(' · ');
+  const ev=r=>(r.evidence||[]).map(e=>`${e.ep}: ${e.n4} in 4K from ${e.g4} group${e.g4===1?'':'s'}${e.services&&e.services.length?' ('+e.services.join(', ')+')':e.s4===0?' (no streaming service)':''}, ${e.n1080} in 1080p`).join(' · ');
   const row=r=>`<tr>
     <td title="${esc(ev(r))}">${esc(r.title)}</td>
     <td class="dim">${esc(r.profile)}</td>
@@ -36624,7 +36624,8 @@ function profAdvPaint(){
       means the 1080p one. Going up takes ${c.up_eps} episodes that agree, because it re-downloads the show; going down takes ${c.down_eps}. A 1080p-only show left on the 2160p profile grabs nothing
       - its releases score under that profile's minimum - which is why this is decided early. Before a move, the series' own files are scored against the new profile: the ones that would
       fall under its minimum are the ones Sonarr will then try to replace. <b>Sure</b> is how firmly the releases say it: each episode that agrees counts by how many
-      releases it had, one episode alone counts for less, and a 1080p-only answer on an episode under a week old counts for less again, because 4K releases often arrive days later.
+      releases it had - for 4K, a release tagged with a streaming service (AMZN, NF, DSNP, ATVP, PCOK...) counts most, because the service itself offers it in 4K,
+      while 4K with no service behind it may be an upscale and is never enough on its own - one episode alone counts for less, and a 1080p-only answer on an episode under a week old counts for less again, because 4K releases often arrive days later.
       In <b>auto</b>, a move is made on its own when it is at least ${c.sure_at}% sure and puts no more than ${c.max_below} files under the new minimum; the rest wait for Move, with the reason shown. Anime is left alone.</div>
     <div style="display:flex;gap:16px;flex-wrap:wrap;font-size:11.5px;margin:4px 0">
       <span><b>${fmt(n.ok||0)}</b> <span class="dim">on the right profile</span></span>
@@ -48996,7 +48997,7 @@ async function loadArrSync(){
   try{ _arrSync=await (await fetch('/api/arrsync')).json(); }
   catch(e){
     // a poll that fails (a busy server) keeps what is on screen
-    if(!_arrSync) el.innerHTML='<span class="dim">could not load</span>';
+    if(!_arrSync){ const m=arrSyncBox(); if(m) m.innerHTML='<span class="dim">could not load</span>'; }
     else if(_arrSync.running||(_arrSync.fixing&&_arrSync.fixing.running)) _arrSyncTimer=setTimeout(loadArrSync, 4000);
     return;
   }
@@ -49013,14 +49014,35 @@ async function loadArrSync(){
   // page waited behind them. The bar still moves; it moves in steps.
   if(busy) _arrSyncTimer=setTimeout(loadArrSync, 4000);
 }
+// ONE HEIGHT, SCANNING OR NOT. The scan's progress block is four lines and the
+// result is a dozen, and every check (every 5 min, and each poll while it
+// scans) swapped one for the other - the whole page below jumped each time.
+// The block above the file list now keeps the tallest it has ever been, and
+// remembers it across page loads, so it is the same height in both states.
+// The file list sits outside it: that one opens and shuts on a click, and a
+// click is allowed to move the page.
+const ARRSYNC_H_KEY='nuarr.arrsync.h';
+function arrSyncBox(){
+  const el=document.getElementById('arrSyncBody'); if(!el) return null;
+  let main=document.getElementById('arrSyncMain');
+  if(!main){
+    el.innerHTML=`<div id="arrSyncMain"></div><div id="arrSyncList" style="margin-top:8px"></div>
+      <div id="arrSyncMsg" class="dim" style="font-size:11.5px;margin-top:5px"></div>`;
+    main=document.getElementById('arrSyncMain');
+    let h=0; try{ h=parseInt(localStorage.getItem(ARRSYNC_H_KEY)||'0',10)||0; }catch(e){}
+    if(h>0 && h<900){ main._steadyH=h; main.style.minHeight=h+'px'; }
+  }
+  return main;
+}
 function arrSyncPaint(){
-  const el=document.getElementById('arrSyncBody');
-  if(!el||!_arrSync) return;
-  const busy=!!(_arrSync.running||(_arrSync.fixing&&_arrSync.fixing.running));
-  steadyPaint(el, _arrSyncPaint, busy);
+  const main=arrSyncBox();
+  if(!main||!_arrSync) return;
+  steadyPaint(main, _arrSyncPaint, true);
+  try{ if(main._steadyH) localStorage.setItem(ARRSYNC_H_KEY, String(main._steadyH)); }catch(e){}
+  arrSyncListPaint();
 }
 function _arrSyncPaint(){
-  const el=document.getElementById('arrSyncBody');
+  const el=document.getElementById('arrSyncMain');
   if(!el||!_arrSync) return;
   const d=_arrSync, C=d.checks||{}, n=d.counts||{};
   if(d.running){
@@ -49150,10 +49172,7 @@ function _arrSyncPaint(){
         title="Sets the languages Nuarr knows, and asks the arrs to re-read the files for the rest">${
           fixing?'Putting it right…':'Put right'+(auto?' now':'')}</button>`:''}
     </div>
-    <table style="width:100%;border-collapse:collapse;font-size:11.5px">${rows}</table>
-    <div id="arrSyncList" style="margin-top:8px"></div>
-    <div id="arrSyncMsg" class="dim" style="font-size:11.5px;margin-top:5px"></div>`;
-  arrSyncListPaint();
+    <table style="width:100%;border-collapse:collapse;font-size:11.5px">${rows}</table>`;
 }
 
 // ---- which processor a job is on, at a glance ----------------------------
@@ -49941,37 +49960,43 @@ async function loadArrsTab(refresh){
   // at all - if they are broken nothing else on this page matters. The guards
   // are optional scripts that fix a specific annoyance, so they sit at the
   // bottom under their own heading rather than in front of the plumbing.
-  el.innerHTML =
-    (d.stats.running?`<div class="dim" style="margin-bottom:8px">running: ${esc(d.stats.running)}…</div>`:'')
-    + `<div style="border:1px solid var(--line);border-radius:8px;padding:10px 14px">
-        <div style="display:flex;align-items:center;gap:10px">
-          <b>Webhooks</b>
-          <button style="margin-left:auto" onclick="registerHooks()">Re-register now</button>
-        </div>
-        <div class="dim" style="font-size:11px;margin:6px 0 4px">
-          How Nuarr hears about imports, upgrades, renames and deletes the moment
-          they happen. Registration is automatic; this shows whether it is actually
-          holding, because a stale hook produces silence, not an error.</div>
-        <span id="hookmsg" class="dim" style="font-size:11px"></span>
-        <div id="hookstate" class="dim" style="margin-top:5px;font-size:11px"></div>
-      </div>`
-    + `<div style="margin:22px 0 10px;padding-top:14px;border-top:2px solid var(--line)">
-        <div style="font-size:15px;font-weight:600">Custom arrs scripts</div>
-        <div class="dim" style="font-size:11px;margin-top:3px;max-width:70ch">
-          Optional jobs that keep something in Radarr/Sonarr the way you decided
-          it, against a tool that would otherwise overwrite it. Each is off until
-          you turn it on, and each works only on the names you list — nothing
-          here touches a profile or format you have not named.
-        </div>
-      </div>`
-    + job('profile_guard','2160p profile split guard',
+  // NO WHOLE-BODY REBUILD. The minute refresh used to replace this body's
+  // innerHTML wholesale: the webhook state and the bitrate-cut table (both
+  // filled by their own fetches) came back empty for a moment, the body shrank
+  // by ~300 px and grew back, and the page below flashed and jumped every
+  // minute. Now each block is a keyed wrapper, painted once, and a refresh
+  // touches only a wrapper whose own HTML changed. The two blocks that fill
+  // themselves are never rebuilt at all.
+  //
+  // WHAT NEEDS YOU GOES FIRST. Within the custom scripts, a card with
+  // something waiting on a decision rises to the top, then one that changed
+  // something lately, then the rest; switched-off scripts sink to the bottom.
+  const now=Date.now()/1000, rbs=d.release_ban||{}, qjs=d.queue_janitor||{};
+  let bcOpen=0; try{ const b=await (await fetch('/api/bitcut')).json(); bcOpen=(b.rows||[]).filter(r=>r.state==='open').length; }catch(e){}
+  const recent=st=>st&&st.last_run&&now-st.last_run<6*3600;
+  const attn={
+    profile_guard:{need:(!(d.split_profiles?.radarr||[]).length&&!(d.split_profiles?.sonarr||[]).length)?'no profiles listed':'',
+                   changed:recent(g)&&(+g.fixed||0)>0?`re-applied ${g.fixed} split${(+g.fixed)===1?'':'s'}`:''},
+    trash_anime:{need:(!d.trash_autoadd&&(t.new_formats||[]).length)?`${t.new_formats.length} new format${t.new_formats.length===1?'':'s'} to add`:'',
+                 changed:recent(t)&&(+t.updated||0)>0?`updated ${t.updated}`:''},
+    release_ban:{need:((rbs.collisions||{}).left||0)>0?`${rbs.collisions.left} collision${rbs.collisions.left===1?'':'s'} to settle`:'',
+                 changed:(rbs.rows||[]).some(r=>r.added_at&&now-r.added_at<6*3600)?'new bans lately':''},
+    queue_janitor:{need:(qjs.kicked||{}).why?'stopped - see why':'',
+                   changed:recent(qjst)&&(+qjst.removed||0)>0?`removed ${qjst.removed}`:''},
+    prowlarr_search:{need:'', changed:((d.prowlarr_search||{}).active||[]).length?'searching now':(recent((d.prowlarr_search||{}).stats)&&(+((d.prowlarr_search||{}).stats||{}).pushed||0)>0?'pushed releases lately':'')},
+    bcBox:{need:bcOpen?`${bcOpen} cut upgrade${bcOpen===1?'':'s'} to decide`:'', changed:''},
+  };
+  const chip=k=>{ const a=attn[k]||{}; return a.need?`<span class="pill" style="color:#e2b341;border-color:#e2b341;margin-left:8px;font-size:10.5px">needs you · ${esc(a.need)}</span>`
+    : a.changed?`<span class="pill" style="color:#79c0ff;border-color:rgba(121,192,255,.5);margin-left:8px;font-size:10.5px">${esc(a.changed)}</span>`:''; };
+  const cards=[
+    ['profile_guard', job('profile_guard','2160p profile split guard',
         'Verifies the listed profiles still rank resolution first (two ordered '
         +'quality groups, upgrade-until on the 2160p group) and re-applies the split '
         +'if a Profilarr sync has flattened them back to one merged group.',
         d.toggles.profile_guard, g,
         {label:'Profiles to keep split', kind:'profile_guard',
-         names:d.split_profiles||{}, empty:'no profiles listed — this guard does nothing'})
-    + job('trash_anime','TRaSH anime format sync',
+         names:d.split_profiles||{}, empty:'no profiles listed — this guard does nothing'})],
+    ['trash_anime', job('trash_anime','TRaSH anime format sync',
         'Fetches the current anime custom formats from the TRaSH guides repo and '
         +'updates existing formats whose matching rules drifted. Never deletes, never '
         +'adds formats to profiles by itself — new ones are listed here for you.',
@@ -49979,8 +50004,8 @@ async function loadArrsTab(refresh){
         {label:'Formats to keep in sync', kind:'trash_anime',
          names:d.anime_formats||{},
          empty:'none listed — every anime format the guides publish that already exists in the arr',
-         adder:newFmts(t)})
-    + job('release_ban','Rejected releases, banned for every indexer',
+         adder:newFmts(t)})],
+    ['release_ban', job('release_ban','Rejected releases, banned for every indexer',
         'When nuarr rejects a release - no English in a file that said DUAL, a '
         +'container that does not decode, a raw the Subtitle maker could not subtitle - the arr blocklists '
         +'that ONE grab from that ONE indexer, and the same release is on four others. '
@@ -49998,8 +50023,8 @@ async function loadArrsTab(refresh){
         d.toggles.release_ban, rbst,
         {label:'Profiles to score on (empty = every profile in that arr)',
          kind:'release_ban', names:rb.profiles||{},
-         empty:'', adder:banList(rb)})
-    + job('queue_janitor','Queue janitor: downloads the arrs finished with but never let go of',
+         empty:'', adder:banList(rb)})],
+    ['queue_janitor', job('queue_janitor','Queue janitor: downloads the arrs finished with but never let go of',
         'A download that completes and then cannot be imported - a better release '
         +'landed first so it is "not a Custom Format upgrade", or the import already '
         +'happened through nuarr and the arr never closed the entry - sits in the '
@@ -50018,8 +50043,8 @@ async function loadArrsTab(refresh){
         +'moment its file list is known, even mid-download, and blocklisted so the '
         +'arr goes looking for a real release instead. And a finished download the arr cannot place - "Unable to parse release", an unknown series or film - has its name read by Qwen, and is imported when that reading matches exactly one film or episode here and the arr offers the file for it; anything else stays for you. A download Sonarr refuses for its shape - a single episode where a two-episode file sits on disk, or a name its parser reads differently from its own grab - is imported when it beats every file it would replace (higher quality in the profile, or the same quality and a higher score), and removed when it beats none of them.',
         d.toggles.queue_janitor, qjst,
-        {label:'', kind:'queue_janitor', names:{}, empty:'', adder:qjList(qj)})
-    + job('prowlarr_search','Prowlarr searcher: nuarr looks for the replacement itself',
+        {label:'', kind:'queue_janitor', names:{}, empty:'', adder:qjList(qj)})],
+    ['prowlarr_search', job('prowlarr_search','Prowlarr searcher: nuarr looks for the replacement itself',
         'When nuarr rejects a file (wrong language, broken, a fake), the arr\'s own search is one indexer round '
         +'scored by its own rules, and it never weighs a season pack against the single episode it wants. This asks '
         +'Prowlarr directly - every indexer it has - reads each name with the arr\'s own parser (quality, custom-format '
@@ -50029,10 +50054,61 @@ async function loadArrsTab(refresh){
         +'a name the arr refuses moves on to the next. Nothing downloads outside the arr. Run now sweeps the arrs\' wanted '
         +'lists (aired, monitored, no file) for what their own searches have not filled; the sweep also runs every 6 hours.',
         d.toggles.prowlarr_search, (d.prowlarr_search||{}).stats||{},
-        {label:'', kind:'prowlarr_search', names:{}, empty:'', adder:psList(d.prowlarr_search||{})})
-    + `<div id="bcBox" style="margin-top:12px"></div>`;
+        {label:'', kind:'prowlarr_search', names:{}, empty:'', adder:psList(d.prowlarr_search||{})})],
+  ];
+  const order=['profile_guard','trash_anime','release_ban','queue_janitor','prowlarr_search','bcBox'];
+  const rank=k=>{ const a=attn[k]||{}, on=k==='bcBox'?true:!!d.toggles[k];
+    return (a.need?0:a.changed?1:on?2:3)*10+order.indexOf(k); };
+  const parts=[['running', (d.stats.running?`<div class="dim" style="margin-bottom:8px">running: ${esc(d.stats.running)}…</div>`:'')], ['hooks', `<div style="border:1px solid var(--line);border-radius:8px;padding:10px 14px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <b>Webhooks</b>
+          <button style="margin-left:auto" onclick="registerHooks()">Re-register now</button>
+        </div>
+        <div class="dim" style="font-size:11px;margin:6px 0 4px">
+          How Nuarr hears about imports, upgrades, renames and deletes the moment
+          they happen. Registration is automatic; this shows whether it is actually
+          holding, because a stale hook produces silence, not an error.</div>
+        <span id="hookmsg" class="dim" style="font-size:11px"></span>
+        <div id="hookstate" class="dim" style="margin-top:5px;font-size:11px"></div>
+      </div>`], ['head', `<div style="margin:22px 0 10px;padding-top:14px;border-top:2px solid var(--line)">
+        <div style="font-size:15px;font-weight:600">Custom arrs scripts</div>
+        <div class="dim" style="font-size:11px;margin-top:3px;max-width:70ch">
+          Optional jobs that keep something in Radarr/Sonarr the way you decided
+          it, against a tool that would otherwise overwrite it. Each is off until
+          you turn it on, and each works only on the names you list — nothing
+          here touches a profile or format you have not named.
+        </div>
+      </div>`]];
+  const scripts=[...cards.map(([k,h])=>[k, h.replace('</b>', '</b>'+chip(k))]),
+    ['bcBox', `${chip('bcBox')?`<div style="margin:2px 0 4px">${chip('bcBox')}</div>`:''}<div id="bcBox" style="margin-top:12px"></div>`]]
+    .sort((x,y)=>rank(x[0])-rank(y[0]));
+  const all=[...parts, ...scripts];
+  const fresh=!el.querySelector(':scope > [data-k]');
+  if(fresh){
+    el.innerHTML=all.map(([k,h])=>`<div data-k="${k}">${h}</div>`).join('');
+    all.forEach(([k,h])=>{ const w=el.querySelector(`:scope > [data-k="${k}"]`); if(w) w._h=h; });
+  }else{
+    // put the wrappers in the new order (moving a node keeps its contents)
+    all.forEach(([k,h])=>{
+      let w=el.querySelector(`:scope > [data-k="${k}"]`);
+      if(!w){ w=document.createElement('div'); w.dataset.k=k; w.innerHTML=h; w._h=h; }
+      // the self-filling blocks keep what they hold; only their chip line may change
+      else if(k==='bcBox'){ const c=chip('bcBox'); const lead=w.firstElementChild&&w.firstElementChild.id!=='bcBox'?w.firstElementChild:null;
+        if(c&&!lead){ const x=document.createElement('div'); x.style.margin='2px 0 4px'; x.innerHTML=c; w.prepend(x); }
+        else if(lead&&!c) lead.remove(); else if(lead&&lead.innerHTML!==c) lead.innerHTML=c; }
+      else if(k!=='hooks' && w._h!==h){
+        // a box inside the card that fills itself (the janitor's #dlBox) is
+        // carried across, so the card never shows it empty for a moment
+        const keepIds=['dlBox','hookstate'], kept={};
+        keepIds.forEach(id=>{ const x=w.querySelector('#'+id); if(x) kept[id]=x; });
+        w.innerHTML=h; w._h=h;
+        Object.entries(kept).forEach(([id,x])=>{ const y=w.querySelector('#'+id); if(y) y.replaceWith(x); });
+      }
+      el.appendChild(w);
+    });
+  }
   loadHookState();
-  _bcKey='';                 // the box is new and empty - paint it whatever the data says
+  if(fresh) _bcKey='';       // the box is new and empty - paint it whatever the data says
   bcLoad();
   dlLoad();
 }
