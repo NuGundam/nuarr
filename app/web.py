@@ -36556,7 +36556,8 @@ async function nurseProwlarr(){
   nurseRun();
 }
 // ---- profile advisor (profadvisor.py): which quality profile a series belongs on ----
-let _pa=null, _paMsg=null, _paOpen=false, _paT=null;
+let _pa=null, _paMsg=null, _paOpen=false, _paT=null, _paMovedOpen=false;
+function profAdvMovedToggle(){ _paMovedOpen=!_paMovedOpen; profAdvPaint(); }
 async function loadProfAdv(){
   const el=document.getElementById('profAdv'); if(!el) return;
   if(!el.firstElementChild) el.innerHTML=`<div class="lkind" style="padding:10px 12px"><b style="color:#8fd0ff">Profile advisor</b>
@@ -36579,7 +36580,24 @@ function profAdvPaint(){
     <td>${r.impact&&r.impact.files!=null?`<span style="color:${r.impact.below_min>c.max_below?'#e2b341':'var(--dim)'}">${r.impact.below_min} of ${r.impact.files}</span>`:''}</td>
     <td style="color:${col[r.status]}">${word[r.status]||r.status}</td>
     <td>${r.status==='would'||r.status==='needs_ok'?`<button class="rmb" onclick="profAdvApply(${r.series_id},this)" title="move this series to ${esc(r.want)} now${r.impact&&r.impact.below_min?` - Sonarr will then look to replace the ${r.impact.below_min} file(s) that fall under its minimum`:''}">Move</button>`:''}</td></tr>`;
-  const rows=(v.rows||[]).slice().sort((a,b)=>(a.status>b.status?1:a.status<b.status?-1:a.title.localeCompare(b.title)));
+  const all=(v.rows||[]).slice().sort((a,b)=>(a.status>b.status?1:a.status<b.status?-1:a.title.localeCompare(b.title)));
+  const rows=all.filter(r=>r.status!=='moved');
+  const moved=all.filter(r=>r.status==='moved').sort((a,b)=>(b.applied_at||0)-(a.applied_at||0));
+  const tblCss=`<style>.paT{width:100%;font-size:11.5px;border-collapse:collapse}.paT td,.paT th{padding:4px 12px 4px 0;text-align:left;vertical-align:middle;border-bottom:0;white-space:nowrap}
+        .paT td{border-top:1px solid var(--line)}.paT th{font-size:10.5px;font-weight:600;color:var(--dim)}.paT td:first-child{max-width:320px;overflow:hidden;text-overflow:ellipsis}</style>`;
+  // MOVED SERIES: SHUT BY DEFAULT. They are history - what was done and when -
+  // and left open they would push the ones still waiting off the panel.
+  const movedBox=moved.length?`<div style="border:1px solid var(--line);border-radius:6px;overflow:hidden;margin-top:6px">
+      <div onclick="profAdvMovedToggle()" style="display:flex;gap:7px;align-items:center;cursor:pointer;user-select:none;padding:4px 8px;font-size:11.5px;background:#161b22;border-bottom:${_paMovedOpen?'1px solid var(--line)':'0'}">
+        <span class="dim" style="display:inline-block;width:9px;transform:rotate(${_paMovedOpen?90:0}deg);transition:transform .15s">▶</span>
+        <b>${_paMovedOpen?'Hide':'Show'} the ${fmt(moved.length)} moved series</b>
+        <span class="dim">${_paMovedOpen?'newest first':'— which, from where, and when'}</span></div>
+      ${_paMovedOpen?`<div style="max-height:260px;overflow:auto;padding:0 10px"><table class="paT">
+        <tr><th>SERIES</th><th>FROM</th><th>TO</th><th>WHY</th><th>WHEN</th><th>NOTE</th></tr>
+        ${moved.map(r=>`<tr><td title="${esc(ev(r))}">${esc(r.title)}</td><td class="dim">${esc(r.applied_from||'')}</td><td><b>${esc(r.profile)}</b></td>
+          <td class="dim" title="${esc(ev(r))}">${r.verdict==='4k'?'released in 4K':'1080p only'}</td>
+          <td class="dim" title="${r.applied_at?esc(new Date(r.applied_at*1000).toLocaleString()):''}">${r.applied_at?ago(r.applied_at):''}</td>
+          <td class="dim">${esc(r.note||'')}</td></tr>`).join('')}</table></div>`:''}</div>`:'';
   el.innerHTML=`<div class="lkind" style="padding:11px 12px">
     <div class="lkindhead"><b style="color:#8fd0ff">Profile advisor</b>
       <span class="dim" style="font-size:11px">${c.armed?'armed - small moves are made on their own':'preview only - nothing is changed in Sonarr until armed'}
@@ -36604,11 +36622,11 @@ function profAdvPaint(){
       <span style="color:${col.needs_ok}"><b>${fmt(n.needs_ok||0)}</b> need your OK</span>
       <span style="color:${col.moved}"><b>${fmt(n.moved||0)}</b> moved</span>
       <span class="dim"><b>${fmt(n.unknown||0)}</b> cannot be told yet</span></div>
-    ${rows.length?`<style>.paT{width:100%;font-size:11.5px;border-collapse:collapse}.paT td,.paT th{padding:4px 12px 4px 0;text-align:left;vertical-align:middle;border-bottom:0;white-space:nowrap}
-        .paT td{border-top:1px solid var(--line)}.paT th{font-size:10.5px;font-weight:600;color:var(--dim)}.paT td:first-child{max-width:320px;overflow:hidden;text-overflow:ellipsis}</style>
+    ${tblCss}${rows.length?`
       <div style="max-height:300px;overflow:auto;border:1px solid var(--line);border-radius:6px;padding:0 10px;margin-top:4px"><table class="paT">
       <tr><th>SERIES</th><th>NOW ON</th><th>BELONGS ON</th><th>WHY</th><th title="files of this series that would fall under the new profile's minimum, which Sonarr would then look to replace">FILES UNDER THE MINIMUM</th><th>STATE</th><th></th></tr>
-      ${rows.map(row).join('')}</table></div>`:`<div class="dim" style="font-size:11px">no series needs a different profile so far</div>`}
+      ${rows.map(row).join('')}</table></div>`:`<div class="dim" style="font-size:11px">no series is waiting for a different profile</div>`}
+    ${movedBox}
   </div>`;
 }
 async function profAdvSet(o){

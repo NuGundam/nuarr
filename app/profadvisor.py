@@ -359,11 +359,25 @@ async def _next() -> int | None:
     return best
 
 
+async def _apply_pending() -> dict | None:
+    """Armed: one series whose row already says "would move" (looked up
+    before the switch was on) is moved now, not at its next recheck."""
+    if not cfg()["armed"]:
+        return None
+    with cursor() as cur:
+        r = cur.execute("SELECT series_id FROM profadv WHERE status='would' ORDER BY checked_at LIMIT 1").fetchone()
+    return await apply(int(r["series_id"]), auto=True) if r else None
+
+
 async def run_one() -> dict:
     if STATE["running"]:
         return {"ok": False, "why": "already looking one up"}
     STATE["running"] = True
     try:
+        init()
+        done = await _apply_pending()
+        if done and done.get("ok"):
+            STATE.update(last=f"moved {done.get('to')} ({done.get('from')} before)", at=time.time(), err="")
         sid = await _next()
         if sid is None:
             STATE["last"] = "every series is up to date"
