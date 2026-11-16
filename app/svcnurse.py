@@ -70,9 +70,29 @@ DIAG_DIR = r"C:\ProgramData\nuarr\docker-diag"   # stacks + bundle taken before 
 DIAG_KEEP = 6
 
 NO_WINDOW = 0x08000000
+# 2026-11-16: a busy host, not a broken Docker. When the engine stops
+# answering while the CPU is this busy, nuarr eases off first (holds new jobs,
+# drops its own processes to idle priority) and gives Docker RELIEF_WAIT_S to
+# answer before anything is restarted.
+BUSY_CPU = 80.0
+RELIEF_WAIT_S = 240.0
+RELIEF_PROBE_S = 30.0
+RELIEF_HOLD_S = 600.0                   # keep new jobs held this long after Docker answers
+PRIORITY_EVERY_S = 15.0                 # standing below-normal sweep of nuarr's child processes
+# one container at a time: restart only the one that is broken
+CTR_COOLDOWN_S = 1800.0
+CTR_MAX_RESTARTS = 3                    # in CTR_WINDOW_S; then report, stop touching it
+CTR_WINDOW_S = 6 * 3600.0
+CTR_MIN_UPTIME_S = 300.0                # a container this fresh is still starting
+CTR_PORT_FAILS = 2                      # port refused this many passes in a row = hung
+CTR_MANUAL_EXIT = (0, 137, 143)         # docker stop / compose down - a person did it
 
 STATE: dict = {"running": False, "at": 0.0, "checked": 0, "findings": [], "actions": [],
-               "prowlarr": {}, "proxies": [], "docker": None, "indexers": {}, "stage": ""}
+               "prowlarr": {}, "proxies": [], "docker": None, "indexers": {}, "stage": "",
+               "containers": [], "load": {}}
+# THE HOLD the job gate reads (gate.check_nurse): set while Docker is being
+# given room, {"since", "until", "why", "idle"}; empty = no hold.
+HOLD: dict = {}
 
 
 # ------------------------------------------------------------ settings ----
@@ -161,20 +181,124 @@ def docker_state(confirm: bool = False) -> str:
     CONFIRM_WAIT_S, and only two failures in a row read as 'wedged' - one slow
     answer while the host is busy is not worth killing every container for.
     Status pages call it without confirm so they never wait a minute."""
-    def probe() -> str:
-        try:
-            listed = os.path.basename(DOCKER_PIPE).lower() in {p.lower() for p in os.listdir("\\\\.\\pipe\\")}
-        except OSError:
-            listed = os.path.exists(DOCKER_PIPE)
-        if not listed:
-            return "down"
-        rc, out = _run(["docker", "version", "--format", "{{.Server.Version}}"], timeout=25)
-        return "up" if rc == 0 and out.strip() and "error" not in out.lower() else "wedged"
-    st = probe()
+    st = _probe_docker()
     if st == "wedged" and confirm:
         time.sleep(CONFIRM_WAIT_S)
-        st = probe()
+        st = _probe_docker()
     return st
+
+
+def _probe_docker(timeout: float = 25.0) -> str:
+    try:
+        listed = os.path.basename(DOCKER_PIPE).lower() in {p.lower() for p in os.listdir("\\\\.\\pipe\\")}
+    except OSError:
+        listed = os.path.exists(DOCKER_PIPE)
+    if not listed:
+        return "down"
+    rc, out = _run(["docker", "version", "--format", "{{.Server.Version}}"], timeout=timeout)
+    return "up" if rc == 0 and out.strip() and "error" not in out.lower() else "wedged"
+
+
+# ------------------------------------------------- nuarr's own load ----
+# Erik's question, 2026-11-16: is nuarr itself starving Docker? These answer it
+# with a number at every hang (kept in nurse.state "hangs") and act on it.
+# The hypervisor runs the core scheduler (type 0x3), so host priorities do not
+# reach Docker's Linux VM - but its Windows side (backend, the CLI pipe relay,
+# where the 11-14 stalls sat) runs on the host and does gain from them.
+def _nuarr_procs() -> list:
+    import psutil
+    try:
+        return psutil.Process(os.getpid()).children(recursive=True)
+    except Exception:                                    # noqa: BLE001
+        return []
+
+
+def load_now(sample_s: float = 2.0) -> dict:
+    """Whole-machine CPU and the share nuarr and its children take, % of all cores."""
+    import psutil
+    procs = [psutil.Process(os.getpid())] + _nuarr_procs()
+    for p in procs:
+        try:
+            p.cpu_percent(None)
+        except Exception:                                # noqa: BLE001
+            pass
+    cpu = psutil.cpu_percent(interval=sample_s)
+    cores = psutil.cpu_count() or 1
+    mine = 0.0
+    for p in procs:
+        try:
+            mine += p.cpu_percent(None)
+        except Exception:                                # noqa: BLE001
+            pass
+    return {"cpu": round(cpu), "nuarr": round(min(100.0, mine / cores)),
+            "ram": round(psutil.virtual_memory().percent), "at": time.time()}
+
+
+def set_priority(level: str) -> int:
+    """'below' (standing) or 'idle' (while Docker is given room) on every
+    process nuarr started - ffmpeg, vship, the AI tools. nuarr's own process
+    keeps normal priority so the web UI and the job loop stay quick.
+    Returns how many processes were changed."""
+    import psutil
+    want = psutil.IDLE_PRIORITY_CLASS if level == "idle" else psutil.BELOW_NORMAL_PRIORITY_CLASS
+    n = 0
+    for p in _nuarr_procs():
+        try:
+            if p.nice() == want:
+                continue
+            p.nice(want)
+            n += 1
+        except Exception:                                # noqa: BLE001
+            pass
+    return n
+
+
+async def priority_loop() -> None:
+    """Standing rule: nuarr's worker processes run below normal, so Docker's
+    Windows side, Plex and the arrs win the CPU when it is contested. Idle
+    while a Docker relief is on."""
+    while True:
+        try:
+            await asyncio.to_thread(set_priority, "idle" if hold_active().get("idle") else "below")
+        except Exception:                                # noqa: BLE001
+            pass
+        await asyncio.sleep(PRIORITY_EVERY_S)
+
+
+def hold_active() -> dict:
+    if HOLD and time.time() < float(HOLD.get("until") or 0):
+        return HOLD
+    HOLD.clear()
+    return {}
+
+
+def _hold(why: str, secs: float, idle: bool) -> None:
+    now = time.time()
+    since = HOLD.get("since") or now
+    HOLD.clear()
+    HOLD.update(since=since, until=now + secs, why=why, idle=idle)
+    set_priority("idle" if idle else "below")
+
+
+def _settle() -> None:
+    """Docker answers again: keep new jobs back RELIEF_HOLD_S, priorities back to below normal."""
+    if HOLD:
+        _hold("Docker answers again - keeping new jobs back a few minutes while it settles",
+              RELIEF_HOLD_S, False)
+
+
+def _relieve_and_probe(load: dict) -> str:
+    """Docker did not answer while the machine was busy. Hold new nuarr jobs,
+    drop nuarr's processes to idle, and give Docker RELIEF_WAIT_S to answer
+    (longer probe timeout too). 'up' = it was starved, not hung."""
+    _hold(f"Docker stopped answering with the CPU at {load['cpu']}% (nuarr {load['nuarr']}%) - "
+          "giving it room before deciding it is hung", RELIEF_WAIT_S + 900, True)
+    end = time.time() + RELIEF_WAIT_S
+    while time.time() < end:
+        time.sleep(RELIEF_PROBE_S)
+        if _probe_docker(timeout=60) == "up":
+            return "up"
+    return _probe_docker(timeout=60)
 
 
 def docker_up() -> bool:
@@ -329,6 +453,156 @@ def _container_for_port(port: int) -> tuple[str, str]:
     return "", ""
 
 
+CTR_FMT = ("{{.Name}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|"
+           "{{.State.StartedAt}}|{{.State.ExitCode}}|{{.HostConfig.RestartPolicy.Name}}")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):                 # a 3xx is an answer; do not follow it
+        return None
+
+
+def _http_any(port: int, timeout: float = 10.0) -> bool:
+    """Any HTTP reply at all (2xx-5xx, redirects not followed) = alive."""
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(f"http://127.0.0.1:{port}/", timeout=timeout):
+            return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:                                    # noqa: BLE001
+        return False
+
+
+def _compose_busy() -> str:
+    """A compose run or the container update script is working on the
+    containers right now - their stops and restarts are not faults."""
+    import psutil
+    for p in psutil.process_iter(["name", "cmdline"]):
+        try:
+            n = (p.info["name"] or "").lower()
+            cmd = " ".join(p.info["cmdline"] or []).lower()
+        except Exception:                                # noqa: BLE001
+            continue
+        if n.startswith("docker-compose") or "update-dockercontainers" in cmd:
+            return n
+        if n == "docker.exe" and " compose " in f" {cmd} ":
+            return "docker compose"
+    return ""
+
+
+def _started_s(stamp: str) -> float:
+    """Docker's StartedAt ('2026-11-16T15:34:10.12345Z', UTC) as epoch seconds."""
+    import calendar
+    try:
+        return float(calendar.timegm(time.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S")))
+    except Exception:                                    # noqa: BLE001
+        return 0.0
+
+
+def _container_rows() -> list:
+    rc, out = _run(["docker", "ps", "-a", "--format", "{{.Names}}|{{.Ports}}"], timeout=30)
+    if rc:
+        return []
+    ports = {}
+    for line in out.splitlines():
+        if "|" in line:
+            n, p = line.split("|", 1)
+            hp = re.findall(r"(?:0\.0\.0\.0|127\.0\.0\.1|\[::\]):(\d+)->\d+/tcp", p)
+            ports[n] = int(hp[0]) if hp else 0
+    if not ports:
+        return []
+    rc, out = _run(["docker", "inspect", "--format", CTR_FMT] + list(ports), timeout=30)
+    if rc:
+        return []
+    rows = []
+    for line in out.splitlines():
+        p = line.split("|")
+        if len(p) == 6:
+            name = p[0].lstrip("/")
+            rows.append({"name": name, "state": p[1], "health": p[2], "started": _started_s(p[3]),
+                         "exit": int(p[4] or 0) if p[4].lstrip("-").isdigit() else 0, "policy": p[5],
+                         "port": ports.get(name, 0)})
+    return rows
+
+
+async def _watch_containers(mem: dict, act: bool, findings: list, now: float, skip_ports: set) -> None:
+    """Each container on its own: unhealthy, running-but-refusing its port,
+    or stopped by itself -> restart/start THAT container, with a cooldown and
+    a cap (CTR_MAX_RESTARTS in CTR_WINDOW_S, then it is left to a person).
+    A container a person stopped (exit 0/137/143) is left stopped. The proxy
+    containers (Byparr) are handled by the proxy check above."""
+    busy = await asyncio.to_thread(_compose_busy)
+    if busy:
+        STATE["containers"] = [{"name": "-", "note": f"{busy} is working on the containers - not touching them"}]
+        return
+    rows = await asyncio.to_thread(_container_rows)
+    if not rows:
+        return
+    cm = mem.setdefault("ctr", {})
+    out = []
+    for c in rows:
+        name, st = c["name"], c["state"]
+        rec = cm.setdefault(name, {})
+        up_s = now - c["started"] if c["started"] else 0.0
+        op, why = "", ""
+        if st == "running":
+            if c["health"] == "unhealthy" and up_s > CTR_MIN_UPTIME_S:
+                op, why = "restart", "Docker's own health check says it is unhealthy"
+            elif c["port"] and c["port"] not in skip_ports and up_s > CTR_MIN_UPTIME_S:
+                # an HTTP answer, not an open port (wslrelay keeps the port
+                # bound while the container behind it is dead) - for any
+                # container that has answered HTTP before; others by port
+                ok = await asyncio.to_thread(_http_any, c["port"])
+                if ok:
+                    rec["http"] = True
+                elif not rec.get("http"):
+                    ok = await asyncio.to_thread(_port_open, "127.0.0.1", c["port"], 3.0)
+                rec["pf"] = 0 if ok else int(rec.get("pf") or 0) + 1
+                if rec["pf"] >= CTR_PORT_FAILS:
+                    op, why = "restart", f"running, but port {c['port']} refused {rec['pf']} checks in a row"
+        elif st in ("exited", "dead") and rec.get("run") and c["exit"] not in CTR_MANUAL_EXIT:
+            op, why = "start", f"stopped by itself (exit code {c['exit']}) and Docker did not bring it back"
+        rec["rs"] = int(rec.get("rs") or 0) + 1 if st == "restarting" else 0
+        if rec["rs"] >= 2:
+            findings.append({"what": f"container {name} keeps restarting",
+                             "detail": "Docker is restarting it in a loop - its own log says why "
+                                       f"(docker logs {name}); restarting it again would not help",
+                             "fix": "", "level": "warn"})
+        rec["run"] = st == "running"
+        row = {"name": name, "state": st, "health": c["health"], "port": c["port"], "problem": why}
+        out.append(row)
+        if not op:
+            continue
+        recent = [t for t in rec.get("r") or [] if now - t < CTR_WINDOW_S]
+        rec["r"] = recent
+        f = {"what": f"container {name}: {why}", "detail": "", "fix": f"docker {op} {name}", "level": "error"}
+        findings.append(f)
+        if len(recent) >= CTR_MAX_RESTARTS:
+            f["detail"] = f"restarted {len(recent)} times in {int(CTR_WINDOW_S / 3600)} h already - leaving it to you"
+            if now - float(rec.get("told") or 0) > CTR_WINDOW_S:
+                rec["told"] = now
+                await _notify(f"nuarr: container {name} keeps failing",
+                              f"{why}. Restarted {len(recent)} times in {int(CTR_WINDOW_S / 3600)} h; not trying again.")
+            continue
+        if recent and now - recent[-1] < CTR_COOLDOWN_S:
+            f["detail"] = "restarted it less than 30 minutes ago - waiting before trying again"
+            continue
+        if not act:
+            continue
+        STATE["stage"] = f"{op}ing container {name}"
+        rc, msg = await asyncio.to_thread(_run, ["docker", op, name], 120)
+        rec["r"] = recent + [now]
+        rec["pf"] = 0
+        if rc:
+            _act(f"docker {op} {name} failed ({why}): {msg.strip()[:120]}", ok=False)
+        else:
+            f["fixed"] = True
+            row["problem"] = f"{op}ed: {why}"
+            _act(f"{op}ed container {name} only - {why}")
+    STATE["containers"] = out
+    _remember(mem)
+
+
 def _act(what: str, ok: bool = True) -> None:
     STATE["actions"] = ([{"at": time.time(), "what": what, "ok": ok}] + STATE["actions"])[:30]
     joblog.log(f"services nurse: {what}", "ok" if ok else "warn", system="nurse")
@@ -407,7 +681,32 @@ async def check(act: bool | None = None) -> dict:
                                        "its proxy and every Cloudflare-protected indexer are down until it is back - "
                                        "the nurse re-tests them when it is", "fix": "", "level": "info"})
         else:
-            dstate = await asyncio.to_thread(docker_state, True)
+            # ONE probe; a failure is then judged against the load. A busy
+            # machine gets relief first (new jobs held, nuarr to idle), a
+            # quiet one the old minute's wait - and every hang is kept with
+            # the CPU figures, so "is it nuarr?" has an answer over time.
+            dstate = await asyncio.to_thread(_probe_docker)
+            if dstate == "wedged":
+                load = await asyncio.to_thread(load_now)
+                STATE["load"] = load
+                hang = {"at": now, "cpu": load["cpu"], "nuarr": load["nuarr"], "ram": load["ram"]}
+                if act and load["cpu"] >= BUSY_CPU:
+                    STATE["stage"] = "Docker is slow while the machine is busy - easing nuarr off"
+                    _act(f"Docker did not answer with the CPU at {load['cpu']}% (nuarr {load['nuarr']}%) - "
+                         "holding new jobs and dropping nuarr to idle priority before deciding it is hung")
+                    dstate = await asyncio.to_thread(_relieve_and_probe, load)
+                    hang["relief"] = True
+                    if dstate == "up":
+                        _settle()
+                        hang["outcome"] = "starved"
+                        _act("Docker answered once nuarr eased off - it was starved by load, not hung; no restart")
+                else:
+                    STATE["stage"] = "Docker did not answer - asking again in a minute"
+                    await asyncio.sleep(CONFIRM_WAIT_S)
+                    dstate = await asyncio.to_thread(_probe_docker)
+                hang.setdefault("outcome", {"up": "slow", "wedged": "hung"}.get(dstate, dstate))
+                mem["hangs"] = (mem.get("hangs") or [])[-29:] + [hang]
+                _remember(mem)
         if ver and not dk.get("version"):
             dk["version"] = ver
         post_update = (not updating and dstate == "up" and bool(ver)
@@ -430,6 +729,10 @@ async def check(act: bool | None = None) -> dict:
                 _remember(mem)
                 STATE["stage"] = "restarting a hung Docker Desktop"
                 ok, how = await asyncio.to_thread(_restart_docker)
+                ld = STATE.get("load") or {}
+                if ld:
+                    how += f"; CPU was {ld.get('cpu')}% (nuarr {ld.get('nuarr')}%)"
+                _settle()
                 if ok:
                     _act("restarted a hung Docker Desktop (" + how + ")")
                     f["fixed"] = True
@@ -470,21 +773,36 @@ async def check(act: bool | None = None) -> dict:
                     f["detail"] += " - started it less than an hour ago, waiting before trying again"
                 continue
             name, status = await asyncio.to_thread(_container_for_port, row["port"])
-            f = {"what": f"proxy {row['name']} is not answering", "detail": f"Docker is up; container {name or '?'} is {status or 'not found'}",
-                 "fix": f"docker start {name}" if name else "", "level": "error"}
+            # RUNNING BUT NOT ANSWERING is a hung container: `docker start` is a
+            # no-op on it, so restart just that one (2026-11-16).
+            running = (status or "").startswith("Up")
+            op = "restart" if running else "start"
+            f = {"what": f"proxy {row['name']} is not answering",
+                 "detail": f"Docker is up; container {name or '?'} is {status or 'not found'}"
+                           + (" but does not answer - hung" if running else ""),
+                 "fix": f"docker {op} {name}" if name else "", "level": "error"}
             findings.append(f)
             if act and name and now - float(mem["cool"].get("c:" + name) or 0) > CONTAINER_COOLDOWN_S:
                 mem["cool"]["c:" + name] = now
                 _remember(mem)
-                STATE["stage"] = f"starting {name}"
-                rc, out = await asyncio.to_thread(_run, ["docker", "start", name])
+                STATE["stage"] = f"{op}ing {name}"
+                rc, out = await asyncio.to_thread(_run, ["docker", op, name], 120)
                 if rc:
-                    _act(f"docker start {name} failed: {out.strip()[:140]}", ok=False)
+                    _act(f"docker {op} {name} failed: {out.strip()[:140]}", ok=False)
                     continue
-                _act(f"started container {name}")
+                _act(f"{op}ed container {name}" + (" (it was running but not answering)" if running else ""))
                 if await _wait_port(row["host"], row["port"], 120):
                     f["fixed"] = True
                     fixed_proxy = True
+        # 3c. EVERY OTHER CONTAINER (Immich, Nextcloud, Profilarr...), one at a
+        # time: only the broken one is restarted, never Docker as a whole.
+        if STATE["docker"] and not updating:
+            STATE["stage"] = "checking containers"
+            try:
+                await _watch_containers(mem, act, findings, now,
+                                        {int(r["port"]) for r in prows if r.get("local") and r.get("port")})
+            except Exception as e:                       # noqa: BLE001
+                joblog.log(f"services nurse: container check {type(e).__name__}: {e}", "warn", system="nurse")
         proxies_fine = not [r for r in STATE["proxies"] if not r["up"]] or fixed_proxy
         # 4. THE INDEXERS PROWLARR HAS MARKED DOWN
         STATE["stage"] = "reading indexer status"
@@ -733,6 +1051,10 @@ def snapshot() -> dict:
     d["docker_state"] = STATE.get("docker_state") or ""
     d["docker_version"] = STATE.get("docker_version") or ""
     d["docker_last_update"] = (_memory().get("docker") or {}).get("last_update")
+    d["containers_watch"] = STATE.get("containers") or []
+    d["hold"] = dict(hold_active())
+    d["load"] = STATE.get("load") or {}
+    d["hangs"] = (_memory().get("hangs") or [])[-10:]
     d["prowlarr_url"] = prowlarr_url()
     d["has_key"] = bool(prowlarr_key())
     d["key_from_config"] = not (kv_get(KV_KEY) or "") and bool(prowlarr_key())

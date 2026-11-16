@@ -85,6 +85,7 @@ LABELS = {
     "arrs": "Sonarr / Radarr",
     "audiolang": "Audio language",
     "drivepool": "DrivePool",
+    "docker": "Docker room",
 }
 
 
@@ -3677,6 +3678,24 @@ def check_manual() -> Reason:
     return Reason(False, "manual", "Not paused")
 
 
+def check_nurse() -> Reason:
+    """The services nurse holds new jobs while Docker stops answering on a
+    busy machine (svcnurse._relieve_and_probe), so nuarr's own load is not
+    what gets Docker restarted. Running jobs carry on at idle priority."""
+    try:
+        from . import svcnurse
+        h = svcnurse.hold_active()
+    except Exception:                                    # noqa: BLE001
+        h = {}
+    if not h:
+        return Reason(False, "docker", "Docker is not short of room")
+    left = max(0, int(float(h.get("until") or 0) - time.time()))
+    return Reason(True, "docker", str(h.get("why") or "Giving Docker room"),
+                  extra=["Running jobs finish at " + ("idle" if h.get("idle") else "below-normal")
+                         + " priority; nothing new starts"],
+                  clears=f"When Docker answers and has settled, at most {max(1, left // 60)} min from now")
+
+
 def check_audiolang() -> Reason:
     r"""Is a listening pass running, and how far through is it.
 
@@ -3799,6 +3818,7 @@ async def status() -> GateStatus:
     # see - and it steers around the busy disks instead of holding everything.
     reasons = [
         check_manual(),
+        check_nurse(),
         # A stalling viewer outranks everything below it, and holds every
         # pool - the one reason here with no scope.
         check_buffering(),

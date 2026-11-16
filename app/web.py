@@ -970,6 +970,8 @@ async def _startup() -> None:
     asyncio.create_task(arrhealth.watch())
     from . import svcnurse
     asyncio.create_task(svcnurse.watch())
+    # nuarr's worker processes below normal priority, idle while Docker is given room
+    asyncio.create_task(svcnurse.priority_loop())
     from . import hevcconvert
     asyncio.create_task(hevcconvert.watch())
     from . import groupscore
