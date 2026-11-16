@@ -11948,6 +11948,14 @@ async def api_nurse_run(act: int = -1):
     return {"started": True}
 
 
+@app.post("/api/nurse/room")
+def api_nurse_room(on: int = 1, secs: float = 0, why: str = ""):
+    """NuSentry's Docker nurse asks for room (Docker slow on a busy machine)
+    or releases it."""
+    from . import svcnurse
+    return svcnurse.room(bool(on), secs, why[:300])
+
+
 @app.post("/api/nurse/mode")
 def api_nurse_mode(mode: str = "auto"):
     from . import svcnurse
@@ -35840,8 +35848,8 @@ async function loadNurse(){
       <button onclick="nurseRun()" style="font-size:11px">Check now</button>
     </div>
     <div class="dim" style="font-size:11px;margin-top:5px">The arrs' warnings above are symptoms; this looks at the causes underneath them - Prowlarr itself, the Cloudflare proxy it
-      sends sites through, and Docker, which the proxy lives in - and in <b>auto</b> starts what is stopped (Docker Desktop through its scheduled task, a
-      stopped container with docker start), then re-tests the indexers that were down so the warnings clear now. An indexer that still fails for
+      sends sites through, and Docker, which the proxy lives in. Docker and its containers are repaired by <b>NuSentry</b> (<a href="http://${location.hostname}:8790/settings#docker" target="_blank">its Docker page</a>); once a proxy answers again this
+      re-tests the indexers that were down so the warnings clear now. An indexer that still fails for
       ${d.disable_after_days} days with the proxy fine is switched off in Prowlarr and tested daily; it comes back on by itself the day it answers.
       Checked every ${Math.round((d.poll_s||300)/60)} min${d.at?' · last '+esc(ago(d.at)):''}.</div>
     ${fnd||(d.checked?'<div class="dim" style="font-size:11px;margin-top:4px">nothing wrong underneath</div>':'')}
@@ -35925,7 +35933,7 @@ function idxPaint(){
         <td style="white-space:nowrap;text-align:right">
           ${c.up?`<button style="font-size:10.5px;padding:1px 8px" onclick="idxCon('${jsq(c.name)}','restart',this)">Restart</button>`
                 :`<button style="font-size:10.5px;padding:1px 8px" onclick="idxCon('${jsq(c.name)}','start',this)">Start</button>`}</td></tr>`).join('')}
-    </table>`:`<div class="dim" style="font-size:11px;margin-top:5px">${d.docker?'no containers':'Docker Desktop is not running - the nurse starts it in auto mode, or use Check now above'}</div>`}
+    </table>`:`<div class="dim" style="font-size:11px;margin-top:5px">${d.docker?'no containers':'Docker is not answering - NuSentry repairs it (its Docker page)'}</div>`}
    </div>`;
 }
 async function idxTest(name){
