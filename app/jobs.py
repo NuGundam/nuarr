@@ -8006,6 +8006,15 @@ def build_ffmpeg(src: str, dst: str, plan, duration: float,
     # the output identical - see encoders.decode_args.
     _burn = getattr(plan, "burn_index", None)
     _on_card = False
+    _upconv = False
+    # A TEXT BURN ON AN 8-BIT SOURCE GOING TO 10-BIT: libass still needs the
+    # frame in system memory, but the widening after it does not. It used to
+    # be format=yuv420p10le on the CPU, then a second conversion to p010le for
+    # the encoder; now the burned 8-bit frame is sent up once and scale_cuda
+    # widens it on the card. Measured 2026-11-16 on 90 s of a 1080p episode
+    # (Yuri on Ice, signs track): 39.9 cpu-s -> 25.9 (-35 %), same bytes out,
+    # wall the same or a little better (the shared NVENC was the limit).
+    _burn_widen = False
     if plan.encode and (C["hwDecode"] if "hwDecode" in C else True):
         # THE DECODER MUST MATCH THE ENCODER'S FAMILY. Handing CUDA frames to
         # an AMF or QuickSync encoder forces a download and re-upload of every
@@ -8044,6 +8053,11 @@ def build_ffmpeg(src: str, dst: str, plan, duration: float,
             a += ["-hwaccel", "cuda"]
             _on_card = False
         _upconv = _upconv and _on_card
+        _burn_widen = (_burn is not None and not getattr(plan, "burn_image", False)
+                       and bool(getattr(plan, "ten_bit", False)) and not _src10
+                       and _fam == "nvenc" and "-hwaccel" in a)
+        if _burn_widen:
+            a += ["-init_hw_device", "cuda=nuarrcu", "-filter_hw_device", "nuarrcu"]
         # SAY WHICH OF THE FOUR DECODE PATHS THIS IS, on the plan, for the
         # card. The chip's sentence used to claim the decode was on the same
         # silicon as the encode for every one of them; only this function
@@ -8106,7 +8120,10 @@ def build_ffmpeg(src: str, dst: str, plan, duration: float,
                 a += ["-filter_complex", fc, "-map", "[v]"]
             else:
                 vf = f"subtitles={_filter_path(src)}:si={burn}"
-                if ten:
+                if _burn_widen:
+                    # see _burn_widen above: widen on the card, not the CPU
+                    vf += ",hwupload_cuda,scale_cuda=format=p010le"
+                elif ten:
                     # libass composites in 8-bit RGB regardless, so this cannot
                     # make the SUBTITLE 10-bit - it puts the picture back into
                     # 10-bit before the encoder so the video itself is
@@ -8128,7 +8145,7 @@ def build_ffmpeg(src: str, dst: str, plan, duration: float,
         try:
             from . import encoders as _enc
             a += _enc.video_args(_fam, _codec, int(tgt["cq"]),
-                                 str(tgt["preset"]), ten, _on_card)
+                                 str(tgt["preset"]), ten, _on_card or _burn_widen)
         except Exception:                                # noqa: BLE001
             a += ["-c:v", tgt["encoder"], "-preset", tgt["preset"],
                   "-rc", "vbr", "-cq", str(tgt["cq"])]
