@@ -7456,6 +7456,29 @@ def _finish_stage(job_id: str, state: str) -> None:
 def _finish(job: Job, state: str, before: int, after: int,
             error: str | None = None, note: str = "",
             event: str = "") -> None:
+    # A SOURCE THAT VANISHED MID-JOB IS NOT A FAILURE EITHER - the same rule
+    # as the dispatch check above (`if not os.path.exists(job.path)`), for the
+    # window after dispatch. Sonarr renamed The Healer S01E04 ([x264] ->
+    # [h264]) at 03:48 on 2026-11-17 and upgraded Nia Liston S01E07 at 05:25,
+    # each minutes into its encode; ffmpeg lost its input (code -2) and both
+    # were counted failed while the new files were already done. Only when
+    # the error says the input is missing AND the path really is gone - a
+    # missing file that is still there is a real fault.
+    if (state == "failed" and job.path and not os.path.exists(job.path)
+            and any(k in (error or "").lower() for k in
+                    ("no such file or directory", "error opening input",
+                     "the source moved or was deleted", "the file is not there"))):
+        joblog.log(f"source is gone - the arr replaced or moved it while this "
+                   f"job ran ({(error or '')[:160]}): {job.path}", "warn", job.id)
+        try:
+            _forget_queue_row(job)
+        except Exception:                                        # noqa: BLE001
+            pass
+        state, error = "skipped", None
+        # worded to land in the existing "replaced while it ran" skip bucket
+        note = ("source replaced during the encode - the arr renamed, "
+                "upgraded or moved it while this job ran; the new file is "
+                "planned on its own")
     _remember_fate(job.id, state)
     _finish_stage(job.id, state)
     if job.kind == "transcode":
