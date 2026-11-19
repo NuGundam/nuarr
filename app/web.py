@@ -52423,15 +52423,24 @@ async function loadHooks(){
         // Colour by WHAT happened, not just whether the handler survived it:
         // deletes amber, upgrades blue, imports green, renames dim - so a
         // scan of the column reads as a story instead of a green stripe.
+        // Erik, 2026-11-18: "make the bubbles colored depend on event type" -
+        // every kind its own hue (filled tint + matching edge), a failed
+        // handler still red whatever the kind.
         const up = /upgrade/i.test(r.detail||'');
-        const cls = !r.ok ? 'p-bad'
-                  : /delete/i.test(r.event) ? 'p-warn'
-                  : up ? 'p-acc'
-                  : /rename/i.test(r.event) ? 'p-dim' : 'p-ok';
         const label = up && /^(Download|ImportComplete)$/.test(r.event)
                     ? 'Upgrade' : r.event;
+        const hue = !r.ok ? '#f85149'
+                  : label==='Upgrade' ? '#58a6ff'
+                  : /^(Download|ImportComplete)$/.test(label) ? '#3fb950'
+                  : /rename/i.test(label) ? '#a371f7'
+                  : /delete/i.test(label) ? '#d29922'
+                  : /^grab/i.test(label) ? '#39c5cf'
+                  : /manualinteraction|health/i.test(label) ? '#f0883e'
+                  : /add/i.test(label) ? '#db61a2'
+                  : /test/i.test(label) ? '#8b949e' : '#c9d1d9';
+        const pst = `color:${hue};border-color:${hue}88;background:${hue}1f`;
         return `<tr><td class="dim">${new Date(r.at*1000).toLocaleTimeString()}</td>
-        <td>${esc(r.arr)}</td><td><span class="pill ${cls}">${esc(label)}</span></td>
+        <td>${esc(r.arr)}</td><td><span class="pill" style="${pst}">${esc(label)}</span></td>
         <td class="dim mono wrap">${esc(r.detail)}</td></tr>`}).join('')+'</table>'
     : '<div class="dim" style="padding:14px">no events yet — register the webhooks, then import or rename something</div>';
   if(paint('hooks', html, true)) pulse(box.closest('.panel'));
