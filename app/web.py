@@ -1528,6 +1528,65 @@ def _file_sub_count(path: str):
     return _memo("subcount:" + path, 60.0, _work)
 
 
+def _file_nuarr(path: str):
+    """What nuarr has done to the file being played, for the session card.
+
+    Erik, 2026-11-18: "put processed info in here like if it been process by
+    nuarr and if it was encoded and at what spec". The newest finished
+    transcode job on the file (by file id, which survives the rename a
+    conversion causes) and the file's own state. Memoised for a minute like
+    the subtitle count beside it - the endpoint is polled every few seconds.
+    """
+    if not path:
+        return None
+
+    def _work():
+        import json as _j
+        from .storage import _deprefix
+        f = _rows("SELECT id, state, state_reason, processed_at, video_codec, height "
+                  "FROM files WHERE path=? COLLATE NOCASE LIMIT 1", (_deprefix(path),))
+        if not f:
+            return {"known": False}
+        f = dict(f[0])
+        out = {"known": True, "state": f.get("state") or "",
+               "reason": f.get("state_reason") or "",
+               "processed_at": f.get("processed_at") or 0,
+               "codec": f.get("video_codec") or "", "height": f.get("height") or 0}
+        j = _rows("SELECT plan_json, result_json, size_before, size_after, finished_at "
+                  "FROM jobs WHERE file_id=? AND kind='transcode' AND state='done' "
+                  "ORDER BY finished_at DESC LIMIT 1", (int(f["id"]),))
+        if j:
+            j = dict(j[0])
+            try:
+                pj = _j.loads(j.get("plan_json") or "{}")
+            except Exception:                                    # noqa: BLE001
+                pj = {}
+            try:
+                summ = (_j.loads(j.get("result_json") or "{}") or {}).get("summary") or ""
+            except Exception:                                    # noqa: BLE001
+                summ = ""
+            v = pj.get("venc") or {}
+            out["last"] = {
+                "at": j.get("finished_at") or 0,
+                "encoded": bool(pj.get("encode")),
+                "target": pj.get("target") or "", "ten_bit": bool(pj.get("ten_bit")),
+                "src": pj.get("src_vcodec") or "", "src_mbps": pj.get("source_mbps"),
+                "encoder": v.get("encoder") or "", "preset": v.get("preset") or "",
+                "cq": v.get("cq"), "cq_fixed": v.get("cq_fixed"),
+                "vmaf": v.get("final_vmaf") if v.get("final_vmaf") is not None else v.get("vmaf"),
+                "worst": v.get("final_worst") if v.get("final_worst") is not None else v.get("vmaf_worst"),
+                "cambi": v.get("final_cambi") if v.get("final_cambi") is not None else v.get("cambi"),
+                "before": j.get("size_before") or 0, "after": j.get("size_after") or 0,
+                "summary": summ[:600],
+            }
+        q = _rows("SELECT kind FROM jobs WHERE file_id=? AND state IN ('queued','running') LIMIT 3",
+                  (int(f["id"]),))
+        out["pending"] = [r["kind"] for r in q]
+        return out
+
+    return _memo("nuarrfile:" + path, 60.0, _work)
+
+
 @app.post("/api/plex/stop")
 def api_plex_stop(key: str, reason: str = ""):
     """Stop one viewer's playback, through Plex's own terminate call.
@@ -1654,6 +1713,8 @@ def api_plex_sessions():
             # with none looks identical whether the file has ten tracks or
             # zero. This is what lets the card say which.
             "file_subs": _file_sub_count(s.get("file") or ""),
+            # WHAT NUARR DID TO THIS FILE - see _file_nuarr.
+            "nuarr_file": _file_nuarr(s.get("file") or ""),
         })
     return {"sessions": out}
 
@@ -33495,6 +33556,34 @@ function pxSignature(ss){
 // (\\?\P:\Anime Shows\...). It means "do not parse this path" to Windows and
 // nothing at all to a person, and it left one card's file line starting four
 // characters further along than its neighbour's.
+// WHAT NUARR DID TO THE FILE BEING PLAYED - one line, the summary on hover.
+function pxProcessed(n){
+  if(!n) return '';
+  if(!n.known) return '<span class="dim">not in nuarr\u2019s library</span>';
+  const gb=b=>b>=1e9?(b/1e9).toFixed(1)+' GB':(b/1e6).toFixed(0)+' MB';
+  const when=t=>{ if(!t) return ''; const d=new Date(t*1000);
+    return d.toLocaleDateString([], {month:'short', day:'numeric'})+' '
+      +d.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'}); };
+  const pend=(n.pending&&n.pending.length)?` <span class="dim">\u00b7 ${esc(n.pending.join(', '))} waiting</span>`:'';
+  const L=n.last;
+  if(L && L.encoded){
+    const tgt=(L.target==='h265'?'HEVC':'H.264')+(L.ten_bit?' 10-bit':'');
+    const enc=[L.encoder?L.encoder.replace('_',' '):'', L.preset, L.cq!=null?'CQ '+L.cq:''].filter(Boolean).join(' ');
+    const cqx=(L.cq_fixed!=null && L.cq!=null && L.cq!==L.cq_fixed)?` <span class="dim">(library ${L.cq_fixed})</span>`:'';
+    const vm=L.vmaf!=null?` \u00b7 VMAF <b>${Number(L.vmaf).toFixed(1)}</b>`
+      +(L.worst!=null?` <span class="dim">worst ${Number(L.worst).toFixed(1)}</span>`:'')
+      +(L.cambi!=null?` <span class="dim">\u00b7 banding ${Number(L.cambi).toFixed(1)}</span>`:''):'';
+    const sz=(L.before&&L.after)?` \u00b7 ${gb(L.before)} \u2192 ${gb(L.after)} <span class="dim">(${Math.round((L.after/L.before-1)*100)}%)</span>`:'';
+    const src=L.src?` <span class="dim">from ${esc(String(L.src).toUpperCase())}${L.src_mbps?' '+Number(L.src_mbps).toFixed(1)+' Mbps':''}</span>`:'';
+    return `<span title="${esc(L.summary||'')}"><b style="color:#3fb950">encoded</b> ${esc(when(L.at))} \u2014 ${tgt}${src}
+      \u00b7 <span class="mono">${esc(enc)}</span>${cqx}${vm}${sz}</span>${pend}`;
+  }
+  if(L) return `<span title="${esc(L.summary||'')}"><b style="color:#58a6ff">rewritten</b> ${esc(when(L.at))}
+    <span class="dim">\u2014 video copied, not re-encoded${(L.before&&L.after)?' \u00b7 '+gb(L.before)+' \u2192 '+gb(L.after):''}</span></span>${pend}`;
+  if(n.state==='done') return `<b style="color:#3fb950">checked</b> ${esc(when(n.processed_at))}
+    <span class="dim">\u2014 ${esc(n.reason||'nothing needed changing')}, untouched</span>${pend}`;
+  return `<span class="dim">not processed yet${n.state?' ('+esc(n.state)+')':''}</span>${pend}`;
+}
 function pxPath(p){
   let x = String(p||'').replace(/\//g,'\\');
   if(x.startsWith('\\\\?\\') || x.startsWith('\\\\.\\')){
@@ -33684,6 +33773,7 @@ function pxDetail(s){
       + ` pool over a share, where nothing reports which disk holds a file. The`
       + ` host has them attached and resolved it from the file itself."`
       + `>the host — this machine reaches the pool over a share</span>`]);
+  { const nf=pxProcessed(s.nuarr_file); if(nf) rows.push(['processed', nf]); }
   if(s.file) rows.push(['file', `<span class="mono dim"
     style="overflow-wrap:anywhere">${esc(pxPath(s.file))}</span>`]);
   return `<div class="pxmore">`+rows.map(([k,v])=>
