@@ -372,6 +372,8 @@ def enqueue(file_ids: list, overwrite: bool = False, by: str = "you",
                     (*[r["file_id"] for r in rows], time.time() - 24 * 3600.0))}
         except Exception:                                        # noqa: BLE001
             fresh = set()
+        if dub:
+            fresh = set()    # DUB MAKES ARE ALWAYS BACKGROUND, however new the file
         got = {"made": 0, "held": {}}
         for part, prio in ((lambda r: r["file_id"] in fresh, _jobs.FRESH_PRIORITY),
                            (lambda r: r["file_id"] not in fresh,
