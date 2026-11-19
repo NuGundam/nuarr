@@ -11566,6 +11566,24 @@ async def api_subneed_make(library: str, on: bool = True):
     return {"ok": True, "make": now, "queued": int(got.get("added") or 0)}
 
 
+@app.post("/api/subneed/dub")
+async def api_subneed_dub(library: str, on: bool = True):
+    """Turn one library's "Make dub subtitles" switch on or off.
+
+    On: dual-audio mkvs in it whose English subtitles are a translation (no
+    CC/SDH/dub track) get a track written from the English dub audio, a few
+    at a time at low priority (subneed.dub_missing)."""
+    from . import langpolicy
+    pol = langpolicy.load()
+    if library not in pol:
+        raise HTTPException(404, f"no library named {library!r}")
+    langpolicy.save({library: {"subs": {"dub": bool(on)}}})
+    now = bool(((langpolicy.load().get(library) or {}).get("subs") or {}).get("dub"))
+    joblog.log(f"{library}: dub subtitles {'ON' if now else 'off'}", "info")
+    got = await asyncio.to_thread(subneed.dub_missing) if now else {"added": 0}
+    return {"ok": True, "dub": now, "queued": int(got.get("added") or 0)}
+
+
 @app.post("/api/subneed/check")
 async def api_subneed_check():
     """Judge the whole library now, in the background; the panel polls the bar.
@@ -35332,7 +35350,13 @@ function langBlockHtml(lib, side, sideLabel){
              onchange="langMake('${esc(lib)}',this.checked,this)">
       Make missing subtitles
       <span class="dim">— the Subtitle maker writes English for files that have none (foreign first, then English audio)</span>
-      <span class="dim" id="lmake_${cssId(lib)}"></span></label>`:''}
+      <span class="dim" id="lmake_${cssId(lib)}"></span></label>
+    <label class="lorig" title="For dual-audio files (English dub + the original language) whose English subtitles are a translation of the original script: the Subtitle maker listens to the ENGLISH DUB and writes what is said, as a separate track 'English Dub CC (nuarr)' - not default, nothing replaced. Skips files that already have a CC / SDH / dub track. Low priority, a few at a time.">
+      <input type="checkbox" ${cfg.dub?'checked':''}
+             onchange="langDub('${esc(lib)}',this.checked,this)">
+      Make dub subtitles
+      <span class="dim">— English subtitles that match the English dub, written from its audio</span>
+      <span class="dim" id="ldub_${cssId(lib)}"></span></label>`:''}
     <div class="lchips">${chips||'<span class="dim" style="font-size:11px">no '
       +esc(sideLabel.toLowerCase())+' tracks scanned in this library yet</span>'}</div>
     ${extra.length?`<div class="dim" style="font-size:11px;margin-top:5px">also kept:
@@ -35378,6 +35402,18 @@ function langBlockHtml(lib, side, sideLabel){
 // only happens if the two disagree, which means something else changed it.
 // MAKE MISSING SUBTITLES saves on the click, like Require: it changes no
 // plan, it turns on a queue.
+async function langDub(lib, on, el){
+  let r=null;
+  try{
+    r=await (await fetch('/api/subneed/dub?library='+encodeURIComponent(lib)
+      +'&on='+(on?'true':'false'), {method:'POST'})).json();
+  }catch(e){}
+  const got=!!(r&&r.dub);
+  if(el) el.checked=got;
+  if(_lang && _lang.policy && _lang.policy[lib] && _lang.policy[lib].subs) _lang.policy[lib].subs.dub=got;
+  const m=document.getElementById('ldub_'+cssId(lib));
+  if(m) m.textContent=!r?' — could not save':(got?(' — on'+(r.queued?(', '+r.queued+' queued now'):'')):' — off');
+}
 async function langMake(lib, on, el){
   let r=null;
   try{

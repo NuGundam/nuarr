@@ -113,6 +113,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 
 from . import joblog
@@ -668,6 +669,129 @@ def make_missing(keep: int = MAKE_KEEP) -> dict:
         joblog.log(f"make missing subtitles: {added} file(s) queued for the Subtitle maker "
                    f"({', '.join(libs)})", "info", system="subneed")
     return {"added": added, "libraries": libs}
+
+
+def dubbers() -> list[str]:
+    """Libraries whose "Make dub subtitles" switch is on."""
+    try:
+        from . import langpolicy
+        return sorted(lib for lib, sides in (langpolicy.load() or {}).items()
+                      if ((sides or {}).get("subs") or {}).get("dub"))
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
+# DUB SUBTITLES, PER LIBRARY - see submake.DUB_TRACK. Erik, 2026-11-18: "build
+# it but in low priority like the tv shows and movies". The same trickle as
+# make_missing: at most DUB_KEEP waiting, behind everything else at DUB_PRIO.
+#
+# WHICH FILES, from the stored probe (no disk read): an mkv with English audio
+# AND audio in another language (a dual-audio release), an English text
+# subtitle already (so the file is not a raw - make_missing has those), and no
+# English track that is already a dub or caption track (title says CC, SDH,
+# closed caption, hearing impaired, or dub).
+DUB_BY = "Dub subtitles (library)"
+DUB_KEEP = 4
+DUB_PRIO = 85
+_DUB_TITLE = re.compile(r"closed\s*caption|\bcc\b|\bsdh\b|hearing[\s-]*impaired|\bhi\b|\bdub", re.I)
+_DUB_TEXT = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"}
+
+
+def dub_wanted(probe_json: str) -> bool:
+    """Does this file (its stored ffprobe JSON) want a dub subtitle track?"""
+    try:
+        streams = json.loads(probe_json or "{}").get("streams") or []
+    except Exception:                                            # noqa: BLE001
+        return False
+    a_eng = a_other = s_eng = False
+    for st in streams:
+        tg = st.get("tags") or {}
+        lang = str(tg.get("language") or "").lower()
+        title = str(tg.get("title") or "")
+        ct = st.get("codec_type")
+        if ct == "audio":
+            if lang in ("eng", "en"):
+                a_eng = a_eng or "commentary" not in title.lower()
+            elif lang not in ("", "und"):
+                a_other = True
+        elif ct == "subtitle" and lang in ("eng", "en"):
+            if _DUB_TITLE.search(title):
+                return False
+            if (st.get("codec_name") or "").lower() in _DUB_TEXT:
+                s_eng = True
+    return a_eng and a_other and s_eng
+
+
+def _dub_queued() -> int:
+    try:
+        from . import submake
+        return sum(1 for x in submake._queue() if x.get("by") == DUB_BY)
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
+def dub_missing(keep: int = DUB_KEEP) -> dict:
+    """Top the dub switch's share of the Subtitle maker queue up to `keep`."""
+    libs = dubbers()
+    if not libs:
+        return {"added": 0, "why": "no library has the switch on"}
+    room = int(keep) - _dub_queued()
+    if room <= 0:
+        return {"added": 0, "why": "its share of the queue is full"}
+    from . import submake
+    qs = ",".join("?" * len(libs))
+    added = scanned = 0
+    last = None
+    while added < room:
+        try:
+            with cursor() as cur:
+                rows = [dict(r) for r in cur.execute(
+                    "SELECT f.id, f.first_seen, p.json FROM files f JOIN file_probes p ON p.file_id=f.id "
+                    f" WHERE f.library IN ({qs}) AND f.state NOT IN ('deleted','duplicate') "
+                    "   AND lower(f.path) LIKE '%.mkv' AND f.audio_langs LIKE '%eng%' "
+                    "   AND (? IS NULL OR COALESCE(f.first_seen,0) < ?) "
+                    " ORDER BY COALESCE(f.first_seen, 0) DESC LIMIT 1500",
+                    (*libs, last, last))]
+        except Exception as e:                                   # noqa: BLE001
+            return {"added": added, "why": f"{type(e).__name__}: {e}"}
+        if not rows:
+            break
+        last = float(rows[-1]["first_seen"] or 0)
+        scanned += len(rows)
+        want = [int(r["id"]) for r in rows if dub_wanted(r["json"])]
+        gates = submake.dub_gate_many(want)
+        for fid in want:
+            if added >= room:
+                break
+            if gates.get(fid) != "none":
+                continue
+            got = submake.enqueue([fid], by=DUB_BY, priority=DUB_PRIO, dub=True)
+            added += int(got.get("added") or 0)
+        if len(rows) < 1500 or last <= 0:
+            break
+    if added:
+        joblog.log(f"dub subtitles: {added} file(s) queued for the Subtitle maker "
+                   f"({', '.join(libs)})", "info", system="subneed")
+    return {"added": added, "libraries": libs, "scanned": scanned}
+
+
+def dub_count(libs: list | None = None) -> dict:
+    """How many files the dub switch would still make, per library."""
+    libs = libs if libs is not None else dubbers()
+    out: dict = {}
+    if not libs:
+        return out
+    from . import submake
+    t = submake._tried()
+    qs = ",".join("?" * len(libs))
+    with cursor() as cur:
+        for r in cur.execute(
+                "SELECT f.id, f.library, p.json FROM files f JOIN file_probes p ON p.file_id=f.id "
+                f" WHERE f.library IN ({qs}) AND f.state NOT IN ('deleted','duplicate') "
+                "   AND lower(f.path) LIKE '%.mkv' AND f.audio_langs LIKE '%eng%'", libs):
+            if dub_wanted(r["json"]) and not t.get("dub:" + str(int(r["id"]))):
+                out[r["library"]] = out.get(r["library"], 0) + 1
+    return out
 
 
 def _make_one(fid: int, state: str, lib: str) -> bool:
@@ -2968,6 +3092,7 @@ async def watch() -> None:
             if r.get("missing"):
                 await act_now(50)
             await asyncio.to_thread(make_missing)
+            await asyncio.to_thread(dub_missing)
         except Exception as e:                                   # noqa: BLE001
             joblog.log(f"missing-subtitle check: {type(e).__name__}: {e}",
                        "warn", system="subneed")

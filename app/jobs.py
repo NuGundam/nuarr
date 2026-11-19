@@ -5490,7 +5490,7 @@ async def _submake_job(w: Worker) -> None:
             plan = {}
         w.set_stage("starting")
         res = await submake.make_job(w, int(job.file_id), bool(plan.get("overwrite")),
-                                     str(plan.get("by") or "you"))
+                                     str(plan.get("by") or "you"), bool(plan.get("dub")))
     finally:
         heavy.release(submake.LANE)
     after = os.path.getsize(job.path) if os.path.exists(job.path) else before

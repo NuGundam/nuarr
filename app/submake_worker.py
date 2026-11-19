@@ -262,12 +262,14 @@ def burned_english(src, ffmpeg, duration, frames=24):
 
 
 # ------------------------------------------------------------ speech ------
-def speech(src, wlang, model_dir, ffmpeg):
+def speech(src, wlang, model_dir, ffmpeg, aidx=0):
     import numpy as np
     from faster_whisper import WhisperModel
     from faster_whisper.vad import VadOptions, get_speech_timestamps
     say(stage="reading the audio", pct=2)
-    raw = subprocess.run([ffmpeg, "-v", "error", "-i", src, "-map", "0:a:0", "-ac", "1",
+    # WHICH AUDIO TRACK - the first unless told. Dub subtitles name the
+    # English one, which on a JA+EN release is usually the second.
+    raw = subprocess.run([ffmpeg, "-v", "error", "-i", src, "-map", f"0:a:{int(aidx)}", "-ac", "1",
                           "-ar", "16000", "-f", "f32le", "-"], capture_output=True).stdout
     audio = np.frombuffer(raw, np.float32)
     if not len(audio):
@@ -622,6 +624,7 @@ def main():
     ap.add_argument("--from-subs", default="", help="stream:N or file:path - translate this track")
     ap.add_argument("--sub-lang", default="", help="the language of --from-subs")
     ap.add_argument("--learn", default="", help="json: the show's names and corrections (sublearn)")
+    ap.add_argument("--audio", type=int, default=0, help="audio track ordinal (0:a:N) to listen to")
     ap.add_argument("--verify", default="", help="json file: {windows:[{t,len,a}]} - what is said there, in English")
     a = ap.parse_args()
     if a.learn:
@@ -696,7 +699,7 @@ def main():
                 say(error=f"English is already burned into the picture ({hits} of {seen} sampled "
                           f"frames carry it) - nothing made. Use 'make anyway' to override.")
                 return
-        talk = speech(a.src, wlang, os.path.join(a.data, "whisper"), a.ffmpeg)
+        talk = speech(a.src, wlang, os.path.join(a.data, "whisper"), a.ffmpeg, a.audio)
         shown, words = [], []
         if plang and not a.no_ocr:
             shown = picture(a.src, plang, script, a.ffmpeg, a.duration or (talk[-1][1] if talk else 3600))

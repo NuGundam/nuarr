@@ -58,17 +58,17 @@ KIND_DEFAULTS: dict = {
     "anime": {
         "audio": {"keep_original": True, "langs": ["jpn", "eng", "und"]},
         "subs":  {"keep_original": False, "langs": ["eng"], "keep_untagged": True,
-                  "require": [], "make": False},
+                  "require": [], "make": False, "dub": False},
     },
     "animation": {
         "audio": {"keep_original": True, "langs": ["eng"]},
         "subs":  {"keep_original": False, "langs": ["eng"], "keep_untagged": True,
-                  "require": [], "make": False},
+                  "require": [], "make": False, "dub": False},
     },
     "live": {
         "audio": {"keep_original": True, "langs": ["eng"]},
         "subs":  {"keep_original": False, "langs": ["eng"], "keep_untagged": True,
-                  "require": [], "make": False},
+                  "require": [], "make": False, "dub": False},
     },
 }
 
@@ -155,6 +155,9 @@ def _norm(got: dict, into: dict) -> None:
     if "make" in got:
         into["make"] = bool(got["make"])
     into.setdefault("make", False)
+    if "dub" in got:
+        into["dub"] = bool(got["dub"])
+    into.setdefault("dub", False)
     if isinstance(got.get("langs"), list):
         # Normalised on the way in, so a policy saved as "ENG " cannot quietly
         # fail to match a probe reporting "eng".
