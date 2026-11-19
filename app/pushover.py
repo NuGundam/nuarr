@@ -224,7 +224,7 @@ async def resend(ids: list) -> dict:
             skipped += 1
             continue
         ok, err = await send(r.get("ptitle") or r.get("title") or "nuarr", r["msg"],
-                             url=_link())
+                             url=_link(), app=r.get("arr") or "")
         _remember({**{k: v for k, v in r.items() if k not in ("id", "at", "ok", "error")},
                    "at": time.time(), "ok": ok, "error": err, "resent": True})
         sent += int(ok)
@@ -233,12 +233,25 @@ async def resend(ids: list) -> dict:
 
 
 # ------------------------------------------------------------ sending ------
+def app_of(name: str) -> str:
+    """'sonarr' / 'radarr' for an arr's name or kind, else ''."""
+    n = str(name or "").lower()
+    return "sonarr" if "sonarr" in n else "radarr" if "radarr" in n else ""
+
+
+def app_token(app: str) -> str:
+    """The token of the arr's own Pushover application, '' when none is set."""
+    return str(getattr(SETTINGS, f"pushover_token_{app}", "") or "") if app in ("sonarr", "radarr") else ""
+
+
 async def send(title: str, message: str, *, priority: int | None = None,
                sound: str = "", url: str = "", url_title: str = "",
                token: str = "", user: str = "",
-               attachment: bytes | None = None) -> tuple[bool, str]:
-    """One message to Pushover. HTML is on; the caller escapes its own text."""
-    token = token or SETTINGS.pushover_token or ""
+               attachment: bytes | None = None, app: str = "") -> tuple[bool, str]:
+    """One message to Pushover. HTML is on; the caller escapes its own text.
+    app 'sonarr'/'radarr' sends from that arr's own Pushover application (its
+    icon) when a token for it is saved."""
+    token = token or app_token(app_of(app)) or SETTINGS.pushover_token or ""
     user = user or SETTINGS.pushover_user or ""
     if not (token and user):
         return False, "no token or user key"
@@ -561,7 +574,7 @@ async def _send_basic(items: list) -> None:
     if len(items) == 1 or not opts().get("digest", True):
         for it in items:
             line = f"{it['label']} {'upgraded' if it['upgrade'] else 'downloaded'}"
-            ok, err = await send(f"{arr} · {line}", _esc(line))
+            ok, err = await send(f"{arr} · {line}", _esc(line), app=arr)
             _remember({"at": time.time(), "arr": arr, "title": it["label"], "detail": "basic",
                        "eng": 0, "ok": ok, "error": err, "kind": "upgraded" if it["upgrade"] else "imported",
                        "files": 1, "ptitle": f"{arr} · {line}", "msg": _esc(line)})
@@ -571,7 +584,7 @@ async def _send_basic(items: list) -> None:
     eps = ", ".join(x["ep"] for x in items if x["ep"])
     line = f"{series} - {len(items)} episodes {verb}" + (f": {eps}" if eps else "")
     line = line[:MSG_LIMIT]
-    ok, err = await send(f"{arr} · {series} · {len(items)} {verb}", _esc(line))
+    ok, err = await send(f"{arr} · {series} · {len(items)} {verb}", _esc(line), app=arr)
     _remember({"at": time.time(), "arr": arr, "title": f"{series} ({len(items)} files)", "detail": "basic",
                "eng": 0, "ok": ok, "error": err, "kind": "upgraded" if ups == len(items) else "imported",
                "files": len(items), "ptitle": f"{arr} · {series} · {len(items)} {verb}", "msg": _esc(line)})
@@ -593,7 +606,7 @@ async def _send_group(items: list) -> None:
                      + (" · English audio" if it.get("eng") else ""))
             msg = (_arr_tag(arr, it.get("kind", "")) + " · <b>" + _esc(it["label"]) + "</b>\n"
                    + "\n".join(it["lines"]))
-            ok, err = await send(title, msg, url=_link(),
+            ok, err = await send(title, msg, url=_link(), app=arr,
                                  attachment=img if it is items[0] else await poster(it))
             _remember({"at": time.time(), "arr": arr, "title": it["label"],
                        "detail": _plain(it["spec"] or (it["lines"][0] if it["lines"] else "")),
@@ -639,7 +652,7 @@ async def _send_group(items: list) -> None:
     if len(msg) > room:
         msg = msg[:room].rsplit("\n", 1)[0] + "\n…"
     msg += "\n" + "\n".join(tail)
-    ok, err = await send(title, msg, url=_link(), attachment=img)
+    ok, err = await send(title, msg, url=_link(), attachment=img, app=arr)
     _remember({"at": time.time(), "arr": arr, "title": f"{series} ({len(items)} files)",
                "detail": what, "eng": engs, "ok": ok, "error": err,
                "kind": "upgraded" if ups == len(items) else "imported", "files": len(items),
@@ -799,6 +812,7 @@ async def seerr(body: dict) -> str:
 def snapshot() -> dict:
     return {"configured": configured(), "token_set": bool(SETTINGS.pushover_token),
             "user_set": bool(SETTINGS.pushover_user), "enabled": enabled(),
+            "apps": {k: bool(app_token(k)) for k in ("sonarr", "radarr")},
             "on": str(kv_get(KV_ON) or "0") == "1", "opts": opts(),
             "stats": dict(STATS), "recent": _recent(), "quiet_s": QUIET_S,
             "link": _link(), "roots": roots()}

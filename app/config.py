@@ -483,6 +483,12 @@ class Settings:
     # and the user key it delivers to. See pushover.py.
     pushover_token: str | None = None
     pushover_user: str | None = None
+    # PER-ARR PUSHOVER APPS. Pushover shows the icon of the APPLICATION a
+    # message is sent from, never a per-message one - so the arrs' messages
+    # carry the official Sonarr / Radarr icon only when sent with a token of
+    # an application that has it. Unset = the Nuarr app, as before.
+    pushover_token_sonarr: str | None = None
+    pushover_token_radarr: str | None = None
 
     # PLEX, DIRECTLY. Tautulli is a live passthrough to Plex for get_activity -
     # measured, it is not serving a cache - but it costs 2,177 ms per call

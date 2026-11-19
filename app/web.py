@@ -3375,6 +3375,54 @@ async def api_pushover_config(body: dict = Body(...)):
     return {"ok": True, "detail": detail}
 
 
+@app.get("/arr-icon/{name}")
+def arr_icon(name: str):
+    """The arrs' official logos (taken from the arrs' own web UI, kept in
+    app/assets) - for arrIcon() and anywhere else the page names an arr."""
+    import pathlib
+    from fastapi.responses import FileResponse
+    stem, _, ext = name.lower().partition(".")
+    if stem not in ("sonarr", "radarr") or ext not in ("svg", "png"):
+        raise HTTPException(404, "no such icon")
+    p = pathlib.Path(__file__).parent / "assets" / f"{stem}.{ext}"
+    return FileResponse(str(p), media_type="image/svg+xml" if ext == "svg" else "image/png",
+                        headers={"Cache-Control": "public, max-age=604800"})
+
+
+@app.post("/api/pushover/apptoken")
+async def api_pushover_apptoken(body: dict = Body(...)):
+    """Save the token of Sonarr's or Radarr's own Pushover application, tested
+    by sending one message from it. A blank token removes it (back to Nuarr's)."""
+    import yaml
+    from . import pushover
+    kind = str(body.get("kind") or "").lower()
+    if kind not in ("sonarr", "radarr"):
+        return {"ok": False, "error": "kind must be sonarr or radarr"}
+    token = str(body.get("token") or "").strip()
+    if token:
+        if not SETTINGS.pushover_user:
+            return {"ok": False, "error": "save the user key first"}
+        ok, detail = await pushover.test(token, SETTINGS.pushover_user)
+        if not ok:
+            return {"ok": False, "error": detail}
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                    # noqa: BLE001
+            raw = {}
+    key = f"pushover_token_{kind}"
+    if token:
+        raw[key] = token
+    else:
+        raw.pop(key, None)
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    setattr(SETTINGS, key, token or None)
+    joblog.log(f"Pushover: {kind.title()} app token {'saved and tested' if token else 'removed'}", "ok")
+    return {"ok": True, "set": bool(token)}
+
+
 @app.post("/api/pushover/enabled")
 def api_pushover_enabled(on: bool = True):
     from . import pushover
@@ -19206,8 +19254,9 @@ async function loadAll(){
 
   const a=await (await fetch('/api/arrs')).json();
   setHTML(document.getElementById('arrs'), Object.entries(a).map(([n,v])=>
-    `<span class="pill ${v.ok?(v.busy?'p-warn':'p-ok'):'p-bad'}" title="${esc(v.busy_reason||v.error||'')}">
-       ${esc(n)} ${v.ok?(v.busy?'busy':'ok'):'down'}</span>`).join(' '));
+    `<span class="pill ${v.ok?(v.busy?'p-warn':'p-ok'):'p-bad'}" title="${esc(v.busy_reason||v.error||'')}"
+       style="display:inline-flex;align-items:center;gap:4px">
+       ${/sonarr|radarr/i.test(n)?arrIcon(n, 12):''}${esc(n)} ${v.ok?(v.busy?'busy':'ok'):'down'}</span>`).join(' '));
 }
 
 async function loadRenames(){
@@ -19234,7 +19283,7 @@ async function loadRenames(){
     el.innerHTML = age + (r.count
       ? '<table><tr><th>Arr</th><th>Title</th><th>Status</th><th>Change</th><th>Why</th></tr>'
         +r.rows.map(x=>`<tr>
-          <td class="dim">${esc(x.arr)}</td><td>${esc(x.title)}</td>
+          <td class="dim" style="white-space:nowrap">${arrIcon(x.arr, 13)} ${esc(x.arr)}</td><td>${esc(x.title)}</td>
           <td><span class="pill ${x.blocked?'p-warn':'p-ok'}">${esc(x.blocked?x.category:'ready')}</span></td>
           <td class="mono wrap" style="width:36%">${esc(x.from)}
               <br><span class="arrow">→</span> <span class="dim">${esc(x.to)}</span></td>
@@ -33331,7 +33380,7 @@ async function loadMetaTab(){
     return `<div class="metarow">
       <div class="metahead">
         <b>${esc(a.provider||'metadata')}</b><span class="metato">→</span>
-        <b>${esc(a.arr)}</b>
+        ${arrIcon(a.arr, 15)} <b>${esc(a.arr)}</b>
         ${a.ok ? `<span class="pill p-ok">connected</span>`
                : `<span class="pill p-bad">unreachable${a.error?' — '+esc(a.error):''}</span>`}
         ${a.version?`<span class="dim mono" style="font-size:12px">v${esc(a.version)}</span>`:''}
@@ -49435,6 +49484,11 @@ function arrLook(kind){
 }
 function arrIcon(kind, size){
   const L=arrLook(kind), s=size||14;
+  // THE OFFICIAL LOGO for Sonarr and Radarr (Erik, 2026-11-19), served from
+  // app/assets; the lettered tile stays for the rest.
+  const off=/sonarr/i.test(kind||'')?'sonarr':/radarr/i.test(kind||'')?'radarr':'';
+  if(off) return `<img src="/arr-icon/${off}.svg" alt="" title="${esc(kind||'')}"
+    style="width:${s}px;height:${s}px;flex:0 0 auto;vertical-align:-${Math.round(s*0.2)}px">`;
   return `<span title="${esc(kind||'')}" style="display:inline-flex;
     align-items:center;justify-content:center;width:${s}px;height:${s}px;
     border-radius:${Math.round(s*0.28)}px;background:${L.c};color:#0b0e13;
@@ -50840,7 +50894,7 @@ function dlPaint(){
         <td class="c"><input type="checkbox" ${_dlSel.has(r.path)?'checked':''} onclick="dlPick(${i},event)"></td>
         <td class="l" title="${esc(r.path)}"><b>${esc(r.name)}</b><div class="dim mono" style="font-size:10px;overflow:hidden;text-overflow:ellipsis">${esc((r.videos||[]).slice(0,2).join(' · '))}${r.n_videos>2?` +${r.n_videos-2}`:''}</div>
           ${r.match?`<div style="font-size:10px;color:#8b949e">${r.kind==='sonarr'?'Sonarr':'Radarr'} knows it: ${esc(r.match)}</div>`:`<div style="font-size:10px;color:#8b949e">neither arr recognises the name - ${r.kind==='sonarr'?'looks like episodes':'looks like a film'}</div>`}
-          ${st?`<div style="font-size:10px;color:${st[0]}">${h.state==='working'?'<span class="dlspin"></span>':''}${esc(h.arr)} ${esc(st[1])}${h.result?' - '+esc(h.result):''} · ${ago(h.done_at||h.at)}</div>`:''}
+          ${st?`<div style="font-size:10px;color:${st[0]}">${h.state==='working'?'<span class="dlspin"></span>':''}${arrIcon(h.arr, 11)} ${esc(h.arr)} ${esc(st[1])}${h.result?' - '+esc(h.result):''} · ${ago(h.done_at||h.at)}</div>`:''}
           ${dlAdvice(r)}</td>
         <td class="c mono">${gb(r.size||0)}</td><td class="c">${fmt(r.n_videos||0)}</td>
         <td class="c dim">${r.age_h<48?Math.round(r.age_h)+'h':Math.round(r.age_h/24)+'d'}</td>
@@ -50965,6 +51019,22 @@ function poPaint(){
         the user key is on the Pushover home page. Both are stored in config.yml
         and never sent back to this page.
       </div>
+      <div style="margin-top:10px;padding-top:9px;border-top:1px solid var(--line)">
+        <b style="font-size:12px">Arr icons on the phone</b>
+        <div class="dim" style="font-size:11px;margin:3px 0 7px">Pushover shows the icon of the
+          <i>application</i> a message comes from. Make a &ldquo;Sonarr&rdquo; and a &ldquo;Radarr&rdquo;
+          application at <a href="https://pushover.net/apps/build" target="_blank" rel="noopener">pushover.net &rarr; Create an Application</a>
+          with the official icon, and paste each token here: their imports and upgrades then arrive
+          with that icon. Blank and saved = back to the Nuarr app.</div>
+        ${['sonarr','radarr'].map(k=>`<div style="display:flex;gap:8px;align-items:center;margin-top:5px">
+          ${arrIcon(k, 18)}
+          <input id="poApp_${k}" type="password" spellcheck="false"
+                 placeholder="${(d.apps||{})[k]?k[0].toUpperCase()+k.slice(1)+' app token saved — paste a new one to replace':k[0].toUpperCase()+k.slice(1)+' app token'}"
+                 style="flex:1;min-width:220px;font-family:var(--mono,monospace);font-size:12px">
+          <button onclick="poAppSave('${k}',this)">Test and save</button>
+          <span id="poAppMsg_${k}" class="dim" style="font-size:11.5px">${(d.apps||{})[k]?'<span style="color:#7fd4a3">own icon</span>':'sending as Nuarr'}</span>
+        </div>`).join('')}
+      </div>
     </div>
 
     <div class="lkind" style="padding:11px 12px;margin-bottom:10px${d.on?'':';opacity:.5'}">
@@ -50995,7 +51065,7 @@ function poPaint(){
         included. Seerr requests follow the level of the folder the show or film lives in; a brand-new request,
         not yet added to an arr, has no folder and is sent in full.</div>
       <div style="display:flex;flex-wrap:wrap;gap:10px 22px">
-        ${(d.roots||[]).length?(d.roots||[]).map((r,i)=>`<span style="display:inline-flex;align-items:center;gap:6px;font-size:11.5px" title="${esc(r.arr)}: ${esc(r.path)}"><span style="color:${r.kind==='radarr'?'#ffc230':'#35c5f4'}">${esc(r.arr)}</span> <span class="mono">${esc(r.path)}</span>
+        ${(d.roots||[]).length?(d.roots||[]).map((r,i)=>`<span style="display:inline-flex;align-items:center;gap:6px;font-size:11.5px" title="${esc(r.arr)}: ${esc(r.path)}">${arrIcon(r.kind||r.arr, 13)}<span style="color:${r.kind==='radarr'?'#ffc230':'#35c5f4'}">${esc(r.arr)}</span> <span class="mono">${esc(r.path)}</span>
           <select onchange="poRoot(${i},this.value)" style="font-size:11px;${r.level==='off'?'opacity:.6':''}">${[['off','Off'],['basic','Basic'],['noart','No art'],['full','Full']].map(([v,t])=>`<option value="${v}" ${(r.level||'full')===v?'selected':''}>${t}</option>`).join('')}</select></span>`).join(''):'<span class="dim" style="font-size:11px">the arrs did not answer - no folders to list</span>'}
       </div>
     </div>
@@ -51037,7 +51107,7 @@ function poDetail(r){
   const row=(k,v)=>`<div style="display:flex;gap:8px;margin:2px 0"><span class="dim" style="flex:none;width:96px;text-align:right">${k}</span><span style="min-width:0;overflow-wrap:anywhere">${v}</span></div>`;
   return `<div style="font-size:11px;padding:6px 10px 8px 34px;white-space:normal">
     ${r.ptitle?row('title',`<b>${r.arr&&r.ptitle.startsWith(r.arr)
-        ?`<span style="color:${arrLook(r.arr).c}">${esc(r.arr)}</span>${esc(r.ptitle.slice(r.arr.length))}`
+        ?`${arrIcon(r.arr, 13)} <span style="color:${arrLook(r.arr).c}">${esc(r.arr)}</span>${esc(r.ptitle.slice(r.arr.length))}`
         :esc(r.ptitle)}</b>`):''}
     ${r.msg?row('message',`<div style="border-left:2px solid var(--line);padding-left:8px">${poMsgHtml(r.msg)}</div>`)
            :row('message','<span class="dim">sent before nuarr kept the full text — only the summary is on file</span>')}
@@ -51142,6 +51212,17 @@ async function poSave(btn){
     m.textContent=r.ok?('saved · '+(r.detail||'')):(r.error||'failed');
     m.style.color=r.ok?'#7fd4a3':'#e0575b';
     if(r.ok) setTimeout(()=>loadPushover(true), 600);
+  }catch(e){ m.textContent='failed: '+e; }
+  btn.disabled=false;
+}
+async function poAppSave(kind, btn){
+  const m=document.getElementById('poAppMsg_'+kind); btn.disabled=true; m.textContent='testing…';
+  try{
+    const r=await (await fetch('/api/pushover/apptoken',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kind, token:document.getElementById('poApp_'+kind).value})})).json();
+    m.textContent=r.ok?(r.set?'saved · a test message was sent from it':'removed · sending as Nuarr'):(r.error||'failed');
+    m.style.color=r.ok?'#7fd4a3':'#e0575b';
+    if(r.ok) setTimeout(()=>loadPushover(true), 900);
   }catch(e){ m.textContent='failed: '+e; }
   btn.disabled=false;
 }
@@ -52476,7 +52557,7 @@ async function loadHooks(){
                   : /test/i.test(label) ? '#8b949e' : '#c9d1d9';
         const pst = `color:${hue};border-color:${hue}88;background:${hue}1f`;
         return `<tr><td class="dim">${new Date(r.at*1000).toLocaleTimeString()}</td>
-        <td>${esc(r.arr)}</td><td><span class="pill" style="${pst}">${esc(label)}</span></td>
+        <td style="white-space:nowrap">${arrIcon(r.arr, 14)} ${esc(r.arr)}</td><td><span class="pill" style="${pst}">${esc(label)}</span></td>
         <td class="dim mono wrap">${esc(r.detail)}</td></tr>`}).join('')+'</table>'
     : '<div class="dim" style="padding:14px">no events yet — register the webhooks, then import or rename something</div>';
   if(paint('hooks', html, true)) pulse(box.closest('.panel'));
