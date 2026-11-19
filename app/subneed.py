@@ -591,6 +591,95 @@ def required() -> dict[str, list[str]]:
     return out
 
 
+def makers() -> list[str]:
+    """Libraries whose "Make missing subtitles" switch is on."""
+    try:
+        from . import langpolicy
+        return sorted(lib for lib, sides in (langpolicy.load() or {}).items()
+                      if ((sides or {}).get("subs") or {}).get("make"))
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
+# MAKE MISSING SUBTITLES, PER LIBRARY. Erik, 2026-11-18: "add option per sub
+# library to have the subtitle maker make subs for shows and movies that are
+# missing them" - and, asked, for BOTH kinds: a foreign file with nothing to
+# read (`missing`) and an English-spoken one with no English track (`want`,
+# 2,459 files when this was written). The maker transcribes English audio
+# rather than translating it, so the second kind costs Whisper alone.
+#
+# A TRICKLE, NOT A FLOOD. At 15-20 GPU minutes a file the `want` backlog is
+# weeks of work; putting it all in the job queue at once would bury every
+# other subtitle job and make the queue panel useless. So at most MAKE_KEEP of
+# this switch's jobs wait at any time, topped up every pass of the loop
+# below, the foreign ones first. The `want` ones go in at MAKE_BACKLOG_PRIO,
+# behind the backlog band, so a person's make and the raws' make still lead.
+# Nothing is ever replaced or deleted on this path - the maker's result, or
+# its "nothing to make subtitles from", is final.
+MAKE_BY = "Make missing subtitles (library)"
+MAKE_KEEP = 6
+MAKE_BACKLOG_PRIO = 80
+
+
+def _make_queued() -> int:
+    try:
+        from . import submake
+        return sum(1 for x in submake._queue() if x.get("by") == MAKE_BY)
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
+def make_missing(keep: int = MAKE_KEEP) -> dict:
+    """Top the switch's share of the Subtitle maker queue back up to `keep`."""
+    libs = makers()
+    if not libs:
+        return {"added": 0, "why": "no library has the switch on"}
+    room = int(keep) - _make_queued()
+    if room <= 0:
+        return {"added": 0, "why": "its share of the queue is full"}
+    init()
+    qs = ",".join("?" * len(libs))
+    try:
+        with cursor() as cur:
+            rows = [dict(r) for r in cur.execute(
+                "SELECT n.file_id, n.state FROM sub_need n JOIN files f ON f.id=n.file_id "
+                f" WHERE n.library IN ({qs}) AND n.lang='eng' AND n.state IN (?, ?) "
+                "   AND f.state NOT IN ('deleted','duplicate') "
+                " ORDER BY CASE n.state WHEN ? THEN 0 ELSE 1 END, "
+                "          COALESCE(f.first_seen, 0) DESC LIMIT ?",
+                (*libs, MISSING, WANT, MISSING, max(200, room * 40)))]
+    except Exception as e:                                       # noqa: BLE001
+        return {"added": 0, "why": f"{type(e).__name__}: {e}"}
+    from . import submake
+    gates = submake.gate_many([r["file_id"] for r in rows])
+    added, tried = 0, 0
+    for r in rows:
+        if added >= room:
+            break
+        if gates.get(int(r["file_id"])) != "none":
+            continue
+        tried += 1
+        got = submake.enqueue([int(r["file_id"])], by=MAKE_BY,
+                              priority=None if r["state"] == MISSING else MAKE_BACKLOG_PRIO)
+        added += int(got.get("added") or 0)
+        if tried >= room * 6:
+            break
+    if added:
+        joblog.log(f"make missing subtitles: {added} file(s) queued for the Subtitle maker "
+                   f"({', '.join(libs)})", "info", system="subneed")
+    return {"added": added, "libraries": libs}
+
+
+def _make_one(fid: int, state: str, lib: str) -> bool:
+    """A fresh file in a switched-on library goes to the maker straight away."""
+    if state not in (MISSING, WANT) or lib not in makers():
+        return False
+    from . import submake
+    if submake.gate(fid) != "none":
+        return False
+    return bool(submake.enqueue([fid], by=MAKE_BY).get("added"))
+
+
 def _keeps_untagged(lib: str) -> bool:
     try:
         from . import langpolicy
@@ -2780,6 +2869,20 @@ async def fresh_followup(file_id: int, job_id: str = "", after_verify: bool = Fa
     try:
         from . import joblog as _jl
         await asyncio.to_thread(check_one, fid)
+
+        def _st_lib():
+            with cursor() as cur:
+                r = cur.execute("SELECT state, library FROM sub_need WHERE file_id=? AND lang='eng' "
+                                "LIMIT 1", (fid,)).fetchone()
+            return (str(r["state"]), str(r["library"] or "")) if r else ("", "")
+        st0, lib0 = await asyncio.to_thread(_st_lib)
+        # THE LIBRARY SWITCH FIRST, whatever the raws mode: a `want` file is
+        # never the raws' business, and a `missing` one in manual mode is
+        # still the switch's.
+        if (st0 == WANT or mode() != "auto") and await asyncio.to_thread(_make_one, fid, st0, lib0):
+            from . import joblog as _jl0
+            _jl0.log("make missing subtitles: the fresh file is queued for the Subtitle maker now",
+                     "info", job_id or None, system="subneed")
         if mode() != "auto":
             return
 
@@ -2864,6 +2967,7 @@ async def watch() -> None:
                 if r.get("checked") else (r.get("why") or "nothing required"))
             if r.get("missing"):
                 await act_now(50)
+            await asyncio.to_thread(make_missing)
         except Exception as e:                                   # noqa: BLE001
             joblog.log(f"missing-subtitle check: {type(e).__name__}: {e}",
                        "warn", system="subneed")

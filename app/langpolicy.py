@@ -58,17 +58,17 @@ KIND_DEFAULTS: dict = {
     "anime": {
         "audio": {"keep_original": True, "langs": ["jpn", "eng", "und"]},
         "subs":  {"keep_original": False, "langs": ["eng"], "keep_untagged": True,
-                  "require": []},
+                  "require": [], "make": False},
     },
     "animation": {
         "audio": {"keep_original": True, "langs": ["eng"]},
         "subs":  {"keep_original": False, "langs": ["eng"], "keep_untagged": True,
-                  "require": []},
+                  "require": [], "make": False},
     },
     "live": {
         "audio": {"keep_original": True, "langs": ["eng"]},
         "subs":  {"keep_original": False, "langs": ["eng"], "keep_untagged": True,
-                  "require": []},
+                  "require": [], "make": False},
     },
 }
 
@@ -150,6 +150,11 @@ def _norm(got: dict, into: dict) -> None:
         into["require"] = sorted({str(x).strip().lower()[:3]
                                   for x in got["require"] if str(x).strip()})
     into.setdefault("require", [])
+    # MAKE MISSING SUBTITLES - the same "no `in into` guard" as require, for
+    # the same reason: every stored policy predates the key.
+    if "make" in got:
+        into["make"] = bool(got["make"])
+    into.setdefault("make", False)
     if isinstance(got.get("langs"), list):
         # Normalised on the way in, so a policy saved as "ENG " cannot quietly
         # fail to match a probe reporting "eng".

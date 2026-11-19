@@ -271,7 +271,8 @@ def _lang_of(r: dict) -> str:
     return langs[0] if langs else "jpn"
 
 
-def enqueue(file_ids: list, overwrite: bool = False, by: str = "you") -> dict:
+def enqueue(file_ids: list, overwrite: bool = False, by: str = "you",
+            priority: int | None = None) -> dict:
     q = _queue()
     have = {int(x["file_id"]) for x in q}
     added, skipped = 0, []
@@ -307,7 +308,8 @@ def enqueue(file_ids: list, overwrite: bool = False, by: str = "you") -> dict:
             fresh = set()
         got = {"made": 0, "held": {}}
         for part, prio in ((lambda r: r["file_id"] in fresh, _jobs.FRESH_PRIORITY),
-                           (lambda r: r["file_id"] not in fresh, 60)):
+                           (lambda r: r["file_id"] not in fresh,
+                            60 if priority is None else int(priority))):
             sub = [r for r in rows if part(r)]
             if sub:
                 g = _jobs.enqueue_many(sub, "submake", priority=prio,

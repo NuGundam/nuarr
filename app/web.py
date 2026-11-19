@@ -11486,6 +11486,25 @@ async def api_subneed_require(library: str, lang: str, on: bool = True):
     return {"ok": True, "require": sorted(want), "swept": r}
 
 
+@app.post("/api/subneed/make")
+async def api_subneed_make(library: str, on: bool = True):
+    """Turn one library's "Make missing subtitles" switch on or off.
+
+    On: files in it with no English subtitles - foreign ones first, then
+    English-spoken ones - go to the Subtitle maker a few at a time
+    (subneed.make_missing). Off: nothing new is queued; jobs already waiting
+    stay unless they are cancelled from the queue."""
+    from . import langpolicy
+    pol = langpolicy.load()
+    if library not in pol:
+        raise HTTPException(404, f"no library named {library!r}")
+    langpolicy.save({library: {"subs": {"make": bool(on)}}})
+    now = bool(((langpolicy.load().get(library) or {}).get("subs") or {}).get("make"))
+    joblog.log(f"{library}: make missing subtitles {'ON' if now else 'off'}", "info")
+    got = await asyncio.to_thread(subneed.make_missing) if now else {"added": 0}
+    return {"ok": True, "make": now, "queued": int(got.get("added") or 0)}
+
+
 @app.post("/api/subneed/check")
 async def api_subneed_check():
     """Judge the whole library now, in the background; the panel polls the bar.
@@ -35217,7 +35236,13 @@ function langBlockHtml(lib, side, sideLabel){
       <input type="checkbox" ${cfg.keep_untagged?'checked':''}
              onchange="langToggle('${esc(lib)}','${side}','__untagged__',this.checked)">
       Keep untagged tracks
-      <span class="dim">— many releases leave subs unlabelled</span></label>`:''}
+      <span class="dim">— many releases leave subs unlabelled</span></label>
+    <label class="lorig" title="The Subtitle maker (Whisper + on-screen text + translation) writes English subtitles for files in this library that have none: foreign-language files first, then English-spoken ones. A few at a time, behind other work - nothing is ever replaced or deleted on this path. Saves the moment you click.">
+      <input type="checkbox" ${cfg.make?'checked':''}
+             onchange="langMake('${esc(lib)}',this.checked,this)">
+      Make missing subtitles
+      <span class="dim">— the Subtitle maker writes English for files that have none (foreign first, then English audio)</span>
+      <span class="dim" id="lmake_${cssId(lib)}"></span></label>`:''}
     <div class="lchips">${chips||'<span class="dim" style="font-size:11px">no '
       +esc(sideLabel.toLowerCase())+' tracks scanned in this library yet</span>'}</div>
     ${extra.length?`<div class="dim" style="font-size:11px;margin-top:5px">also kept:
@@ -35261,6 +35286,20 @@ function langBlockHtml(lib, side, sideLabel){
 // clicked - but that is one boolean, not a page. The checkbox is set from
 // the response, the cached policy is patched to match, and the full reload
 // only happens if the two disagree, which means something else changed it.
+// MAKE MISSING SUBTITLES saves on the click, like Require: it changes no
+// plan, it turns on a queue.
+async function langMake(lib, on, el){
+  let r=null;
+  try{
+    r=await (await fetch('/api/subneed/make?library='+encodeURIComponent(lib)
+      +'&on='+(on?'true':'false'), {method:'POST'})).json();
+  }catch(e){}
+  const got=!!(r&&r.make);
+  if(el) el.checked=got;
+  if(_lang && _lang.policy && _lang.policy[lib] && _lang.policy[lib].subs) _lang.policy[lib].subs.make=got;
+  const m=document.getElementById('lmake_'+cssId(lib));
+  if(m) m.textContent=!r?' — could not save':(got?(' — on'+(r.queued?(', '+r.queued+' queued now'):'')):' — off');
+}
 async function langRequire(lib, code, on, el){
   let r=null;
   try{
