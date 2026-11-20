@@ -3375,6 +3375,15 @@ async def api_pushover_config(body: dict = Body(...)):
     return {"ok": True, "detail": detail}
 
 
+@app.get("/tv/wallpaper.jpg")
+async def tv_wallpaper():
+    """The loft TV's Projectivy wallpaper (tvwall.py): the nuarr background with
+    what Plex is playing, or a recent addition when nothing is."""
+    from . import tvwall
+    jpg = await asyncio.to_thread(tvwall.render)
+    return Response(jpg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
 @app.get("/arr-icon/{name}")
 def arr_icon(name: str):
     """The arrs' official logos (taken from the arrs' own web UI, kept in
