@@ -384,6 +384,16 @@ def _record(pid: int, owner_pid: int, procs: dict, title: str,
                "warn" if ours else "info")
 
 
+def _asked_hidden(pid: int) -> bool:
+    """Did nuarr spawn this pid with no console window (spawntrace's record)?"""
+    try:
+        from . import spawntrace
+        w = spawntrace.where(pid) or {}
+    except Exception:                                        # noqa: BLE001
+        return False
+    return bool(int(w.get("flags") or 0) & (0x08000000 | 0x00000008))
+
+
 def sample(prev: dict) -> dict:
     """One pass. Returns the new process map for the next call."""
     procs = _snapshot()
@@ -415,6 +425,17 @@ def sample(prev: dict) -> dict:
         # unidentifiable "?" tells nobody anything and, repeated, reads as a
         # broken watcher.
         if ppid not in procs and ppid in (prev or {}):
+            # A HIDDEN CONSOLE IS NOT A FLASH. CREATE_NO_WINDOW still gives the
+            # child a conhost - with no window - so a one-second ffmpeg probe
+            # that passed the flag looked exactly like a flash once it had
+            # exited: vmaftarget.py:375 on 2026-11-14 held the health row red
+            # for a week over a spawn that was hidden correctly. When nuarr's
+            # own spawn record says the console was asked for hidden
+            # (CREATE_NO_WINDOW or DETACHED_PROCESS), it is counted, not logged.
+            # A window seen on screen (visible=1) is always logged.
+            if _asked_hidden(ppid):
+                STATE["hidden_ok"] = STATE.get("hidden_ok", 0) + 1
+                continue
             _record(pid, ppid, procs, "", visible=-1, prev=prev)
     return procs
 

@@ -92,12 +92,14 @@ def _where() -> str:
     return nearest or lib
 
 
-def note(pid: int, exe: str, argv: str = "", where: str = "") -> None:
+def note(pid: int, exe: str, argv: str = "", where: str = "", flags: int = 0,
+         hidden: bool = False) -> None:
     if not pid:
         return
     with _LOCK:
         _RING[int(pid)] = {"exe": exe or "", "where": where or _where(),
-                           "argv": (argv or "")[:300], "at": time.time()}
+                           "argv": (argv or "")[:300], "at": time.time(),
+                           "flags": int(flags or 0), "hidden": bool(hidden)}
         _ORDER.append(int(pid))
         STATE["seen"] += 1
         while len(_ORDER) > MAX:
@@ -130,7 +132,14 @@ def install() -> None:
             else:
                 exe = str(args or "").split(" ")[0]
                 argv = str(args or "")
-            note(getattr(self, "pid", 0) or 0, os.path.basename(exe), argv)
+            # THE FLAGS TOO, so the console watcher can tell a console asked
+            # for hidden (CREATE_NO_WINDOW still starts a conhost - one that
+            # never shows) from one that was not. See consolewatch.sample.
+            si = kw.get("startupinfo")
+            hidden = bool(si is not None and (getattr(si, "dwFlags", 0) & 1)
+                          and getattr(si, "wShowWindow", 1) == 0)
+            note(getattr(self, "pid", 0) or 0, os.path.basename(exe), argv,
+                 flags=int(kw.get("creationflags") or 0), hidden=hidden)
         except Exception as e:                                   # noqa: BLE001
             STATE["error"] = f"{type(e).__name__}: {e}"
 

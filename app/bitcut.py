@@ -803,10 +803,18 @@ def reconcile(queues: list, w: dict) -> list:
                 for e in h if e.get("eventType") == "downloadFailed")
             if dead:
                 why += " (Usenet copies taken down - torrents next)"
-            # auto gets one more go with the next release; after two lost, a person
-            set_state(x["file_id"], "open", f"{why}: {x['release']} - fetch again to try the next one",
-                      tried=tried, usenet_dead=bool(dead),
-                      auto_tried=x.get("auto_tried") if len(tried) >= 2 else None)
+            # LOST GRABS STAY AUTO'S. "After two lost, a person" left The Conjuring 3
+            # waiting on a click (2026-11-20) - B0MBARDiERS lost, the Usenet remux
+            # taken down - while a seeded UHD torrent sat next in line; the click
+            # would only have fetched it. Auto takes the next release up to
+            # MAX_LOST grabs; past that the row joins the "nothing fuller" path -
+            # rechecked daily, then the old release again - which needs nobody.
+            if len(tried) >= MAX_LOST:
+                set_state(x["file_id"], "none", f"{why}: {x['release']} - {len(tried)} fuller copies lost; "
+                          "rechecked daily, then the old release again", tried=tried, usenet_dead=bool(dead))
+            else:
+                set_state(x["file_id"], "open", f"{why}: {x['release']} - auto fetches the next one",
+                          tried=tried, usenet_dead=bool(dead), auto_tried=None)
             joblog.log(f"bitrate cut: {why} - {x['release']}", "warn")
             STATS["detail"].append(f"{a.name}: {why} - {x['release'][:60]}; row back to open")
     return out
@@ -953,10 +961,11 @@ def _preview(file_id: int) -> dict:
 # bin at once, while the bin still has it; otherwise the row is rechecked
 # once a day for RETRY_D days - repacks and disc rips arrive late - and then
 # the old release is grabbed again. Only a row whose old release is gone as
-# well closes by itself, as kept, with the reason. A grab that is lost twice
-# (reconcile) is still a person's. A sweep runs a minute after a new cut
+# well closes by itself, as kept, with the reason. A lost grab is followed by
+# the next release, up to MAX_LOST (reconcile). A sweep runs a minute after a new cut
 # lands and every hour.
 RETRY_D = 14
+MAX_LOST = 4          # lost grabs auto follows with the next release - see reconcile
 RETRY_S = 86400
 KV_MODE = "bitcut.mode"
 KV_AUTO_LOG = "bitcut.auto_log"

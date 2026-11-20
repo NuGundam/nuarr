@@ -130,7 +130,56 @@ async def _one(cfg) -> dict:
             })
     except Exception:                                    # noqa: BLE001
         pass
+    if any(str(h.get("source") or "").startswith("IndexerStatusCheck") or
+           str(h.get("source") or "").startswith("IndexerLongTermStatusCheck")
+           for h in row["health"]):
+        if await _retest_indexers(cfg.name, c, row["health"]):
+            row["health"] = [h for h in row["health"]
+                             if not str(h.get("source") or "").startswith("Indexer")
+                             or "StatusCheck" not in str(h.get("source") or "")]
     return row
+
+
+# ---- AN INDEXER THAT IS BACK -------------------------------------------------
+#
+# "Indexers unavailable due to failures: Tokyo Toshokan" stayed on the tile
+# (2026-11-20) hours after the site came back: the arr only retries a failed
+# indexer on its own back-off, and clears the warning after that. Pressing Test
+# on the indexer and then the arr's health check clears it at once - so nuarr
+# does that: every RETEST_S per arr, test each indexer the warning names; when
+# all pass, ask the arr to re-run its health checks. One that still fails is
+# left alone - the warning is then true.
+RETEST_S = 1800.0
+_RETEST_AT: dict = {}
+
+
+async def _retest_indexers(arr: str, c, health: list) -> bool:
+    import re as _re
+    if time.time() - _RETEST_AT.get(arr, 0.0) < RETEST_S:
+        return False
+    _RETEST_AT[arr] = time.time()
+    names: set = set()
+    for h in health:
+        if "StatusCheck" in str(h.get("source") or ""):
+            m = _re.search(r":\s*(.+)$", h.get("message") or "")
+            if m:
+                names |= {n.strip() for n in m.group(1).split(",") if n.strip()}
+    if not names:
+        return False
+    try:
+        idx = [i for i in (await c._get("/indexer") or []) if i.get("name") in names]
+        if not idx:
+            return False
+        for i in idx:
+            await c._post("/indexer/test", i)        # raises on a failing test
+        await c._post("/command", {"name": "CheckHealth"})
+    except Exception as e:                               # noqa: BLE001
+        joblog.log(f"{arr}: re-tested {', '.join(sorted(names))} - still failing "
+                   f"({type(e).__name__})", "info", system="arrhealth")
+        return False
+    joblog.log(f"{arr}: {', '.join(sorted(names))} working again - re-tested and "
+               "asked the arr to re-check its health", "ok", system="arrhealth")
+    return True
 
 
 async def refresh() -> dict:
