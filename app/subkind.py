@@ -153,6 +153,11 @@ def _picture_rows(limit: int) -> list:
         auto = {"mark": "act"}.get(r.get("auto") or "", r.get("auto") or "ask")
         auto_why = r.get("auto_why") or ""
         marked = bool(r.get("marked"))
+        # ANSWERED IS ANSWERED. A person who picked "signs or songs" or "no
+        # subtitles in the picture" has said there is nothing to mark; the row
+        # kept its Mark it button and so kept counting as a question and
+        # holding the file (Detective Conan S29E29, answered "signs").
+        answered = bool(r.get("chosen")) and kind in ("signs", "none") and not marked
         out.append({
             "id": f"{r['file_id']}:{PICTURE}",
             "file_id": r["file_id"], "source": PICTURE,
@@ -166,9 +171,10 @@ def _picture_rows(limit: int) -> list:
             "lines": lines.get(int(r["file_id"])) or [],
             "why": r.get("why") or "",
             "auto": auto, "auto_why": auto_why,
-            "action": "" if marked else "mark",
-            "action_word": "" if marked else "Mark it",
-            "done": marked, "done_word": "marked" if marked else "",
+            "action": "" if (marked or answered) else "mark",
+            "action_word": "" if (marked or answered) else "Mark it",
+            "done": marked or answered,
+            "done_word": "marked" if marked else ("answered" if answered else ""),
             "detail": r.get("detail") or "",
             # WHEN THE FILE LANDED, not when it was looked at. A finding you
             # are deciding about is about a file, and "this arrived an hour

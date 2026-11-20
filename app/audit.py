@@ -344,8 +344,14 @@ def check(pr: dict, anime: bool, library: str = "",
     if (v.get("codec_name") or "").lower() not in ("h264", "hevc", "h265", "av1"):
         flag("video/codec", f"{v.get('codec_name') or 'unknown'} video",
              "h264, HEVC or AV1")
+    # A DV file whose header has no parameter sets (extradata under 40 bytes) is
+    # one the planner KEEPS on purpose: ffmpeg cannot rewrite it without the DV
+    # layer (rules.py, "Dolby Vision kept"). Flagging it made a permanent
+    # "rules have a gap" item with nothing anyone could do (Reasonable Doubt S03).
+    _xd = v.get("extradata_size")
+    dv_header_ok = not (isinstance(_xd, int) and _xd < 40)
     for sd in v.get("side_data_list") or []:
-        if "dv_profile" in sd and int(sd["dv_profile"]) in dv_profiles:
+        if dv_header_ok and "dv_profile" in sd and int(sd["dv_profile"]) in dv_profiles:
             flag("video/DV", f"Dolby Vision profile {sd['dv_profile']}",
                  "plain HDR10, DV layer removed")
     if "10" in (v.get("profile") or "") and "10" not in (v.get("pix_fmt") or ""):

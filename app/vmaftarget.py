@@ -59,6 +59,11 @@ DEFAULTS = {"on": True, "target": 95.0, "samples": 4, "sample_s": 6.0, "floor": 
             # quality", 80 "very high", 90 visually lossless. Off here and set
             # per kind: untested on live action, where grain reads low.
             "ssimu": 0.0,
+            # MEASURE WITHOUT JUDGING (Erik, 2026-11-20). Scores and logs
+            # SSIMULACRA2 on every sample but never holds a CQ back - for
+            # live action, where grain reads low and the right floor is not
+            # known yet. A floor above 0 measures anyway.
+            "ssimu_measure": False,
             # ONE BAR DOES NOT FIT EVERY KIND. VMAF reads a flat cel the same
             # as grainy film, but the viewer does not: film needs its worst
             # moments held closer. Each kind (langpolicy: anime / animation /
@@ -77,7 +82,7 @@ DEFAULTS = {"on": True, "target": 95.0, "samples": 4, "sample_s": 6.0, "floor": 
             # before it is committed - see verify_final()
             "verify": True}
 KINDS = ("anime", "animation", "live")
-KIND_KEYS = ("target", "floor", "low", "banding", "ssimu")
+KIND_KEYS = ("target", "floor", "low", "banding", "ssimu", "ssimu_measure")
 CQ_DOWN = 4            # at most this many CQ steps BELOW the library's CQ
 CQ_UP = 14             # at most this many above it (was 10; burn-heavy anime passed VMAF 96-98 at the old cap of +10)
 MIN_MINUTES = 4.0
@@ -176,6 +181,8 @@ def _clamp(k: str, v):
         return max(1.0, min(20.0, float(v)))
     if k == "ssimu":
         return max(0.0, min(95.0, float(v)))
+    if k == "ssimu_measure":
+        return str(v).lower() in ("1", "true", "on", "yes")
     return v
 
 
@@ -799,6 +806,7 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
     kc = for_kind(c, kind)
     want, floor, banding, low_floor = float(kc["target"]), float(kc["floor"]), float(kc["banding"]), float(kc["low"])
     s2_floor = float(kc.get("ssimu") or 0.0)
+    s2_measure = s2_floor > 0 or bool(kc.get("ssimu_measure"))
     head = headroom(library, is_dvd(src)) if c.get("headroom") else 0.0
     aim = want + head                       # what the samples must reach for the file to land on `want`
     n, length = int(c["samples"]), float(c["sample_s"])
@@ -915,7 +923,7 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
                     sizes += sz
                     means.append(sc[0])
                     lows.append(sc[1])
-                    if s2_floor > 0:
+                    if s2_measure:
                         _report(f"CQ {cq}: sample {k + 1}/{len(refs)} - SSIMULACRA2 detail check",
                                 1 + len(tried) + (k + 0.7) / len(refs))
                         s2 = _ssimu(ref, out)
@@ -1035,7 +1043,7 @@ def _choose(job_id: str, file_id: int, src: str, plan, probe: dict | None, durat
         if pred is not None:
             note += f" · samples {abs(pred) * 100:.0f}% {'smaller' if pred >= 0 else 'LARGER'} than the source there"
         if chosen.get("ssimu") is not None:
-            note += f" · SSIMULACRA2 {chosen['ssimu']:g}" + (f" (floor {s2_floor:g})" if s2_floor else "")
+            note += f" · SSIMULACRA2 {chosen['ssimu']:g}" + (f" (floor {s2_floor:g})" if s2_floor else " (measured only)")
         if dark:
             note += f" · dark scene sampled at {int(dark['t'] // 60)}:{int(dark['t'] % 60):02d}"
         _remember(library, target, family, best)

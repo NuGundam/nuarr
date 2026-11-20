@@ -1581,8 +1581,18 @@ def sweep(limit: int = BATCH) -> dict:
                     "  FROM files f LEFT JOIN sub_facts s ON s.file_id=f.id "
                     "                LEFT JOIN hardsub h ON h.file_id=f.id "
                     " WHERE f.library=? AND f.state NOT IN ('deleted','duplicate') "
-                    " ORDER BY seen IS NOT NULL, seen "
-                    " LIMIT ?", (lib, int(limit))).fetchall()
+                    # QUESTIONS FIRST. A file held at `unknown` is one a person
+                    # is being asked about, and it waited its turn behind the
+                    # whole library - a month for Anime Shows. Three Detective
+                    # Conan episodes sat on Subtitle User Input at a picture
+                    # score of 78-84% that the scorer had long since revised to
+                    # 20%; one re-check and all three settled by themselves.
+                    # An hour between looks keeps a truly unsure file from
+                    # taking the batch every pass.
+                    " ORDER BY (SELECT MAX(n.state='unknown' AND n.checked_at < ?) "
+                    "             FROM sub_need n WHERE n.file_id=f.id) DESC, "
+                    "          seen IS NOT NULL, seen "
+                    " LIMIT ?", (lib, time.time() - 3600, int(limit))).fetchall()
                 now = time.time()
                 for r in rows:
                     # The joined row carries the picture columns, so the sweep
