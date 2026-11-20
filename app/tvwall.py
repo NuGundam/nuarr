@@ -227,52 +227,52 @@ def _render_house(s: dict) -> Image.Image:
          f"intake {_fmt(_n(s, 'sensor.fresh_air_aqi_nox'), 0)}"),
     ]
     # ---- tiles in the free band between the header and the app rows
-    x0, y0, gap, th = 64, 150, 12, 255
+    x0, y0, gap, th = 96, 152, 14, 196
     tw = (W - 2 * x0 - gap * (len(tiles) - 1)) // len(tiles)
-    f_lab, f_unit, f_val, f_pill, f_sub, f_arr = (_font("b", 19), _font("r", 18), _font("b", 64),
-                                                  _font("b", 18), _font("r", 21), _font("sym", 40))
+    f_lab, f_unit, f_val, f_pill, f_sub, f_arr = (_font("sb", 15), _font("r", 14), _font("sb", 46),
+                                                  _font("sb", 14), _font("r", 16), _font("sym", 28))
     for i, (lab, unit, val, (tier, col), arr, sub) in enumerate(tiles):
         x = x0 + i * (tw + gap)
-        d.rounded_rectangle((x, y0, x + tw, y0 + th), radius=14, fill=PANEL + (215,), outline=LINE + (255,), width=2)
-        d.rectangle((x + 14, y0 + th - 5, x + tw - 14, y0 + th - 3), fill=col + (170,))
-        d.text((x + 18, y0 + 16), lab, font=f_lab, fill=DIM)
-        d.text((x + 18, y0 + 40), unit, font=f_unit, fill=DIM + (170,))
-        d.text((x + 16, y0 + 78), val, font=f_val, fill=col if tier else FG)
+        d.rounded_rectangle((x, y0, x + tw, y0 + th), radius=12, fill=PANEL + (170,), outline=LINE + (200,), width=1)
+        d.rounded_rectangle((x + 16, y0 + th - 4, x + tw - 16, y0 + th - 2), radius=1, fill=col + (130,))
+        d.text((x + 16, y0 + 13), lab, font=f_lab, fill=DIM)
+        d.text((x + 16, y0 + 32), unit, font=f_unit, fill=DIM + (150,))
+        d.text((x + 15, y0 + 58), val, font=f_val, fill=col if tier else FG)
         if arr:
-            d.text((x + 24 + d.textlength(val, font=f_val), y0 + 96), arr, font=f_arr, fill=DIM)
+            d.text((x + 22 + d.textlength(val, font=f_val), y0 + 72), arr, font=f_arr, fill=DIM)
         if tier:
-            pw = d.textlength(tier, font=f_pill) + 22
-            d.rounded_rectangle((x + 16, y0 + 168, x + 16 + pw, y0 + 198), radius=15,
-                                fill=col + (40,), outline=col + (150,), width=1)
-            d.text((x + 27, y0 + 172), tier, font=f_pill, fill=col)
+            pw = d.textlength(tier, font=f_pill) + 18
+            d.rounded_rectangle((x + 15, y0 + 126, x + 15 + pw, y0 + 149), radius=11,
+                                fill=col + (32,), outline=col + (110,), width=1)
+            d.text((x + 24, y0 + 128), tier, font=f_pill, fill=col)
         if sub:
             sub_t = sub
             while sub_t and d.textlength(sub_t, font=f_sub) > tw - 30:
                 sub_t = sub_t[:-1]
-            d.text((x + 18, y0 + 210), sub_t, font=f_sub, fill=DIM)
+            d.text((x + 16, y0 + 160), sub_t, font=f_sub, fill=DIM)
     # ---- outdoor line in the header (the card's OUTDOOR pill)
     oT, oRH = _n(s, "sensor.outdoor_temperature"), _n(s, "sensor.outdoor_humidity")
     hi, lo = _n(s, "sensor.outdoor_forecast_high"), _n(s, "sensor.outdoor_forecast_low")
     hi = hi if _ok(hi) else _n(s, "sensor.ecobee_forecast_high")
     lo = lo if _ok(lo) else _n(s, "sensor.ecobee_forecast_low")
     night = str(s.get("sun.sun")) == "below_horizon"
-    parts = [("☾  " if night else "☀  ", _font("sym", 26), (240, 220, 160) if night else AMBER),
-             ("OUTDOOR   ", _font("b", 24), FG), (f"{_fmt(oT, 1)}°F", _font("b", 30), BLUE),
-             ("   ·   AH  ", _font("b", 24), DIM), (f"{_fmt(_ah(oT, oRH), 1)} g/m³", _font("b", 26), BLUE)]
+    parts = [("☾  " if night else "☀  ", _font("sym", 20), (240, 220, 160) if night else AMBER),
+             ("OUTDOOR   ", _font("sb", 18), FG), (f"{_fmt(oT, 1)}°F", _font("sb", 22), BLUE),
+             ("   ·   AH  ", _font("sb", 18), DIM), (f"{_fmt(_ah(oT, oRH), 1)} g/m³", _font("sb", 20), BLUE)]
     if _ok(hi) or _ok(lo):
-        parts.append((f"   ·   H {_fmt(hi, 0)}°  /  L {_fmt(lo, 0)}°", _font("b", 24), DIM))
+        parts.append((f"   ·   H {_fmt(hi, 0)}°  /  L {_fmt(lo, 0)}°", _font("sb", 18), DIM))
     width = sum(d.textlength(t, font=f) for t, f, _ in parts)
-    px, py = 420, 36
-    d.rounded_rectangle((px - 22, py - 8, px + width + 22, py + 46), radius=27,
-                        fill=(255, 255, 255, 14), outline=LINE + (255,), width=2)
+    px, py = 410, 41
+    d.rounded_rectangle((px - 18, py - 6, px + width + 18, py + 38), radius=22,
+                        fill=(255, 255, 255, 10), outline=LINE + (200,), width=1)
     x = px
     for t, f, c in parts:
         bb = d.textbbox((0, 0), t, font=f)
-        d.text((x, py + 19 - (bb[1] + bb[3]) / 2), t, font=f, fill=c)
+        d.text((x, py + 16 - (bb[1] + bb[3]) / 2), t, font=f, fill=c)
         x += d.textlength(t, font=f)
     # "updated" under the tiles, so a stale picture is obvious
-    up, f_up = time.strftime("updated %H:%M").replace(" 0", " "), _font("r", 18)
-    d.text((W - 64 - d.textlength(up, font=f_up), y0 + th + 6), up, font=f_up, fill=DIM + (150,))
+    up, f_up = time.strftime("updated %H:%M").replace(" 0", " "), _font("r", 14)
+    d.text((W - x0 - d.textlength(up, font=f_up), y0 + th + 6), up, font=f_up, fill=DIM + (130,))
     return img
 
 
