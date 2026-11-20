@@ -505,6 +505,10 @@ class Settings:
     # or the token is missing, the old path still answers.
     plex_url: str | None = None
     plex_token: str | None = None
+    # HOME ASSISTANT, for the loft TV wallpaper (tvwall.py): a long-lived
+    # token from HA Profile > Security, set on /tv. Read-only use.
+    ha_url: str | None = "http://192.168.0.96:8123"
+    ha_token: str | None = None
     # auto: the agreement check fixes what it finds on its own schedule.
     plexsync_mode: str = "manual"
     # auto: files that no longer match the subtitle rules are requeued

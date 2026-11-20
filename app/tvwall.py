@@ -1,204 +1,336 @@
 """Loft TV wallpaper (Erik, 2026-11-19).
 
-Projectivy on the loft TV loads its wallpaper from a URL. This renders that
-picture: the nuarr-style home background with a "Now playing" card in the
-free space top-right (whatever Plex is playing anywhere in the house, with
-its backdrop, poster and progress), or, when nothing plays, one of the latest
-additions to Plex (a different one every 10 minutes). If Plex can't be reached
-it is just the plain background.
+Projectivy on the loft TV shows this as its home-screen wallpaper: the
+nuarr-style background with the house's air readings from Home Assistant -
+the same sources the HVAC card's rails use (temperature, RH, absolute
+humidity, dew point, CO2, VOC, PM AQI, NOx, each with the fresh-air intake
+value) and the outdoor line in the header.
+
+Projectivy downloads a picture URL once and never again, so the TV plays it
+as a slow live HLS stream instead (/tv/live.m3u8): every 10-second segment
+is the current picture, encoded when the TV asks for it. Nothing is fetched
+or encoded while the TV isn't on its home screen.
+
+HA access: ha_url + ha_token in config.yml, set on /tv.
 """
 from __future__ import annotations
 
 import io
 import json
+import math
 import pathlib
+import subprocess
+import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 ASSETS = pathlib.Path(__file__).parent / "assets"
 W, H = 1920, 1080
-BG, FG, DIM, ACC, LINE = (15, 18, 22), (230, 233, 239), (139, 149, 165), (88, 166, 255), (36, 42, 51)
-# the free area right of the HDMI inputs and above the app row
-BOX = (900, 0, W, 425)
-_CACHE: dict = {"at": 0.0, "key": None, "jpg": b""}
+BG, PANEL, LINE = (15, 18, 22), (23, 27, 33), (36, 42, 51)
+FG, DIM, ACC = (230, 233, 239), (139, 149, 165), (88, 166, 255)
+GREEN, LIME, AMBER, ORANGE, RED, BLUE = ((104, 211, 145), (163, 217, 119), (240, 192, 96),
+                                         (246, 147, 91), (224, 87, 91), (116, 185, 232))
+SEG = 10                      # seconds per HLS segment
+FPS = 5
+
+_IMG: dict = {"at": 0.0, "jpg": b"", "err": ""}
+_SEGS: dict[int, bytes] = {}
 _LOCK = threading.Lock()
+_SEG_LOCK = threading.Lock()
+
+IDS = [
+    "sensor.house_temperture_sum", "sensor.house_humidity_sum", "sensor.house_ah_average",
+    "sensor.house_dew_point", "sensor.airgradient_co2_index_sum", "sensor.nu_aqi_co2_sum",
+    "sensor.airgradient_voc_index_sum", "sensor.nu_aqi_voc_index_sum", "sensor.pm2_5_sum",
+    "sensor.house_nox_index", "sensor.house_temperature_trend", "sensor.house_humidity_trend",
+    "sensor.house_ah_trend", "input_number.set_temperature",
+    "sensor.fresh_air_aqi_temperature", "sensor.fresh_air_aqi_humidity",
+    "sensor.fresh_air_aqi_absolute_humidity", "sensor.fresh_air_aqi_voc", "sensor.fresh_air_aqi_nox",
+    "sensor.fresh_air_aqi_average_pm_aqi",
+    "sensor.outdoor_temperature", "sensor.outdoor_humidity", "sensor.outdoor_forecast_high",
+    "sensor.outdoor_forecast_low", "sensor.ecobee_forecast_high", "sensor.ecobee_forecast_low",
+    "sun.sun",
+]
 
 
-def _plex() -> tuple[str, str]:
-    from . import plexnotify
-    return plexnotify._plex()
+# ------------------------------------------------------------------ HA ---
+def ha_conf() -> tuple[str, str]:
+    from .config import SETTINGS
+    return (str(getattr(SETTINGS, "ha_url", "") or "").rstrip("/"),
+            str(getattr(SETTINGS, "ha_token", "") or ""))
 
 
-def _get_json(path: str) -> dict:
-    url, token = _plex()
-    req = urllib.request.Request(url + path, headers={"X-Plex-Token": token, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=8) as r:
-        return json.loads(r.read() or b"{}")
-
-
-def _get_img(path: str, w: int, h: int) -> Image.Image | None:
-    if not path:
-        return None
-    url, token = _plex()
-    from urllib.parse import quote
-    q = f"/photo/:/transcode?width={w}&height={h}&minSize=1&upscale=1&url={quote(path)}"
+def ha_test(url: str, token: str) -> tuple[bool, str]:
     try:
-        req = urllib.request.Request(url + q, headers={"X-Plex-Token": token})
+        req = urllib.request.Request(url.rstrip("/") + "/api/", headers={"Authorization": f"Bearer {token}"})
         with urllib.request.urlopen(req, timeout=8) as r:
-            return Image.open(io.BytesIO(r.read())).convert("RGB")
-    except Exception:                                            # noqa: BLE001
-        return None
+            return r.status == 200, "ok"
+    except urllib.error.HTTPError as e:
+        return False, "HA refused the token" if e.code in (401, 403) else f"HA answered {e.code}"
+    except Exception as e:                                       # noqa: BLE001
+        return False, f"can't reach HA ({type(e).__name__})"
 
 
-def _font(bold: bool, size: int):
+def _states() -> dict[str, str]:
+    url, token = ha_conf()
+    if not (url and token):
+        raise RuntimeError("no Home Assistant token set (nuarr /tv)")
+    tpl = ("{% set ns = namespace(d={}) %}{% for i in " + json.dumps(IDS) + " %}"
+           "{% set ns.d = dict(ns.d, **{i: states(i)}) %}{% endfor %}{{ ns.d | tojson }}")
+    req = urllib.request.Request(url + "/api/template", data=json.dumps({"template": tpl}).encode(),
+                                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=8) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _n(s: dict, k: str) -> float:
     try:
-        return ImageFont.truetype("segoeuib.ttf" if bold else "segoeui.ttf", size)
+        return float(s.get(k))
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _ok(v: float) -> bool:
+    return v == v
+
+
+def _hi(a: float, b: float) -> float:
+    return b if not _ok(a) else a if not _ok(b) else max(a, b)
+
+
+def pm_aqi(c: float) -> float:
+    """US EPA PM2.5 AQI, 2024 breakpoints (the card's pmAqiOf)."""
+    if not _ok(c):
+        return c
+    for lo, hi, alo, ahi in ((0, 9.0, 0, 50), (9.1, 35.4, 51, 100), (35.5, 55.4, 101, 150),
+                             (55.5, 125.4, 151, 200), (125.5, 225.4, 201, 300), (225.5, 325.4, 301, 500)):
+        if c <= hi:
+            return alo + (ahi - alo) * (max(c, lo) - lo) / (hi - lo)
+    return 500.0
+
+
+def _dew_f(t_f: float, rh: float) -> float:
+    if not (_ok(t_f) and _ok(rh)) or rh <= 0:
+        return float("nan")
+    t = (t_f - 32) / 1.8
+    g = math.log(rh / 100) + 17.62 * t / (243.12 + t)
+    return (243.12 * g / (17.62 - g)) * 1.8 + 32
+
+
+def _ah(t_f: float, rh: float) -> float:
+    if not (_ok(t_f) and _ok(rh)):
+        return float("nan")
+    t = (t_f - 32) / 1.8
+    return 6.112 * math.exp(17.67 * t / (t + 243.5)) * rh * 2.1674 / (273.15 + t)
+
+
+# five-tier scales, the card's (CO2 600/800/1000/1400 · VOC 150/250/350/450 · PM AQI 25/50/100/150)
+def _tier5(v: float, cuts) -> tuple[str, tuple]:
+    if not _ok(v):
+        return "", DIM
+    for cut, lab, col in zip(cuts, ("Excellent", "Good", "Moderate", "Poor"), (GREEN, LIME, AMBER, ORANGE)):
+        if v < cut:
+            return lab, col
+    return "Bad", RED
+
+
+def _dew_tier(dp: float) -> tuple[str, tuple]:
+    if not _ok(dp):
+        return "", DIM
+    for cut, lab, col in ((40, "Very Dry", AMBER), (50, "Dry", LIME), (55, "Pleasant", GREEN),
+                          (60, "Comfortable", GREEN), (65, "Sticky", AMBER)):
+        if dp < cut:
+            return lab, col
+    return "Muggy", RED
+
+
+def _rh_tier(rh: float) -> tuple[str, tuple]:
+    if not _ok(rh):
+        return "", DIM
+    if rh < 30:
+        return "Dry", AMBER
+    if rh < 40:
+        return "OK", LIME
+    if rh <= 60:
+        return "Ideal", GREEN
+    return "Humid", AMBER if rh <= 70 else RED
+
+
+def _ah_tier(ah: float) -> tuple[str, tuple]:
+    if not _ok(ah):
+        return "", DIM
+    if ah < 7:
+        return "Dry", AMBER
+    if ah <= 11:
+        return "OK", GREEN
+    return "Humid", AMBER if ah <= 13 else RED
+
+
+def _temp_tier(t: float, sp: float) -> tuple[str, tuple]:
+    if not (_ok(t) and _ok(sp)):
+        return "", DIM
+    if t < sp - 1.0:
+        return "Below band", BLUE
+    if t > sp + 1.0:
+        return "Above band", ORANGE
+    return "In band", GREEN
+
+
+def _arrow(trend) -> str:
+    t = str(trend or "").lower()
+    return "↑" if "rising" in t else "↓" if "falling" in t else "→" if "stable" in t else ""
+
+
+# -------------------------------------------------------------- drawing ---
+def _font(kind: str, size: int):
+    name = {"b": "segoeuib.ttf", "sb": "seguisb.ttf", "r": "segoeui.ttf", "sym": "seguisym.ttf"}[kind]
+    try:
+        return ImageFont.truetype(name, size)
     except OSError:
         return ImageFont.load_default()
 
 
-def _fit(d: ImageDraw.ImageDraw, text: str, font, width: int) -> str:
-    if d.textlength(text, font=font) <= width:
-        return text
-    while text and d.textlength(text + "…", font=font) > width:
-        text = text[:-1]
-    return text.rstrip() + "…"
+def _fmt(v: float, dp: int) -> str:
+    return "–" if not _ok(v) else f"{v:.{dp}f}"
 
 
-def _hms(ms: int) -> str:
-    s = int(ms or 0) // 1000
-    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
+def _render_house(s: dict) -> Image.Image:
+    img = Image.open(ASSETS / "tv_wallpaper.png").convert("RGB")
+    d = ImageDraw.Draw(img, "RGBA")
+    sp = _n(s, "input_number.set_temperature")
+    hT, hRH, hAH, hDP = (_n(s, "sensor.house_temperture_sum"), _n(s, "sensor.house_humidity_sum"),
+                         _n(s, "sensor.house_ah_average"), _n(s, "sensor.house_dew_point"))
+    iT, iRH, iAH = (_n(s, "sensor.fresh_air_aqi_temperature"), _n(s, "sensor.fresh_air_aqi_humidity"),
+                    _n(s, "sensor.fresh_air_aqi_absolute_humidity"))
+    co2 = _hi(_n(s, "sensor.airgradient_co2_index_sum"), _n(s, "sensor.nu_aqi_co2_sum"))
+    voc = _hi(_n(s, "sensor.airgradient_voc_index_sum"), _n(s, "sensor.nu_aqi_voc_index_sum"))
+    pm = pm_aqi(_n(s, "sensor.pm2_5_sum"))
+    nox = _n(s, "sensor.house_nox_index")
+    tiles = [
+        ("TEMPERATURE", "°F", _fmt(hT, 1), _temp_tier(hT, sp), _arrow(s.get("sensor.house_temperature_trend")),
+         f"intake {_fmt(iT, 1)}°" + (f" · set {_fmt(sp, 0)}°" if _ok(sp) else "")),
+        ("HUMIDITY", "%", _fmt(hRH, 0), _rh_tier(hRH), _arrow(s.get("sensor.house_humidity_trend")),
+         f"intake {_fmt(iRH, 0)} %"),
+        ("ABS HUMIDITY", "g/m³", _fmt(hAH, 1), _ah_tier(hAH), _arrow(s.get("sensor.house_ah_trend")),
+         f"intake {_fmt(iAH, 1)}"),
+        ("DEW POINT", "°F", _fmt(hDP, 1), _dew_tier(hDP), "", f"intake {_fmt(_dew_f(iT, iRH), 1)}°"),
+        ("CO₂", "ppm", _fmt(co2, 0), _tier5(co2, (600, 800, 1000, 1400)), "", ""),
+        ("VOC", "index", _fmt(voc, 0), _tier5(voc, (150, 250, 350, 450)), "",
+         f"intake {_fmt(_n(s, 'sensor.fresh_air_aqi_voc'), 0)}"),
+        ("PM AQI", "EPA", _fmt(pm, 0), _tier5(pm, (25, 50, 100, 150)), "",
+         f"intake {_fmt(_n(s, 'sensor.fresh_air_aqi_average_pm_aqi'), 0)}"),
+        ("NOx", "index", _fmt(nox, 0), _tier5(nox, (2, 20, 100, 200)), "",
+         f"intake {_fmt(_n(s, 'sensor.fresh_air_aqi_nox'), 0)}"),
+    ]
+    # ---- tiles in the free band between the header and the app rows
+    x0, y0, gap, th = 64, 150, 12, 255
+    tw = (W - 2 * x0 - gap * (len(tiles) - 1)) // len(tiles)
+    f_lab, f_unit, f_val, f_pill, f_sub, f_arr = (_font("b", 19), _font("r", 18), _font("b", 64),
+                                                  _font("b", 18), _font("r", 21), _font("sym", 40))
+    for i, (lab, unit, val, (tier, col), arr, sub) in enumerate(tiles):
+        x = x0 + i * (tw + gap)
+        d.rounded_rectangle((x, y0, x + tw, y0 + th), radius=14, fill=PANEL + (215,), outline=LINE + (255,), width=2)
+        d.rectangle((x + 14, y0 + th - 5, x + tw - 14, y0 + th - 3), fill=col + (170,))
+        d.text((x + 18, y0 + 16), lab, font=f_lab, fill=DIM)
+        d.text((x + 18, y0 + 40), unit, font=f_unit, fill=DIM + (170,))
+        d.text((x + 16, y0 + 78), val, font=f_val, fill=col if tier else FG)
+        if arr:
+            d.text((x + 24 + d.textlength(val, font=f_val), y0 + 96), arr, font=f_arr, fill=DIM)
+        if tier:
+            pw = d.textlength(tier, font=f_pill) + 22
+            d.rounded_rectangle((x + 16, y0 + 168, x + 16 + pw, y0 + 198), radius=15,
+                                fill=col + (40,), outline=col + (150,), width=1)
+            d.text((x + 27, y0 + 172), tier, font=f_pill, fill=col)
+        if sub:
+            sub_t = sub
+            while sub_t and d.textlength(sub_t, font=f_sub) > tw - 30:
+                sub_t = sub_t[:-1]
+            d.text((x + 18, y0 + 210), sub_t, font=f_sub, fill=DIM)
+    # ---- outdoor line in the header (the card's OUTDOOR pill)
+    oT, oRH = _n(s, "sensor.outdoor_temperature"), _n(s, "sensor.outdoor_humidity")
+    hi, lo = _n(s, "sensor.outdoor_forecast_high"), _n(s, "sensor.outdoor_forecast_low")
+    hi = hi if _ok(hi) else _n(s, "sensor.ecobee_forecast_high")
+    lo = lo if _ok(lo) else _n(s, "sensor.ecobee_forecast_low")
+    night = str(s.get("sun.sun")) == "below_horizon"
+    parts = [("☾  " if night else "☀  ", _font("sym", 26), (240, 220, 160) if night else AMBER),
+             ("OUTDOOR   ", _font("b", 24), FG), (f"{_fmt(oT, 1)}°F", _font("b", 30), BLUE),
+             ("   ·   AH  ", _font("b", 24), DIM), (f"{_fmt(_ah(oT, oRH), 1)} g/m³", _font("b", 26), BLUE)]
+    if _ok(hi) or _ok(lo):
+        parts.append((f"   ·   H {_fmt(hi, 0)}°  /  L {_fmt(lo, 0)}°", _font("b", 24), DIM))
+    width = sum(d.textlength(t, font=f) for t, f, _ in parts)
+    px, py = 420, 36
+    d.rounded_rectangle((px - 22, py - 8, px + width + 22, py + 46), radius=27,
+                        fill=(255, 255, 255, 14), outline=LINE + (255,), width=2)
+    x = px
+    for t, f, c in parts:
+        bb = d.textbbox((0, 0), t, font=f)
+        d.text((x, py + 19 - (bb[1] + bb[3]) / 2), t, font=f, fill=c)
+        x += d.textlength(t, font=f)
+    # "updated" under the tiles, so a stale picture is obvious
+    up, f_up = time.strftime("updated %H:%M").replace(" 0", " "), _font("r", 18)
+    d.text((W - 64 - d.textlength(up, font=f_up), y0 + th + 6), up, font=f_up, fill=DIM + (150,))
+    return img
 
 
-def _pick() -> dict | None:
-    """What to show: a playing Plex session first, else a recent addition."""
-    try:
-        sess = (_get_json("/status/sessions").get("MediaContainer") or {}).get("Metadata") or []
-    except Exception:                                            # noqa: BLE001
-        return None
-    sess = [s for s in sess if s.get("type") in ("movie", "episode")]
-    if sess:
-        sess.sort(key=lambda s: ((s.get("Player") or {}).get("state") != "playing", -int(s.get("viewOffset") or 0)))
-        s = sess[0]
-        p = s.get("Player") or {}
-        who = " · ".join(x for x in ((s.get("User") or {}).get("title"), p.get("title")) if x)
-        return {"label": ("NOW PLAYING" if p.get("state") == "playing" else "PAUSED") + (f"  ·  {who}" if who else ""),
-                "item": s, "progress": (int(s.get("viewOffset") or 0), int(s.get("duration") or 0))}
-    try:
-        rec = (_get_json("/library/recentlyAdded?X-Plex-Container-Start=0&X-Plex-Container-Size=12")
-               .get("MediaContainer") or {}).get("Metadata") or []
-    except Exception:                                            # noqa: BLE001
-        return None
-    rec = [r for r in rec if r.get("art") or r.get("grandparentArt") or r.get("parentArt")]
-    if not rec:
-        return None
-    r = rec[int(time.time() // 600) % len(rec)]
-    return {"label": "NEW IN PLEX", "item": r, "progress": None}
-
-
-def _text(it: dict) -> tuple[str, str]:
-    t = it.get("type")
-    if t == "episode":
-        se = f"S{int(it.get('parentIndex') or 0):02d}E{int(it.get('index') or 0):02d}"
-        return it.get("grandparentTitle") or it.get("title") or "", f"{se} · {it.get('title') or ''}"
-    if t == "season":
-        return it.get("parentTitle") or it.get("title") or "", it.get("title") or ""
-    sub = " · ".join(str(x) for x in (it.get("year"), it.get("contentRating")) if x)
-    return it.get("title") or "", sub
+def _render_plain(msg: str) -> Image.Image:
+    img = Image.open(ASSETS / "tv_wallpaper.png").convert("RGB")
+    if msg:
+        ImageDraw.Draw(img, "RGBA").text((420, 50), msg, font=_font("r", 24), fill=DIM)
+    return img
 
 
 def render() -> bytes:
-    with _LOCK:      # at most one Plex look every 20 s, however often the TV asks
-        if _CACHE["jpg"] and time.time() - _CACHE["at"] < 20:
-            return _CACHE["jpg"]
-    base = Image.open(ASSETS / "tv_wallpaper.png").convert("RGB")
-    pick = _pick()
-    key = None
-    if pick:
-        it = pick["item"]
-        key = (pick["label"], it.get("ratingKey"), (pick["progress"] or (0, 0))[0] // 30000)
+    """The current picture as JPEG; HA is asked at most every 20 s."""
     with _LOCK:
-        if _CACHE["jpg"] and _CACHE["key"] == key and time.time() - _CACHE["at"] < 600:
-            _CACHE["at"] = time.time()
-            return _CACHE["jpg"]
-    if pick:
-        it = pick["item"]
-        bw, bh = BOX[2] - BOX[0], BOX[3] - BOX[1]
-        art = _get_img(it.get("grandparentArt") or it.get("parentArt") or it.get("art") or "", bw, bh)
-        if art:
-            # cover-crop, dim, and fade into the background on the left and bottom
-            sc = max(bw / art.width, bh / art.height)
-            art = art.resize((int(art.width * sc) + 1, int(art.height * sc) + 1))
-            art = art.crop(((art.width - bw) // 2, (art.height - bh) // 3,
-                            (art.width - bw) // 2 + bw, (art.height - bh) // 3 + bh))
-            art = Image.blend(Image.new("RGB", art.size, BG), art, 0.42)
-            mask = Image.new("L", (bw, bh), 0)
-            md = ImageDraw.Draw(mask)
-            for x in range(bw):
-                a = min(1.0, x / 420)
-                md.line((x, 0, x, bh), fill=int(255 * a))
-            fade = Image.new("L", (bw, bh), 255)
-            fd = ImageDraw.Draw(fade)
-            fd.rectangle((0, 0, bw, 121), fill=0)          # keep the header bar as it is
-            for y in range(bh - 140, bh):
-                fd.line((0, y, bw, y), fill=int(255 * (bh - y) / 140))
-            from PIL import ImageChops
-            mask = ImageChops.multiply(mask, fade)
-            base.paste(art, BOX[:2], mask)
-        d = ImageDraw.Draw(base, "RGBA")
-        # poster on the right
-        px, py, pw, ph = 1640, 150, 180, 270
-        poster = _get_img(it.get("grandparentThumb") or it.get("parentThumb") or it.get("thumb") or "", pw, ph)
-        if poster:
-            poster = poster.resize((pw, ph))
-            m = Image.new("L", (pw, ph), 0)
-            ImageDraw.Draw(m).rounded_rectangle((0, 0, pw - 1, ph - 1), radius=12, fill=255)
-            shadow = Image.new("RGBA", (pw + 40, ph + 40), (0, 0, 0, 0))
-            ImageDraw.Draw(shadow).rounded_rectangle((20, 24, pw + 20, ph + 24), radius=14, fill=(0, 0, 0, 150))
-            shadow = shadow.filter(ImageFilter.GaussianBlur(10))
-            base.paste(shadow, (px - 20, py - 20), shadow)
-            base.paste(poster, (px, py), m)
-            d.rounded_rectangle((px, py, px + pw - 1, py + ph - 1), radius=12, outline=LINE + (255,), width=2)
-        tx, tw = 1010 if poster else 1100, (px - 40 - 1010) if poster else 720
-        title, sub = _text(it)
-        f_lab, f_t, f_s, f_m = _font(True, 21), _font(True, 50), _font(False, 28), _font(False, 22)
-        d.text((tx, 170), _fit(d, pick["label"], f_lab, tw), font=f_lab, fill=ACC)
-        d.text((tx, 200), _fit(d, title, f_t, tw), font=f_t, fill=FG)
-        if sub:
-            d.text((tx, 268), _fit(d, sub, f_s, tw), font=f_s, fill=DIM)
-        if pick["progress"] and pick["progress"][1]:
-            off, dur = pick["progress"]
-            y = 350
-            d.rounded_rectangle((tx, y, tx + tw, y + 6), radius=3, fill=(255, 255, 255, 40))
-            d.rounded_rectangle((tx, y, tx + max(6, int(tw * min(1, off / dur))), y + 6), radius=3, fill=ACC + (255,))
-            d.text((tx, y + 16), _hms(off), font=f_m, fill=DIM)
-            left = f"-{_hms(dur - off)}"
-            d.text((tx + tw - d.textlength(left, font=f_m), y + 16), left, font=f_m, fill=DIM)
-        else:
-            summ = (it.get("summary") or it.get("parentSummary") or "").replace("\n", " ")
-            if summ:
-                # two lines of the summary
-                words, lines, cur = summ.split(), [], ""
-                for wd in words:
-                    if d.textlength((cur + " " + wd).strip(), font=f_m) > tw:
-                        lines.append(cur)
-                        cur = wd
-                        if len(lines) == 2:
-                            break
-                    else:
-                        cur = (cur + " " + wd).strip()
-                if len(lines) < 2 and cur:
-                    lines.append(cur)
-                if len(lines) == 2 and len(" ".join(lines)) < len(summ):
-                    lines[1] = _fit(d, lines[1] + " …", f_m, tw)
-                for i, ln in enumerate(lines[:2]):
-                    d.text((tx, 322 + i * 30), ln, font=f_m, fill=DIM)
+        if _IMG["jpg"] and time.time() - _IMG["at"] < 20:
+            return _IMG["jpg"]
+    try:
+        img, err = _render_house(_states()), ""
+    except Exception as e:                                       # noqa: BLE001
+        err = str(e) if isinstance(e, RuntimeError) else f"Home Assistant unavailable ({type(e).__name__})"
+        img = _render_plain(err)
     out = io.BytesIO()
-    base.save(out, "JPEG", quality=88)
-    jpg = out.getvalue()
+    img.save(out, "JPEG", quality=90)
     with _LOCK:
-        _CACHE.update(at=time.time(), key=key, jpg=jpg)
-    return jpg
+        _IMG.update(at=time.time(), jpg=out.getvalue(), err=err)
+        return _IMG["jpg"]
+
+
+# ----------------------------------------------------------------- HLS ---
+def playlist() -> str:
+    n = int(time.time() // SEG)
+    lines = ["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{SEG}", f"#EXT-X-MEDIA-SEQUENCE:{n - 2}"]
+    for k in range(n - 2, n + 1):
+        lines += [f"#EXTINF:{SEG}.000,", f"seg/{k}.ts"]
+    return "\n".join(lines) + "\n"
+
+
+def segment(n: int) -> bytes:
+    """Segment n = the current picture, SEG seconds at FPS, with timestamps
+    continuous across segments (wrapping with MPEG-TS's 33-bit clock)."""
+    with _SEG_LOCK:
+        if n in _SEGS:
+            return _SEGS[n]
+        from .config import NO_WINDOW
+        from .jobs import _ffmpeg_exe
+        jpg = render()
+        start = ((n * SEG * 90000) % (1 << 33)) / 90000.0
+        with tempfile.TemporaryDirectory() as td:
+            src = pathlib.Path(td) / "f.jpg"
+            src.write_bytes(jpg)
+            cmd = [_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-loop", "1", "-framerate", str(FPS),
+                   "-i", str(src), "-t", str(SEG), "-c:v", "libx264", "-preset", "veryfast", "-tune", "stillimage",
+                   "-crf", "20", "-pix_fmt", "yuv420p", "-g", str(SEG * FPS), "-keyint_min", str(SEG * FPS),
+                   "-sc_threshold", "0", "-an", "-output_ts_offset", f"{start:.3f}", "-muxdelay", "0",
+                   "-f", "mpegts", "-"]
+            r = subprocess.run(cmd, capture_output=True, timeout=60, creationflags=NO_WINDOW)
+        if r.returncode != 0 or not r.stdout:
+            raise RuntimeError("encode failed: " + r.stderr.decode("utf-8", "replace")[-300:])
+        _SEGS[n] = r.stdout
+        for k in sorted(_SEGS)[:-6]:
+            _SEGS.pop(k, None)
+        return r.stdout

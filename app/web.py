@@ -3377,11 +3377,95 @@ async def api_pushover_config(body: dict = Body(...)):
 
 @app.get("/tv/wallpaper.jpg")
 async def tv_wallpaper():
-    """The loft TV's Projectivy wallpaper (tvwall.py): the nuarr background with
-    what Plex is playing, or a recent addition when nothing is."""
+    """The loft TV's wallpaper picture (tvwall.py): house air from HA."""
     from . import tvwall
     jpg = await asyncio.to_thread(tvwall.render)
     return Response(jpg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/tv/live.m3u8")
+def tv_live():
+    """The same picture as a live HLS stream - what Projectivy plays, since it
+    never re-downloads a picture URL."""
+    from . import tvwall
+    return Response(tvwall.playlist(), media_type="application/vnd.apple.mpegurl",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.get("/tv/seg/{n}.ts")
+async def tv_seg(n: int):
+    from . import tvwall
+    try:
+        ts = await asyncio.to_thread(tvwall.segment, n)
+    except Exception as e:                                       # noqa: BLE001
+        raise HTTPException(503, str(e)[:200])
+    return Response(ts, media_type="video/mp2t", headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/tv/ha")
+async def api_tv_ha(body: dict = Body(...)):
+    """Save Home Assistant's URL + a long-lived token for the TV wallpaper,
+    tested first. The token is stored in config.yml and never sent back."""
+    import yaml
+    from . import tvwall
+    url = str(body.get("url") or SETTINGS.ha_url or "").strip().rstrip("/")
+    token = str(body.get("token") or "").strip() or str(SETTINGS.ha_token or "")
+    if not (url and token):
+        return {"ok": False, "error": "paste a token"}
+    ok, detail = await asyncio.to_thread(tvwall.ha_test, url, token)
+    if not ok:
+        return {"ok": False, "error": detail}
+    p = _config_path()
+    raw = {}
+    if p.exists():
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8-sig")) or {}
+        except Exception:                                        # noqa: BLE001
+            raw = {}
+    raw["ha_url"], raw["ha_token"] = url, token
+    p.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    SETTINGS.ha_url, SETTINGS.ha_token = url, token
+    tvwall._IMG["at"] = 0.0
+    joblog.log("Loft TV wallpaper: Home Assistant token saved and tested", "ok")
+    return {"ok": True}
+
+
+@app.get("/tv", response_class=HTMLResponse)
+def tv_page():
+    """Loft TV wallpaper: preview + the Home Assistant token."""
+    from . import tvwall
+    have = bool(SETTINGS.ha_token)
+    import html as _html
+    url = _html.escape(SETTINGS.ha_url or "", quote=True)
+    return HTMLResponse(f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Loft TV wallpaper</title>
+<style>body{{background:#0f1216;color:#e6e9ef;font:14px 'Segoe UI',system-ui,sans-serif;margin:0;padding:22px}}
+.box{{background:#171b21;border:1px solid #242a33;border-radius:12px;padding:16px 18px;max-width:1100px;margin:0 auto 16px}}
+h1{{font-size:18px;margin:0 0 4px}} .dim{{color:#8b95a5}} input{{background:#0f1216;color:#e6e9ef;border:1px solid #242a33;
+border-radius:8px;padding:7px 9px;font:12px Consolas,monospace}} button{{background:#58a6ff;color:#0f1216;border:0;border-radius:8px;
+padding:8px 14px;font-weight:600;cursor:pointer}} img{{width:100%;border-radius:10px;border:1px solid #242a33;display:block}}
+code{{color:#58a6ff}}</style></head><body>
+<div class="box"><h1>Loft TV wallpaper</h1>
+<div class="dim">The loft TV's Projectivy home screen plays <code>http://192.168.0.176:8770/tv/live.m3u8</code>:
+this picture as a slow live stream, re-drawn from Home Assistant every 20 s while the home screen is showing.</div></div>
+<div class="box"><img id="pv" src="/tv/wallpaper.jpg?{int(time.time())}" alt=""></div>
+<div class="box"><b>Home Assistant access</b>
+<div class="dim" style="margin:4px 0 10px">A long-lived token from HA &rarr; your Profile &rarr; Security &rarr; Long-lived access tokens.
+Stored in config.yml, used only to read the sensor values on this picture, never shown again here.</div>
+<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+<input id="u" value="{url}" style="width:220px" spellcheck="false">
+<input id="t" type="password" spellcheck="false" style="flex:1;min-width:260px"
+ placeholder="{'token saved - paste a new one to replace' if have else 'long-lived access token'}">
+<button onclick="save(this)">Test and save</button> <span id="m" class="dim">{'connected' if have else 'not set'}</span></div></div>
+<script>
+async function save(b){{const m=document.getElementById('m');b.disabled=true;m.textContent='testing…';
+try{{const r=await (await fetch('/api/tv/ha',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+body:JSON.stringify({{url:document.getElementById('u').value,token:document.getElementById('t').value}})}})).json();
+m.textContent=r.ok?'saved · connected':(r.error||'failed');m.style.color=r.ok?'#7fd4a3':'#e0575b';
+if(r.ok){{document.getElementById('t').value='';setTimeout(()=>{{document.getElementById('pv').src='/tv/wallpaper.jpg?'+Date.now()}},600);}}}}
+catch(e){{m.textContent='failed: '+e}} b.disabled=false;}}
+setInterval(()=>{{document.getElementById('pv').src='/tv/wallpaper.jpg?'+Date.now()}},30000);
+</script></body></html>""")
 
 
 @app.get("/arr-icon/{name}")
