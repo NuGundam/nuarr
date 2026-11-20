@@ -1725,7 +1725,20 @@ def decide(probe: dict, *, anime: bool = False, filename: str = "",
     dv = _dv_profile(v, filename)
     dv_profiles = [int(x) for x in _v("strip_dv_profiles",
                                       CONFIG["stripDVProfiles"])]
-    if _v("strip_dv", CONFIG["stripDV"]) and dv in dv_profiles:
+    # A HEADER WITH NO PARAMETER SETS CANNOT TAKE THE STRIP (Erik, 2026-11-19).
+    # Some WEB-DLs (Reasonable Doubt HULU/HONE, 32 files) carry a 23-byte
+    # hvcC - no VPS/SPS/PPS, all in-band. Every CBS bitstream filter
+    # (filter_units, hevc_metadata) rebuilds that header empty and the
+    # Matroska muxer refuses it: "Could not write header (incorrect codec
+    # parameters ?)". Tested on ffmpeg 9.0.2 and 7.1.4, every filter chain.
+    # Such a file failed every retry for ever; leave its DV alone instead -
+    # it plays exactly as it does today.
+    _xd = v.get("extradata_size") if isinstance(v, dict) else None
+    dv_header_ok = not (isinstance(_xd, int) and _xd < 40)
+    if _v("strip_dv", CONFIG["stripDV"]) and dv in dv_profiles and not dv_header_ok:
+        p.notes.append("Dolby Vision kept - the file's header has no parameter "
+                       "sets, so ffmpeg cannot rewrite it without the DV layer")
+    elif _v("strip_dv", CONFIG["stripDV"]) and dv in dv_profiles:
         p.strip_dv = True
         p.add("video", f"remove the Dolby Vision layer (keeps HDR10)",
               "TVs without Dolby Vision have to convert this file to play it; "
