@@ -168,6 +168,25 @@ def _landed(a, row: dict) -> tuple[str, dict | None]:
         if ext in SUB_EXT:
             continue
         junk.append(p)
+    if not real and not junk:
+        # AN EMPTY DOWNLOAD IS NOT A FAKE. Nothing in the folder means the file
+        # LEFT it - nuarr's import script had already moved it onto the pool
+        # when the arr's own copy step looked for it (a destination past 260
+        # characters it could not see, 2026-11-21). Read as "held only nothing",
+        # five good releases of Magic Repo Man S01E08 were removed and
+        # blocklisted in an hour while the episode sat on disk. The arr is asked
+        # to look at the series' folder instead; once it finds the file, the
+        # "already imported" rule clears the row on the next pass.
+        try:
+            if a.kind == "sonarr" and row.get("seriesId"):
+                _call(a, "/api/v3/command", "POST", {"name": "RescanSeries", "seriesId": row["seriesId"]})
+            elif row.get("movieId"):
+                _call(a, "/api/v3/command", "POST", {"name": "RescanMovie", "movieId": row["movieId"]})
+        except Exception as e:                                   # noqa: BLE001
+            STATS["detail"].append(f"{a.name}: could not ask for a rescan: {type(e).__name__}: {e}"[:160])
+        STATS["detail"].append(f"{a.name}: {(row.get('title') or '')[:60]} - download folder empty, "
+                               "the arr was asked to rescan the library for it")
+        return "", None
     if not real:
         names = ", ".join(os.path.basename(p)[-50:] for p in junk[:2]) or "nothing"
         return (f"not a video: the download held only {names} - removed and blocklisted, "
