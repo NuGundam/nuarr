@@ -754,6 +754,147 @@ def pw_stage(src: str, dur: float, tracks: list, sps: list, allc: dict, sampled:
         t.pop("offset", None)
 
 
+# ---------------------------------------------------------- the words ----
+# CHECKED AGAINST WHAT IS ACTUALLY SAID (2026-11-20). Everything above lines
+# the subtitle's on/off pattern up against where there is speech - which is
+# cheap, works in any language, and can be wrong: on 9-1-1 S10E06 it put both
+# English tracks 2-3 s early with a correlation of 0.4-0.5 and margins of a few
+# thousandths, and called them "messy". Transcribed, 158 lines sat within 0.1 s
+# of their words. A SDH track's [siren wails] lines and a loud score are enough
+# to pull the pattern match off.
+#
+# So before a track is called out of step - and before anything is moved - a
+# few windows are transcribed with word times and each subtitle line is found
+# in the transcript. That is a measurement of the thing itself:
+#   in step by the words      -> "ok", whatever the pattern said
+#   one steady offset          -> "offset" by that amount (a messy track gets
+#                                 fixed; an offset track gets the truer number)
+#   anything else              -> the pattern's verdict stands
+# Only where the subtitle is in the language being spoken (a dub's subtitles
+# cannot be matched to Japanese voices), and only for languages the matching
+# below can read. CPU, a few windows: about a minute, on tracks about to be
+# called wrong - a small price next to rewriting a file that was right.
+WORD_LANGS = {"eng": "en", "en": "en", "spa": "es", "fre": "fr", "fra": "fr", "ger": "de", "deu": "de",
+              "ita": "it", "por": "pt", "dut": "nl", "nld": "nl"}
+WORD_WINDOWS = 4
+WORD_LEN = 75.0
+WORD_REACH = 6.0              # a line is looked for this far either side of its own time
+WORD_LEAD = 0.2               # a corrected line starts this long before its words (early is fine, late is not)
+WORD_MIN = 15                 # matched lines needed before the words overrule anything
+WORD_MODEL_DIR = os.environ.get("NUARR_WHISPER_DIR") or r"C:\ProgramData\nuarr\whisper"
+_WM = {"m": None}
+
+
+def _norm_word(w: str) -> str:
+    return re.sub(r"[^0-9a-z\u00c0-\u024f']", "", w.lower())
+
+
+def _word_cues(src: str, ord_: int) -> list:
+    """[(start seconds, [words])] - spoken lines only, sound descriptions out."""
+    ff = _ff()[0]
+    raw = subprocess.run([ff, "-v", "error", "-i", src, "-map", f"0:s:{ord_}", "-f", "srt", "-"],
+                         capture_output=True, timeout=300, creationflags=NO_WINDOW).stdout.decode("utf-8", "replace")
+    out = []
+    for blk in re.split(r"\r?\n\r?\n", raw):
+        m = re.search(r"(\d+):(\d+):(\d+)[,.](\d+) --> \d+:\d+:\d+[,.]\d+\s*\r?\n(.*)", blk, re.S)
+        if not m:
+            continue
+        t0 = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) + int(m.group(4)) / 1000
+        text = re.sub(r"<[^>]+>|\{[^}]*\}|\[[^\]]*\]|\([^)]*\)|^[A-Z][A-Z .']+:|[\u266a\u266b#]", " ", m.group(5), flags=re.M)
+        words = [w for w in (_norm_word(x) for x in text.split()) if w]
+        if len(words) >= 4:
+            out.append((t0, words))
+    return out
+
+
+def _word_times(src: str, a_ord: int, lang: str, t0: float) -> list:
+    """[(word, absolute seconds)] for one window of one audio track."""
+    if _WM["m"] is None:
+        from faster_whisper import WhisperModel
+        _WM["m"] = WhisperModel("small", device="cpu", compute_type="int8", cpu_threads=4,
+                                download_root=WORD_MODEL_DIR, local_files_only=True)
+    ff = _ff()[0]
+    raw = subprocess.run([ff, "-v", "error", "-ss", f"{t0:.2f}", "-t", f"{WORD_LEN:.0f}", "-i", src, "-map",
+                          f"0:a:{a_ord}", "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
+                         capture_output=True, timeout=300, creationflags=NO_WINDOW).stdout
+    wav = np.frombuffer(raw, np.int16).astype(np.float32) / 32768.0
+    if len(wav) < 16000 * 10:
+        return []
+    segs, _ = _WM["m"].transcribe(wav, word_timestamps=True, vad_filter=True, language=lang)
+    return [(w_, t0 + x.start) for sg in segs for x in (sg.words or []) for w_ in [_norm_word(x.word)] if w_]
+
+
+def words_stage(src: str, dur: float, tracks: list) -> None:
+    """Confirm every track about to be called out of step against the spoken words."""
+    import difflib
+    todo = [t for t in tracks if t.get("verdict") in ("offset", "drift", "piecewise", "messy")
+            and "audio_ord" in t and WORD_LANGS.get((t.get("lang") or "").lower())
+            and WORD_LANGS.get((t.get("lang") or "").lower()) == WORD_LANGS.get((t.get("audio_lang") or "").lower())]
+    if not todo or not os.path.isdir(WORD_MODEL_DIR):
+        return
+    starts = [dur * f for f in (0.12, 0.37, 0.62, 0.87)][:WORD_WINDOWS]
+    heard: dict = {}
+    for n, t in enumerate(todo):
+        key = t["audio_ord"]
+        if key not in heard:
+            print(f"PROG {n}/{len(todo)} checking the lines against the spoken words", file=sys.stderr, flush=True)
+            heard[key] = [(st, _word_times(src, key, WORD_LANGS[(t.get("audio_lang") or "").lower()], st))
+                          for st in starts]
+        cues = _word_cues(src, t["ord"])
+        per, allo = [], []
+        for st, words in heard[key]:
+            tw = [w for w, _ in words]
+            offs = []
+            for c0, cw in cues:
+                if not (st - 6 <= c0 <= st + WORD_LEN + 6) or not tw:
+                    continue
+                k = len(cw)
+                best = (0.0, -1)
+                for i in range(0, max(1, len(tw) - k + 1)):
+                    # the same words within a few seconds of the line - a phrase
+                    # said again a minute later is not this line
+                    if tw[i] != cw[0] or abs(c0 - words[i][1]) > WORD_REACH:
+                        continue
+                    r = difflib.SequenceMatcher(None, cw, tw[i:i + k]).ratio()
+                    if r > best[0]:
+                        best = (r, i)
+                if best[0] >= 0.8:
+                    offs.append(c0 - words[best[1]][1])          # - = the line shows before the words
+            if len(offs) >= 3:
+                per.append(float(np.median(offs)))
+            allo += offs
+        if len(allo) < WORD_MIN or len(per) < 2:
+            t["words"] = {"n": len(allo), "note": "too few lines found in the speech to check"}
+            continue
+        med = float(np.median(allo))
+        # how many lines agree with the middle one. Not all will: Whisper's word
+        # starts wander by a few tenths and a two-speaker line is anchored on
+        # its first speaker - measured on a file known to be right, two lines
+        # in three sat within 0.8 s and the rest scattered both ways.
+        near = sum(1 for o in allo if abs(o - med) <= 0.8) / len(allo)
+        spread = max(abs(x - med) for x in per)
+        steady = spread <= 0.35
+        t["words"] = {"n": len(allo), "median": round(med, 2), "windows": [round(x, 2) for x in per],
+                      "near": round(near, 2), "was": t.get("verdict")}
+        t["words"]["spread"] = round(spread, 2)
+        # IN STEP MEANS WHAT IT MEANS EVERYWHERE ELSE HERE: a line may lead its
+        # words a little (subtitles are cut that way, and Erik's rule is early
+        # is fine, late is not) - up to 0.6 s early, 0.3 s late, in every part.
+        if near >= 0.6 and -0.6 <= med <= 0.3 and all(-0.9 <= x <= 0.45 for x in per):
+            was = t["verdict"]
+            for k_ in ("pieces", "drops"):
+                t.pop(k_, None)
+            t.update(verdict="ok", why=(f"in step by the spoken words - {len(allo)} lines start within "
+                                        f"{abs(med):.2f}s of what is said (the speech-pattern match had said {was})"))
+        elif near >= 0.6 and steady and abs(med) >= 0.6 and t["verdict"] in ("messy", "offset"):
+            for k_ in ("pieces", "drops"):
+                t.pop(k_, None)
+            # moved to land WORD_LEAD before the words, never after them
+            t.update(verdict="offset", rate=1.0, rate_name="", offset=round(-med - WORD_LEAD, 2),
+                     why=(f"every line {'early' if med < 0 else 'late'} by {abs(med):.2f}s, measured against "
+                          f"the spoken words ({len(allo)} lines, the same in every part checked)"))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True)
@@ -858,6 +999,13 @@ def main() -> int:
         again = [t for t in todo if t.get("verdict") == "messy" and "audio_ord" in t]
         if again:
             pw_stage(a.src, dur, again, sps, allc, sampled)
+    # AND THE WORDS HAVE THE LAST SAY on anything about to be called wrong.
+    if not a.check_only:
+        try:
+            words_stage(a.src, dur, todo)
+        except Exception as e:                                   # noqa: BLE001
+            for t in todo:
+                t.setdefault("words", {"note": f"word check failed: {type(e).__name__}: {e}"[:160]})
     print(json.dumps({"ok": True, "duration": dur, "speech_min": round(float(sp.sum()) * STEP / 60, 1),
                       "audio": [lg for _, lg in a_list], "sampled": sampled,
                       "heard_min": round(sum(b - a for a, b in WINDOWS) / 60, 1), "tracks": tracks}))

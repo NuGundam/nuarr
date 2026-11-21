@@ -6958,6 +6958,38 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
     except Exception:                                        # noqa: BLE001
         w.stage_device = ""
 
+    # AND AGAIN AT THE DOOR (2026-11-20). The stamp test above runs before the
+    # final VMAF check and the wait for DrivePool - a minute or more - and an
+    # arr upgrade can land in exactly that gap: Sonarr deleted 9-1-1 S10E06's
+    # Kitsune copy at 06:30 for an NTb upgrade, and at 06:31 this commit wrote
+    # the encode back to the deleted path. The arr no longer tracked it, Plex
+    # listed two versions, and the stray was the one that got played. Same
+    # test, same outcome: the output was made from bytes that are gone.
+    try:
+        _door_stamp = (os.path.getsize(job.path), os.path.getmtime(job.path))
+    except OSError:
+        _door_stamp = None
+    if _door_stamp != _src_stamp and (_door_stamp is None or _src_stamp[1]):
+        joblog.log("the source was replaced or removed between the last check and the commit "
+                   "(an arr upgrade landed) - discarding the output rather than writing a file "
+                   "the arr no longer tracks", "warn", job.id)
+        await asyncio.to_thread(_rm, out)
+        try:
+            from . import subocr as _so_door
+            _so_door.clear_pending(job.file_id, SETTINGS.cache_dir)
+        except Exception:                                        # noqa: BLE001
+            pass
+        if _door_stamp is not None:
+            try:
+                with cursor() as cur:
+                    cur.execute("UPDATE files SET state='eligible', state_reason=NULL WHERE id=?",
+                                (job.file_id,))
+            except Exception:                                    # noqa: BLE001
+                pass
+        _finish(job, "skipped", size_before, 0,
+                "source replaced during the encode - output discarded, the "
+                "new file will be planned fresh")
+        return
     res = await asyncio.to_thread(fileops.safe_replace, job.path, out,
                                   on_stage=_on_stage, pace=_pace)
     w.commit_phase = ""
