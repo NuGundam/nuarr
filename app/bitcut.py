@@ -1046,7 +1046,11 @@ def _due_kind(x: dict, rec: str, now: float | None = None) -> str:
     now = now or time.time()
     st = x.get("state")
     if rec == "keep":
-        return ""
+        # THE ADVICE IS THE ANSWER. Auto used to skip a "keep" row and leave
+        # it open - so the one case with nothing to do (the upgrade brought
+        # English audio; The Apothecary Diaries S03E06, 2026-11-20) was the
+        # one that sat in Needs Attention and held its file for a click.
+        return "keep" if st == "open" else ""
     if st == "open":
         return "" if x.get("auto_tried") else "fetch"
     if st == "none":
@@ -1092,7 +1096,11 @@ def auto_sweep() -> dict:
                     r["auto_tried"] = time.time()
             _save(rows)
             try:
-                if do == "restore":
+                if do == "keep":
+                    why = (explain(x).get("rec_why") or "the advice was keep").split(" - ")[0]
+                    set_state(fid, "kept", f"kept by auto: {why}"[:300])
+                    res = {"ok": True, "release": f"kept as it is - {why}"}
+                elif do == "restore":
                     res = restore(fid)
                     if not res.get("ok"):
                         set_state(fid, "kept", f"closed by auto: nothing fuller in {RETRY_D} days and the old "
@@ -1106,9 +1114,11 @@ def auto_sweep() -> dict:
                             res = {"ok": True, "release": f"the old file, back from the recycle bin ({rb.get('file')})"}
             except Exception as e:                               # noqa: BLE001
                 res = {"ok": False, "why": f"{type(e).__name__}: {e}"[:160]}
-            word = {"fetch": "", "retry": "retry: ", "restore": "old release again: "}[do]
+            word = {"fetch": "", "retry": "retry: ", "restore": "old release again: ", "keep": ""}[do]
             _auto_note({"at": time.time(), "label": x.get("label"), "ok": bool(res.get("ok")),
                         "what": word + str(res.get("release") or res.get("why") or "")})
+            if do == "keep":
+                continue
             fetched += int(bool(res.get("ok")))
             none += int(not res.get("ok"))
         if fetched or none:

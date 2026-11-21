@@ -1545,10 +1545,38 @@ def _file_nuarr(path: str):
         from .storage import _deprefix
         f = _rows("SELECT id, state, state_reason, processed_at, video_codec, height "
                   "FROM files WHERE path=? COLLATE NOCASE LIMIT 1", (_deprefix(path),))
+        replaced = ""
         if not f:
-            return {"known": False}
+            # THE FILE CAN BE REPLACED UNDER A VIEWER. 9-1-1: Nashville S02E06
+            # (2026-11-20) sat paused at 99% on the ETHEL copy while Sonarr
+            # upgraded it to NTb: Plex still reports the old path, which is in
+            # no table any more, and the card said "not in nuarr's library"
+            # about an episode that is. When the played file is gone from the
+            # disk, the same episode (or the film's folder) is looked up
+            # instead and the card says the file was replaced.
+            import os as _os
+            import re as _re
+            dp = _deprefix(path)
+            try:
+                gone = not _os.path.exists(path)
+            except OSError:
+                gone = False
+            if not gone:
+                return {"known": False}
+            folder, base = _os.path.split(dp)
+            m = _re.search(r"S\d+E\d+", base, _re.I)
+            sib = _rows("SELECT id, path, state, state_reason, processed_at, video_codec, height "
+                        "FROM files WHERE lower(substr(path, 1, ?)) = lower(?)",
+                        (len(folder) + 1, folder + _os.sep))
+            sib = [dict(r) for r in sib
+                   if _os.sep not in r["path"][len(folder) + 1:]
+                   and (m.group(0).lower() in _os.path.basename(r["path"]).lower() if m else True)]
+            if len(sib) != 1:
+                return {"known": False, "gone": True}
+            f = [sib[0]]
+            replaced = _os.path.basename(sib[0]["path"])
         f = dict(f[0])
-        out = {"known": True, "state": f.get("state") or "",
+        out = {"known": True, "replaced": replaced, "state": f.get("state") or "",
                "reason": f.get("state_reason") or "",
                "processed_at": f.get("processed_at") or 0,
                "codec": f.get("video_codec") or "", "height": f.get("height") or 0}
@@ -13237,11 +13265,19 @@ def _attention(limit: int = 400, fresh: bool = False):
             got = {int(r["id"]): r for r in rows(
                 "SELECT id, path, title, season, episode FROM files WHERE id IN ("
                 + ",".join(str(int(i)) for i in ids) + ")")}
+            # a held file whose row is gone (an upgrade replaced it - the bitrate
+            # cut's own case) read "(untitled)"; the cut's row still names it
+            try:
+                from . import bitcut as _bc
+                _cut = {int(x["file_id"]): x.get("label") or "" for x in _bc._load()}
+            except Exception:                                # noqa: BLE001
+                _cut = {}
             for fid in ids:
                 r = got.get(fid) or {}
                 out.append({"source": "held files", "id": fid,
-                            "title": _lf(r.get("title"), r.get("season"), r.get("episode"),
-                                         r.get("path"), fid) or f"file {fid}",
+                            "title": (_lf(r.get("title"), r.get("season"), r.get("episode"),
+                                          r.get("path"), fid) if r else _cut.get(fid))
+                                     or f"file {fid}",
                             "path": r.get("path") or "", "detail": why[fid],
                             "goto": "", "act": "", "n_total": len(why), "note": ""})
     except Exception:                                        # noqa: BLE001
@@ -17058,6 +17094,8 @@ tr.actsub.genhead .wrap>div.ell{white-space:nowrap;overflow:hidden;
    an ellipsis instead of pushing Stop onto a second line on that card alone */
 .pxmeta>.pill,.pxmeta>b{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:0 1 auto}
 .pxmeta>.pxstop{flex:0 0 auto}
+/* the name gives way first; the two pills only once it is down to nothing */
+.pxmeta>.pill{flex-shrink:1}.pxmeta>b{flex-shrink:20}
 .pxempty{display:none}
 .pxrunnone{display:flex;align-items:center;justify-content:center;font-size:11px;padding:6px 0}
 .pxlegend.pxempty{visibility:hidden}
@@ -33726,7 +33764,14 @@ function pxSignature(ss){
 // WHAT NUARR DID TO THE FILE BEING PLAYED - one line, the summary on hover.
 function pxProcessed(n){
   if(!n) return '';
-  if(!n.known) return '<span class="dim">not in nuarr\u2019s library</span>';
+  if(!n.known) return n.gone
+    ? '<span class="pxwarn">this file has been removed since the stream began</span>'
+    : '<span class="dim">not in nuarr\u2019s library</span>';
+  if(n.replaced){
+    const rest = pxProcessed(Object.assign({}, n, {replaced: ''}));
+    return `<span class="pxwarn" title="The file this viewer is still playing no longer exists - it was replaced while the stream was open. Plex keeps serving what the player already buffered; the details here are the replacement's.">replaced since this stream began</span>
+      <span class="dim">\u2014 now</span> <span class="mono dim" style="overflow-wrap:anywhere">${esc(n.replaced)}</span><br>${rest}`;
+  }
   const gb=b=>b>=1e9?(b/1e9).toFixed(1)+' GB':(b/1e6).toFixed(0)+' MB';
   const when=t=>{ if(!t) return ''; const d=new Date(t*1000);
     return d.toLocaleDateString([], {month:'short', day:'numeric'})+' '
@@ -34004,7 +34049,7 @@ function pxRender(ss){
   el.innerHTML = ss.map((s,i)=>{
     const col = PLAYCOL[s.decision] || 'var(--dim)';
     const how = s.decision === 'direct play' ? 'direct play'
-              : s.decision === 'copy' ? 'direct stream (remuxed)'
+              : s.decision === 'copy' ? 'direct stream'
               : 'transcoding';
     const st = pxState(s);
     const open = _pxOpenAll;
@@ -34022,7 +34067,7 @@ function pxRender(ss){
           <span class="pxcaret dim">${open?'\u25be':'\u25b8'}</span></div>
         <div class="dim pxsub" data-al="h:sub">${s.sub?esc(s.sub):'&nbsp;'}</div>
         <div class="pxmeta" data-al="h:meta">
-          <span class="pill" style="color:${col};border-color:${col}">${esc(how)}</span>
+          <span class="pill" style="color:${col};border-color:${col}"${s.decision==='copy'?' title="Remuxed: video and audio are copied as-is into a container the player accepts - nothing is re-encoded"':''}>${esc(how)}</span>
           ${st==='buffering' ? '<span class="pill p-bad pxbuf">buffering</span>'
             : st==='paused'  ? '<span class="pill p-warn">paused</span>'
                              : '<span class="pill p-ok pxlive">playing</span>'}
