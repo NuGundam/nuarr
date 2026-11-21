@@ -1080,6 +1080,10 @@ def main() -> int:
     ap.add_argument("--check-only", action="store_true")
     ap.add_argument("--retime-out", default="", help="write each named track, retimed line by line onto its words, here")
     a = ap.parse_args()
+    try:                       # the stage lines carry a middle dot; say them in UTF-8
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:                                            # noqa: BLE001
+        pass
     sys.stdout.reconfigure(encoding="utf-8")
     pj = probe(a.src)
     st = pj.get("streams") or []

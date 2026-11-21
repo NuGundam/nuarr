@@ -433,7 +433,8 @@ def _import_unread(items: list) -> list:
                 STATS["detail"].append(f"{a.name}: {name[:60]} - {len(cands)} video files offered, left for you")
                 continue
             c = cands[0]
-            f = {"path": c["path"], "quality": c.get("quality"), "languages": c.get("languages") or [],
+            f = {"path": c["path"], "quality": c.get("quality") or row.get("quality"),
+                 "languages": c.get("languages") or row.get("languages") or [],
                  "releaseGroup": c.get("releaseGroup") or "", "downloadId": row.get("downloadId") or ""}
             f.update({k: hit[k] for k in ("seriesId", "episodeIds", "movieId") if k in hit})
             _call(a, "/api/v3/command", "POST", {"name": "ManualImport", "files": [f], "importMode": "auto"})
@@ -540,7 +541,8 @@ def _import_known(items: list) -> list:
                 STATS["detail"].append(f"{a.name}: {name[:60]} - {len(cands)} video files offered, left for you")
                 continue
             c = cands[0]
-            f = {"path": c["path"], "quality": c.get("quality"), "languages": c.get("languages") or [],
+            f = {"path": c["path"], "quality": c.get("quality") or row.get("quality"),
+                 "languages": c.get("languages") or row.get("languages") or [],
                  "releaseGroup": c.get("releaseGroup") or "", "downloadId": row.get("downloadId") or ""}
             f.update(ids)
             _call(a, "/api/v3/command", "POST", {"name": "ManualImport", "files": [f], "importMode": "auto"})
@@ -637,6 +639,19 @@ def _import_by_runtime(queues: list) -> tuple[list, set, set]:
                 if packed and any(e.get("hasFile") for e in eps):
                     for r, _ in grp[:1]:
                         _remove(a, r, blocklist=True)
+                    # THE BLOCKLIST IS ONE GRAB FROM ONE INDEXER. Sonarr searched
+                    # again and took the same pack from the next indexer, named
+                    # without "-Obfuscated", within a minute. The release NAME is
+                    # banned for every indexer - the tool refetch uses.
+                    try:
+                        from . import arrban
+                        import re as _re
+                        _nm = _re.sub(r"-(Obfuscated|Scrambled|AsRequested|postbot|xpost|BUYMORE|Rakuv\w*)$", "",
+                                      name, flags=_re.I)
+                        arrban.add("release", _nm, f"one file holding {len(grp)} episodes that have their own files",
+                                   "queue janitor", by="nuarr")
+                    except Exception as e:                       # noqa: BLE001
+                        STATS["detail"].append(f"{a.name}: could not ban {name[:50]}: {type(e).__name__}: {e}"[:160])
                     for r, _ in grp:
                         gone.add(r.get("id"))
                     out.append({"at": time.time(), "arr": a.name, "title": name, "client": row0.get("downloadClient") or "",
@@ -645,7 +660,18 @@ def _import_by_runtime(queues: list) -> tuple[list, set, set]:
                                        "their own - not worth turning them into one entry; removed and blocklisted"})
                     STATS["detail"].append(f"{a.name}: removed {name[:60]} - one file for {len(grp)} episodes that have their own")
                     continue
-                f = {"path": c["path"], "quality": c.get("quality"), "languages": c.get("languages") or [],
+                # A FILE THE ARR CANNOT READ HAS NO QUALITY EITHER. Handed over like
+                # that, Sonarr deleted the episode's old file as an upgrade and then
+                # crashed building the new one's name (NullReference in
+                # AddQualityTokens) - Slime's Scarlet Bond was left with no file at
+                # all, 2026-11-20. The queue row carries the quality the arr grabbed
+                # it as; with neither, nothing is imported.
+                qual = c.get("quality") or row0.get("quality")
+                if not (qual and (qual.get("quality") or {}).get("id") is not None):
+                    STATS["detail"].append(f"{a.name}: {name[:60]} - no quality to import it as, left for you")
+                    continue
+                f = {"path": c["path"], "quality": qual,
+                     "languages": c.get("languages") or row0.get("languages") or [],
                      "releaseGroup": c.get("releaseGroup") or "", "downloadId": row0.get("downloadId") or "",
                      "seriesId": row0["seriesId"], "episodeIds": [r["episodeId"] for r, _ in grp]}
                 _call(a, "/api/v3/command", "POST", {"name": "ManualImport", "files": [f], "importMode": "auto"})

@@ -222,8 +222,13 @@ def rp_group_pattern(group: str) -> str:
     has to be where groups go: "[Group] Show - 01" at the front, or "...-Group"
     at the end (an indexer's "[rarbg]" or a container extension after it
     allowed). Never mid-name, where "ZR" or "ELiTE" would hit a title."""
+    # AND THE TAG A USENET REPOST HANGS AFTER IT. "...x264-QCF-Obfuscated" ends
+    # in "Obfuscated", so a ban on QCF did not see it (2026-11-20: the one-file
+    # Vixen season came back under exactly that name). The known repost tags
+    # are allowed after the group; nothing else is.
     g = "".join(_esc(c) for c in str(group or "").strip())
     return (r"(?:^\[" + g + r"\]|[-._ ]" + g
+            + r"(?:-(?:Obfuscated|Scrambled|AsRequested|postbot|xpost|BUYMORE|Rakuv\w*))?"
             + r"(?:\[[^\]]*\])?(?:\.(?:mkv|mp4|avi|m4v|ts))?\s*$)")
 
 
