@@ -275,7 +275,11 @@ def _measure(path: str, tracks: str = "", check_only: bool = False, words_always
                     i, n = ln.split()[1].split("/")
                     st["pct"] = base + span * int(i) / max(1, int(n))
                     if ln.count(" ") >= 2:
-                        st["stage"] = ln.split(" ", 2)[2].strip()
+                        # WHICH METHOD IS RUNNING is in the worker's own words
+                        # (method 1 / 2 / 3); the same passes run again to test
+                        # a rebuilt file, and say so.
+                        st["stage"] = (("checking the result \u00b7 " if (check_only or words_always) else "")
+                                       + ln.split(" ", 2)[2].strip())
                 except Exception:                                # noqa: BLE001
                     pass
             else:
@@ -322,7 +326,7 @@ def _retime(path: str, ords: list) -> dict:
                     try:
                         i, n = ln.split()[1].split("/")
                         st["pct"] = 36.0 + 40.0 * int(i) / max(1, int(n))
-                        st["stage"] = "hearing every line"
+                        st["stage"] = "method 3 · line-by-line retime - hearing every line"
                     except Exception:                            # noqa: BLE001
                         pass
         th = threading.Thread(target=_err, daemon=True)
@@ -381,7 +385,7 @@ def fix(file_id: int, path: str, tracks: list) -> dict:
 
         def _rep(p):
             st["pct"] = 40 + 0.4 * float(p or 0)
-        st["stage"] = "rewriting the timing"
+        st["stage"] = "fixing \u00b7 shifting the track (one offset or frame rate)"
         from . import outside as _out
         r = _run_reporting([_mkvmerge(), "-o", tmp] + cmd_sync + [path], _rep,
                            on_pid=lambda pid: _out.set_pid(key, pid))
@@ -389,14 +393,14 @@ def fix(file_id: int, path: str, tracks: list) -> dict:
             fileops._quiet_remove(tmp)
             return {"ok": False, "why": (r.stderr or r.stdout or "mkvmerge failed").strip()[:300]}
         # EXIT 0 IS NOT PROOF: measure the rebuilt file the same way.
-        st.update(stage="measuring the result", pct=82)
+        st.update(stage="checking the result", pct=82)
         chk = _measure(tmp, ",".join(str(t["ord"]) for t in tracks), check_only=True)
         bad = [t for t in (chk.get("tracks") or []) if t.get("verdict") != "ok"]
         if not chk.get("ok") or bad or len(chk.get("tracks") or []) != len(tracks):
             fileops._quiet_remove(tmp)
             why = "; ".join(f"track {t['ord'] + 1}: {t.get('why', '')}" for t in bad) or chk.get("why") or "the check failed"
             return {"ok": False, "why": "the corrected file still is not in step - nothing was changed (" + why + ")"}
-        st.update(stage="putting it back", pct=90)
+        st.update(stage="fixing \u00b7 putting it back", pct=90)
         from .jobs import outside_commit as _oc
         res = fileops.safe_replace(path, tmp, **_oc(path, "subtiming"))
         fileops._quiet_remove(tmp)
@@ -563,7 +567,7 @@ def fix_piecewise(file_id: int, path: str, tracks: list) -> dict:
         with fileops.cache_reserve(_size(path)):
             # 1. each track out of the container as it is (codec copy keeps the
             #    ASS styles), retimed, written beside the temp file
-            st.update(stage="rewriting the cue times", pct=40)
+            st.update(stage="fixing \u00b7 rewriting the cue times", pct=40)
             ff = _ffmpeg_exe()
             for i, t in enumerate(tracks):
                 m = subs[t["ord"]]
@@ -609,12 +613,12 @@ def fix_piecewise(file_id: int, path: str, tracks: list) -> dict:
 
             def _rep(p):
                 st["pct"] = 45 + 0.35 * float(p or 0)
-            st["stage"] = "rebuilding the file"
+            st["stage"] = "fixing \u00b7 rebuilding the file"
             r = _run_reporting(cmd, _rep, on_pid=lambda pid: _out.set_pid(key, pid))
             if r.returncode >= 2 or not os.path.exists(tmp):
                 return {"ok": False, "why": (r.stderr or r.stdout or "mkvmerge failed").strip()[:300]}
             # 3. EXIT 0 IS NOT PROOF: measure the rebuilt file the same way
-            st.update(stage="measuring the result", pct=82)
+            st.update(stage="checking the result", pct=82)
             by_words = any(t.get("text") is not None for t in tracks)
             if by_words:
                 # A LINE-BY-LINE REWRITE IS JUDGED BY THE WORDS. The pattern
@@ -636,7 +640,7 @@ def fix_piecewise(file_id: int, path: str, tracks: list) -> dict:
             if not chk.get("ok") or bad or len(chk.get("tracks") or []) != len(tracks):
                 why = "; ".join(f"track {t['ord'] + 1}: {t.get('why', '')}" for t in bad) or chk.get("why") or "the check failed"
                 return {"ok": False, "why": "the corrected file still is not in step - nothing was changed (" + why + ")"}
-            st.update(stage="putting it back", pct=90)
+            st.update(stage="fixing \u00b7 putting it back", pct=90)
             from .jobs import outside_commit as _oc
             res = fileops.safe_replace(path, tmp, **_oc(path, "subtiming"))
             if not getattr(res, "ok", False):
@@ -672,7 +676,7 @@ def check_one(row: dict, act: bool | None = None, w=None) -> dict:
     act = (mode() == "auto") if act is None else act
     t0 = time.time()
     from . import outside as _out
-    fields = {"file_id": fid, "label": _label(path), "stage": "listening for speech", "pct": 2.0, "started": t0}
+    fields = {"file_id": fid, "label": _label(path), "stage": "method 1 · pattern check - listening for speech", "pct": 2.0, "started": t0}
     slot = None
     if w is not None:
         st = _WorkerState(w, **fields)
@@ -720,7 +724,7 @@ def check_one(row: dict, act: bool | None = None, w=None) -> dict:
             # the rebuilt track is in step by those words.
             wordy = [t for t in tracks if t.get("retime_ok")] if act else []
             if wordy:
-                st.update(stage="hearing every line", pct=36)
+                st.update(stage="method 3 · line-by-line retime - hearing every line", pct=36)
                 got = _retime(path, [t["ord"] for t in wordy])
                 for t in wordy:
                     g = got.get(int(t["ord"]))

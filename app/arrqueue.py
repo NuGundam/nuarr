@@ -1166,10 +1166,18 @@ def _pass() -> str:
                     new.append(cleaned)
                     continue                # the arr is importing it now
             stall = ""
-            if did in stalled and (r.get("sizeleft") or 0) > 0:
-                stall = (f"stalled: no progress for {stalled[did]:.0f} h at "
-                         f"{100 * (1 - (r.get('sizeleft') or 0) / max(1, r.get('size') or 1)):.0f}% - "
-                         "blocklisted, the arr will look for another release")
+            # NO METADATA IS STALLED TOO (Erik, 2026-11-20). A magnet that never
+            # finds its metadata has no size at all - 0 B, so "bytes left" is 0
+            # and the test below (sizeleft > 0) passed it over on every pass:
+            # Reasonable Doubt S02E08 sat "downloading metadata" for 44 hours
+            # with the stall clock running the whole time. Size 0 and not
+            # finished is the same dead torrent, and gets the same answer.
+            _nometa = not (r.get("size") or 0) and (r.get("status") or "") != "completed"
+            if did in stalled and ((r.get("sizeleft") or 0) > 0 or _nometa):
+                stall = ((f"stalled: no metadata after {stalled[did]:.0f} h - " if _nometa else
+                          f"stalled: no progress for {stalled[did]:.0f} h at "
+                          f"{100 * (1 - (r.get('sizeleft') or 0) / max(1, r.get('size') or 1)):.0f}% - ")
+                         + "blocklisted, the arr will look for another release")
             why = bad or stall or losers.get(r["id"]) or _verdict(a, r)
             if not why:
                 if (r.get("trackedDownloadStatus") or "") == "warning":

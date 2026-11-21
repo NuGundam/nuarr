@@ -197,7 +197,7 @@ def read_all(src: str, dur: float, pieces: list, a_list: list, tracks: list) -> 
     got = {t["ord"]: set() for t in tracks}
     with tempfile.TemporaryDirectory(prefix="nuarr_stm_") as d:
         for pi, (t0, t1) in enumerate(pieces):
-            print(f"PROG {pi}/{len(pieces)} reading - piece {pi + 1} of {len(pieces)}",
+            print(f"PROG {pi}/{len(pieces)} method 1 · pattern check - listening, piece {pi + 1} of {len(pieces)}",
                   file=sys.stderr, flush=True)
             # -copyts: a seek lands on the keyframe before t0, and without it a
             # subtitle's clock starts at its first packet after that keyframe -
@@ -244,7 +244,7 @@ def cues_all(src: str, tracks: list, pieces: list) -> dict:
     got = {t["ord"]: set() for t in tracks}
     with tempfile.TemporaryDirectory(prefix="nuarr_stm_") as d:
         for pi, (t0, t1) in enumerate(pieces):
-            print(f"PROG {pi}/{len(pieces)} reading - piece {pi + 1} of {len(pieces)}",
+            print(f"PROG {pi}/{len(pieces)} method 1 · pattern check - listening, piece {pi + 1} of {len(pieces)}",
                   file=sys.stderr, flush=True)
             # -copyts: a seek lands on the keyframe before t0, and without it a
             # subtitle's clock starts at its first packet after that keyframe -
@@ -722,7 +722,7 @@ def pw_stage(src: str, dur: float, tracks: list, sps: list, allc: dict, sampled:
     if sampled:
         a_ords = sorted({t["audio_ord"] for t in tracks})
         lgs = {i: lg for i, lg, _ in sps}
-        print(f"PROG 0/1 hearing the whole file for a closer look", file=sys.stderr, flush=True)
+        print(f"PROG 0/1 method 1 · pattern check - a closer look at the whole file", file=sys.stderr, flush=True)
         spd, cues = read_all(src, dur, [(0.0, dur)], [(i, lgs.get(i, "und")) for i in a_ords], tracks)
     else:
         spd = {i: s for i, _, s in sps}
@@ -781,6 +781,7 @@ WORD_LEN = 75.0
 WORD_REACH = 6.0              # a line is looked for this far either side of its own time
 WORD_LEAD = 0.2               # a corrected line starts this long before its words (early is fine, late is not)
 WORD_TIGHT = 0.85             # this share of lines within 0.8 s of the middle one = in step
+SHORT_S, SHORT_SHARE, SHORT_MIN = 0.5, 0.10, 100     # see "TOO SHORT TO READ" in main()
 WORD_MIN = 15                 # matched lines needed before the words overrule anything
 WORD_MODEL_DIR = os.environ.get("NUARR_WHISPER_DIR") or r"C:\ProgramData\nuarr\whisper"
 _WM = {"m": None}
@@ -879,11 +880,15 @@ def retime_words(src: str, dur: float, ord_: int, a_ord: int, lang: str) -> tupl
         text = m.group(9).rstrip()
         said = re.sub(r"<[^>]+>|\{[^}]*\}|\[[^\]]*\]|\([^)]*\)|^[A-Z][A-Z .']+:|[\u266a\u266b#]", " ", text, flags=re.M)
         cues.append({"a": a0, "b": a1, "text": text, "w": [w for w in (_norm_word(x) for x in said.split()) if w]})
-    words = []
+    # HEARD ONCE PER AUDIO TRACK. Two English tracks (plain and SDH) are the
+    # usual case, and the second used to transcribe the same audio again.
+    words = _HEARD.get((src, a_ord))
     step = 600.0
     n = int(dur // step) + 1
-    for i in range(n):
-        print(f"PROG {i}/{n} hearing what is said", file=sys.stderr, flush=True)
+    if words is None:
+      words = []
+      for i in range(n):
+        print(f"PROG {i}/{n} method 3 · line-by-line retime - hearing what is said", file=sys.stderr, flush=True)
         t0 = i * step
         global WORD_LEN
         keep, WORD_LEN = WORD_LEN, step
@@ -891,7 +896,8 @@ def retime_words(src: str, dur: float, ord_: int, a_ord: int, lang: str) -> tupl
             words += _word_times(src, a_ord, lang, t0)
         finally:
             WORD_LEN = keep
-    words.sort(key=lambda x: x[1])
+      words.sort(key=lambda x: x[1])
+      _HEARD[(src, a_ord)] = words
     tw = [w for w, _ in words]
     tt = [t for _, t in words]
     import bisect
@@ -976,6 +982,7 @@ def retime_words(src: str, dur: float, ord_: int, a_ord: int, lang: str) -> tupl
     return out, stats
 
 
+_HEARD: dict = {}
 RETIME_REACH = 8.0            # a line is looked for this far either side of where it stands
 RETIME_MIN = 0.45             # a line nearer its words than this is not touched
 
@@ -994,7 +1001,7 @@ def words_stage(src: str, dur: float, tracks: list) -> None:
     for n, t in enumerate(todo):
         key = t["audio_ord"]
         if key not in heard:
-            print(f"PROG {n}/{len(todo)} checking the lines against the spoken words", file=sys.stderr, flush=True)
+            print(f"PROG {n}/{len(todo)} method 2 · word check - comparing lines with what is said", file=sys.stderr, flush=True)
             heard[key] = [(st, _word_times(src, key, WORD_LANGS[(t.get("audio_lang") or "").lower()], st))
                           for st in starts]
         cues = _word_cues(src, t["ord"])
@@ -1168,6 +1175,24 @@ def main() -> int:
 
     for t in todo:
         measure(t)
+    # TOO SHORT TO READ - the 9-1-1 S10E06 signature, from cues already in hand.
+    # Amazon's file for that episode had a quarter of its lines on screen for
+    # under half a second, crammed in early; its other episodes have none. The
+    # pattern match can call such a track in step (most lines are), so it is
+    # looked for directly: SHORT_SHARE of at least SHORT_MIN lines lasting
+    # under SHORT_S makes a track "uneven" whatever else was said about it,
+    # and the line-by-line repair - which also gives lines their length back -
+    # is tried on it.
+    if not a.check_only:
+        for t in todo:
+            cs = allc.get(t["ord"]) or []
+            if len(cs) >= SHORT_MIN:
+                sh = sum(1 for c0, c1 in cs if c1 - c0 < SHORT_S) / len(cs)
+                t["short"] = round(sh, 3)
+                if sh >= SHORT_SHARE and t.get("verdict") in ("ok", "unsure"):
+                    t.update(verdict="uneven", short_lines=True,
+                             why=(f"{int(round(sh * 100))}% of lines are on screen for under half a second - "
+                                  f"too short to read; the track's timing is damaged"))
     # PAL, ONLY WHEN IT COULD BE PAL. A 4 % mismatch moves a line minutes by
     # the end of a film - out of reach of the windows already read. Those
     # stretches are read (subtitles only) when a track came out unclear.
