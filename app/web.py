@@ -17053,7 +17053,14 @@ tr.actsub.genhead .wrap>div.ell{white-space:nowrap;overflow:hidden;
   white-space:nowrap}
 .pxsub{font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pxmeta{display:flex;align-items:center;gap:7px;font-size:11.5px;margin-top:2px;
-  flex-wrap:wrap}
+  flex-wrap:nowrap;min-width:0}
+/* one line on every card: a long pill ("direct stream (remuxed)") shrinks with
+   an ellipsis instead of pushing Stop onto a second line on that card alone */
+.pxmeta>.pill,.pxmeta>b{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:0 1 auto}
+.pxmeta>.pxstop{flex:0 0 auto}
+.pxempty{display:none}
+.pxrunnone{display:flex;align-items:center;justify-content:center;font-size:11px;padding:6px 0}
+.pxlegend.pxempty{visibility:hidden}
 /* clock, bar and percentage share one row pinned to the bottom of the card, so
    cards of differing text length still line their progress up with each other */
 .pxfoot{display:flex;align-items:center;gap:9px;margin-top:auto;padding-top:7px}
@@ -33915,7 +33922,7 @@ function pxDetail(s){
     // 3x the floor, which puts the threshold a third of the way across and
     // makes "20s against a 60s floor" a gap you can see from across the room.
     const fs = Math.round(fl * Number(window._pxFullMult || 3));
-    runway = `<div class="pxrunwrap"><em class="pxrunlbl"></em>
+    runway = `<div class="pxrunwrap" data-al="run"><em class="pxrunlbl"></em>
       <div class="pxrun"><i></i><u></u><o></o><s></s></div>
       <div class="pxrunax"><span class="zero">0s</span><span class="fl">${fl}s</span
       ><span class="rs">${rs}s</span><span class="fs">${fs}s</span
@@ -33936,14 +33943,38 @@ function pxDetail(s){
   { const nf=pxProcessed(s.nuarr_file); if(nf) rows.push(['processed', nf]); }
   if(s.file) rows.push(['file', `<span class="mono dim"
     style="overflow-wrap:anywhere">${esc(pxPath(s.file))}</span>`]);
+  // EVERY CARD, THE SAME ROWS - ALL OF THEM (2026-11-20). The early rows were
+  // made unconditional, but container, encoder, nuarr and the rest still came
+  // and went by stream type, so a direct play's "source" sat beside a remux's
+  // "container" and nothing below lined up. Fixed order, a quiet dash where a
+  // row has nothing to say; the two rows that are rare everywhere ('' - the
+  // floor arithmetic - and "resolved by") are hidden spacers that pxAlign
+  // opens only when a neighbour in the same line has one.
+  const ORDER = ['video','audio','subtitle','container','source','encoder','ends',
+                 'nuarr','','resolved by','processed','file'];
+  const dash = '<span class="dim">—</span>';
+  const fill = {video: '<span class="dim">not reported</span>',
+    audio: '<span class="dim">not reported</span>', subtitle: pxNoSub(s),
+    container: (d.src_container||d.dst_container)
+      ? `<span class="mono">${esc(d.src_container||d.dst_container)}</span>` : dash,
+    source: dash,
+    encoder: s.decision==='transcode' ? '<span class="dim">starting</span>'
+                                      : '<span class="dim">not transcoding</span>',
+    nuarr: dash, '': null, 'resolved by': null, processed: dash, file: dash};
+  const have = new Set(rows.map(r=>r[0]));
+  for(const k of ORDER) if(!have.has(k)) rows.push([k, fill[k]]);
+  rows.sort((a,b)=>ORDER.indexOf(a[0])-ORDER.indexOf(b[0]));
+  if(!runway) runway = `<div class="pxrunwrap pxrunnone" data-al="run"><span class="dim">${
+    done ? 'buffered to the end — no runway to watch' : 'no runway measured yet'}</span></div>`;
   return `<div class="pxmore">`+rows.map(([k,v])=>
-    `<div class="pxrow"><span class="pxk">${k}</span><span class="pxv">${v}</span></div>`).join('')
+    `<div class="pxrow${v===null?' pxempty':''}" data-al="r:${k||'why'}"><span class="pxk">${k}</span><span class="pxv">${v===null?'&nbsp;':v}</span></div>`).join('')
     + runway
-    + (fl?`<div class="pxlegend">
+    + (fl?`<div class="pxlegend" data-al="legend">
         <s class="pos">watched</s><s class="buf">buffered ahead</s>
         <s class="thr">${fl}s — Nuarr stops</s>
         <s class="rsm">${rs}s — Nuarr starts again</s>
-        <s class="fsp">${Math.round(fl*Number(window._pxFullMult||3))}s — Nuarr at full speed</s></div>`:'')
+        <s class="fsp">${Math.round(fl*Number(window._pxFullMult||3))}s — Nuarr at full speed</s></div>`
+        :`<div class="pxlegend pxempty" data-al="legend">&nbsp;</div>`)
     + `</div>`;
 }
 // ONE CLICK OPENS THEM ALL. The expanded views are for comparing - who is
@@ -33987,10 +34018,10 @@ function pxRender(ss){
       ${s.thumb?`<img class="pxart" src="/api/plex/art?key=${encodeURIComponent(s.thumb)}"
                       alt="" loading="lazy">`:'<div class="pxart pxnone"></div>'}
       <div class="pxbody">
-        <div class="pxtitle">${esc(s.label)}
+        <div class="pxtitle" data-al="h:title">${esc(s.label)}
           <span class="pxcaret dim">${open?'\u25be':'\u25b8'}</span></div>
-        ${s.sub?`<div class="dim pxsub">${esc(s.sub)}</div>`:''}
-        <div class="pxmeta">
+        <div class="dim pxsub" data-al="h:sub">${s.sub?esc(s.sub):'&nbsp;'}</div>
+        <div class="pxmeta" data-al="h:meta">
           <span class="pill" style="color:${col};border-color:${col}">${esc(how)}</span>
           ${st==='buffering' ? '<span class="pill p-bad pxbuf">buffering</span>'
             : st==='paused'  ? '<span class="pill p-warn">paused</span>'
@@ -34004,9 +34035,9 @@ function pxRender(ss){
              not on its neighbour, and nothing below lined up between the two.
              Three fixed lines now - verdict, device, where it reads from -
              present on every card whether or not they have anything to say. -->
-        <div class="dim pxsub">${esc(s.player||s.product||'unknown device')}</div>
-        <div class="dim pxsub">${bits.join(' \u00b7 ')||'&nbsp;'}</div>
-        <div class="pxsub pxlead"></div>
+        <div class="dim pxsub" data-al="h:dev">${esc(s.player||s.product||'unknown device')}</div>
+        <div class="dim pxsub" data-al="h:where">${bits.join(' \u00b7 ')||'&nbsp;'}</div>
+        <div class="pxsub pxlead" data-al="h:lead"></div>
         ${open?pxDetail(s):''}
         <div class="pxfoot">
           <span class="pxclock mono"></span>
@@ -34017,7 +34048,36 @@ function pxRender(ss){
       </div></div>`;
   }).join('');
   pxTick();
+  pxAlign();
 }
+
+// EVERY SECTION ON ONE LINE ACROSS THE CARDS (2026-11-20). Same rows in the
+// same order is not enough: a long path or a wrapped sentence makes one card's
+// row three lines and its neighbour's one, and everything under it drifts.
+// After each render and tick, every [data-al] block gets the height of the
+// tallest block with the same key among the cards sharing its line of the grid.
+// Hidden spacer rows (.pxempty) open only when a card in that line has the row.
+function pxAlign(){
+  const el = document.getElementById('plexCards');
+  if(!el || !el.children.length) return;
+  el.querySelectorAll('[data-al]').forEach(b=>{
+    b.style.minHeight=''; if(b.classList.contains('pxempty')) b.style.display=''; });
+  const groups = {};
+  for(const card of el.children){
+    const line = card.offsetTop;
+    card.querySelectorAll('[data-al]').forEach(b=>{
+      (groups[line+'|'+b.dataset.al] ||= []).push(b);
+    });
+  }
+  for(const g of Object.values(groups)){
+    if(g.length < 2) continue;
+    if(g.some(b=>!b.classList.contains('pxempty')))
+      g.forEach(b=>{ if(b.classList.contains('pxempty')) b.style.display='flex'; });
+    const h = Math.max(...g.map(b=>b.getBoundingClientRect().height));
+    g.forEach(b=>{ b.style.minHeight = h+'px'; });
+  }
+}
+window.addEventListener('resize', ()=>{ clearTimeout(window._pxAlT); window._pxAlT=setTimeout(pxAlign,120); });
 
 // THE ENCODER'S LEAD OVER THE VIEWER, in words.
 //
@@ -34258,6 +34318,8 @@ function pxTick(){
              {hour:'numeric',minute:'2-digit'})} · ${pxTime(left)} left`;
     }
   }
+  // live text (lead, ETA, runway label) can change a block's line count
+  if(Date.now() - (window._pxAlAt||0) > 2000){ window._pxAlAt = Date.now(); pxAlign(); }
 }
 
 async function loadPlexCards(){
