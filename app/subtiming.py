@@ -793,7 +793,9 @@ def check_one(row: dict, act: bool | None = None, w=None) -> dict:
                                                    "moved_n": t.get("moved_n"), "longer_n": t.get("longer_n")}
                                                   for t in fixable])
                 else:
-                    f = fix(fid, path, [{"ord": t["ord"], "offset": float(t["offset"]), "rate": float(t["rate"])}
+                    # words kept: fix() judges a word-found shift by the words
+                    f = fix(fid, path, [{"ord": t["ord"], "offset": float(t["offset"]), "rate": float(t["rate"]),
+                                         "words": t.get("words")}
                                         for t in fixable])
                 if f.get("ok"):
                     action = f"fixed {len(fixable)} track(s)"
