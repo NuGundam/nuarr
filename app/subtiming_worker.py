@@ -1179,6 +1179,32 @@ def main() -> int:
 
     for t in todo:
         measure(t)
+    # A SHIFT FOUND BY THE WORDS IS JUDGED BY THE WORDS (2026-11-21). Six Sheriff
+    # Country 2160p episodes: the pattern match was unsure, the words said every
+    # line ~1-1.9 s early, the track was moved - and the result was then judged
+    # by the pattern match alone, whose slices on these tracks scatter +/-0.4 s
+    # whatever the timing. "Still not in step", the better file thrown away
+    # (S01E16: median 0.55 s early before, about 0 after). With
+    # NUARR_WORDS_CHECK a rebuilt track the pattern match calls off gets the
+    # word check, and the words decide.
+    if a.check_only and os.environ.get("NUARR_WORDS_CHECK"):
+        off = [t for t in todo if t.get("verdict") == "off"]
+        pat = {id(t): t.get("why") for t in off}
+        for t in off:
+            t["verdict"] = "offset"            # what words_stage takes as "about to be called wrong"
+        try:
+            words_stage(a.src, dur, off)
+        except Exception as e:                                   # noqa: BLE001
+            for t in off:
+                t["words"] = {"note": f"word check failed: {type(e).__name__}: {e}"[:160]}
+        for t in off:
+            if t.get("verdict") == "ok":
+                t["why"] = f"{t['why']} - pattern match: {pat[id(t)]}"
+            else:
+                w = t.get("words") or {}
+                t["verdict"] = "off"
+                t["why"] = (f"{pat[id(t)]}; by the words median {w.get('median')}s, "
+                            f"{int(round((w.get('near') or 0) * 100))}% of lines near their words")
     # TOO SHORT TO READ - the 9-1-1 S10E06 signature, from cues already in hand.
     # Amazon's file for that episode had a quarter of its lines on screen for
     # under half a second, crammed in early; its other episodes have none. The

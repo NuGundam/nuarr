@@ -55,6 +55,16 @@ DEFAULT_WORKERS = 3
 DEFAULT_MODE = "auto"
 DEFAULT_PER_HOUR = 60
 TICK_S = 120.0
+# NEW FILES AT FULL PACE, THE REST AS A BACKLOG (2026-11-21). A sweep of 2,309
+# older "in step" files found 10 with damaged timing (0.4%) for most of a day of
+# queue time, so the old library is not swept at the hourly budget any more.
+# A file that arrived - or was rewritten, which changes its mtime - within
+# FRESH_DAYS is checked at the full rate, ahead of everything; older unchecked
+# files trickle at KV_BACKLOG per hour at a priority under every other job.
+FRESH_DAYS = 3.0
+KV_BACKLOG = "subtiming.backlog_per_hour"
+DEFAULT_BACKLOG = 10
+PRIO_FRESH, PRIO_BACKLOG = 80, 10
 WORKER_TIMEOUT = 1800
 TEXT_LIKE = tuple(f'%"codec_name":"{c}"%' for c in ("subrip", "ass", "ssa", "webvtt", "mov_text"))
 _READY = False
@@ -204,7 +214,23 @@ def _label(path: str) -> str:
 _UNCHECKED = "NOT EXISTS (SELECT 1 FROM subtiming t WHERE t.file_id=f.id AND ABS(t.mtime - f.mtime) <= 2)"
 
 
-def candidates(limit: int = 20, skip_disks: set | None = None) -> list:
+def backlog_per_hour() -> int:
+    try:
+        return max(0, int(kv_get(KV_BACKLOG) or DEFAULT_BACKLOG))
+    except (TypeError, ValueError):
+        return DEFAULT_BACKLOG
+
+
+def set_backlog_per_hour(n: int) -> int:
+    kv_set(KV_BACKLOG, str(max(0, int(n))))
+    return backlog_per_hour()
+
+
+def _fresh_since() -> float:
+    return time.time() - FRESH_DAYS * 86400
+
+
+def candidates(limit: int = 20, skip_disks: set | None = None, fresh: bool | None = None) -> list:
     """Files with a text subtitle track, not yet checked as they are now -
     newest first, so what was just imported is looked at within minutes.
     skip_disks: hot disks left out in the query itself - the newest files
@@ -220,6 +246,10 @@ def candidates(limit: int = 20, skip_disks: set | None = None) -> list:
         held = frozenset()
     if held:                        # waiting on you - see jobs.held_for_person
         skip_sql += f"AND f.id NOT IN ({','.join(str(int(i)) for i in held)}) "
+    if fresh is not None:           # new (or rewritten) files vs the backlog
+        since = float(_fresh_since())
+        cond = f"(COALESCE(f.first_seen, 0) >= {since} OR f.mtime >= {since})"
+        skip_sql += f"AND {cond} " if fresh else f"AND NOT {cond} "
     with cursor() as cur:
         rows = cur.execute(
             f"SELECT f.id, f.path, f.mtime, f.pool_disk, f.duration FROM files f JOIN file_probes p ON p.file_id=f.id "
@@ -247,7 +277,8 @@ def waiting() -> int:
 
 
 # ---------------------------------------------------------------- measure ----
-def _measure(path: str, tracks: str = "", check_only: bool = False, words_always: bool = False) -> dict:
+def _measure(path: str, tracks: str = "", check_only: bool = False, words_always: bool = False,
+             words_check: bool = False) -> dict:
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     py = sys.executable
     if py.lower().endswith("pythonw.exe"):
@@ -262,7 +293,9 @@ def _measure(path: str, tracks: str = "", check_only: bool = False, words_always
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
                          errors="replace", cwd=root, creationflags=NO_WINDOW | 0x00004000,   # below normal
                          startupinfo=hidden_si(), stdin=subprocess.DEVNULL,
-                         env=(dict(os.environ, NUARR_WORDS_ALWAYS="1") if words_always else None))
+                         env=(dict(os.environ, **({"NUARR_WORDS_ALWAYS": "1"} if words_always else {}),
+                                   **({"NUARR_WORDS_CHECK": "1"} if words_check else {}))
+                              if (words_always or words_check) else None))
     _out.set_pid(key, p.pid)
     # PROGRESS AS IT GOES: the worker says "PROG i/n what" on stderr per piece
     base, span = (82.0, 8.0) if check_only else (5.0, 30.0)
@@ -394,7 +427,10 @@ def fix(file_id: int, path: str, tracks: list) -> dict:
             return {"ok": False, "why": (r.stderr or r.stdout or "mkvmerge failed").strip()[:300]}
         # EXIT 0 IS NOT PROOF: measure the rebuilt file the same way.
         st.update(stage="checking the result", pct=82)
-        chk = _measure(tmp, ",".join(str(t["ord"]) for t in tracks), check_only=True)
+        # a shift the words found is judged by the words too - see
+        # "A SHIFT FOUND BY THE WORDS" in subtiming_worker
+        by_words = any((t.get("words") or {}).get("median") is not None for t in tracks)
+        chk = _measure(tmp, ",".join(str(t["ord"]) for t in tracks), check_only=True, words_check=by_words)
         bad = [t for t in (chk.get("tracks") or []) if t.get("verdict") != "ok"]
         if not chk.get("ok") or bad or len(chk.get("tracks") or []) != len(tracks):
             fileops._quiet_remove(tmp)
@@ -857,15 +893,32 @@ def feed(n: int | None = None, manual: bool = False) -> dict:
     want = n if manual else n - inq
     if want <= 0:
         return {"queued": 0, "why": f"{inq} already waiting"}
-    rows = _spread(candidates(max(want * 10, 150), busy_disks()))[:want]
-    if not rows:
-        return {"queued": 0, "why": "nothing left to check"}
-    g = _jobs.enqueue_many(
-        [{"file_id": r["id"], "path": r["path"],
-          "plan_json": json.dumps({"act": mode() == "auto", "summary": "subtitle timing against the speech"})}
-         for r in rows],
-        "subtiming", priority=40 if manual else 80, source="ui" if manual else "subtiming")
-    made = int(g.get("made") or 0)
+    busy = busy_disks()
+    if manual:
+        rows, back = _spread(candidates(max(want * 10, 150), busy))[:want], []
+    else:
+        rows = _spread(candidates(max(want * 10, 150), busy, fresh=True))[:want]
+        # the backlog only fills what new files left, at its own hourly budget
+        if now - STATE.get("bl_start", 0) > 3600:
+            STATE.update(bl_start=now, bl_count=0)
+        bl_room = min(want - len(rows), backlog_per_hour() - STATE.get("bl_count", 0))
+        back = _spread(candidates(max(bl_room * 10, 50), busy, fresh=False))[:bl_room] if bl_room > 0 else []
+    if not rows and not back:
+        return {"queued": 0, "why": "nothing new to check" if not manual else "nothing left to check"}
+    mk = lambda rs: [{"file_id": r["id"], "path": r["path"],
+                      "plan_json": json.dumps({"act": mode() == "auto", "summary": "subtitle timing against the speech"})}
+                     for r in rs]
+    made = 0
+    g = {}
+    if rows:
+        g = _jobs.enqueue_many(mk(rows), "subtiming", priority=40 if manual else PRIO_FRESH,
+                               source="ui" if manual else "subtiming")
+        made += int(g.get("made") or 0)
+    if back:
+        gb = _jobs.enqueue_many(mk(back), "subtiming", priority=PRIO_BACKLOG, source="subtiming backlog")
+        nb = int(gb.get("made") or 0)
+        STATE["bl_count"] = STATE.get("bl_count", 0) + nb
+        made += nb
     STATE["hour_count"] += made
     if made and _WAIT["n"] > 0:
         _WAIT["n"] = max(0, _WAIT["n"] - made)
