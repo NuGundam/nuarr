@@ -2201,6 +2201,22 @@ def clear_resolved_failures() -> dict:
         rows = [dict(r) for r in cur.execute(sql)]
         gone = [r for r in rows if r["why"]]
         if gone:
+            # THE FAILURE KEEPS A TRACE (2026-11-20 audit). The row leaves the
+            # failed list because the problem is over, and it used to take the
+            # only record with it: 43 Dolby Vision passthrough failures on
+            # 2026-11-19 were in the log and nowhere in the database. One
+            # history row each, pruned with the rest of history.
+            try:
+                _q = ",".join(str(int(r["id"])) for r in gone)
+                for j in [dict(x) for x in cur.execute(
+                        f"SELECT file_id, kind, source, title, error, finished_at FROM jobs WHERE id IN ({_q})")]:
+                    cur.execute(
+                        "INSERT INTO history(file_id, event, detail, at, label) VALUES(?,?,?,?,?)",
+                        (j["file_id"], "failed",
+                         f"{j['kind']} ({j['source'] or ''}): {(j['error'] or '')[:400]}",
+                         j["finished_at"] or time.time(), j["title"] or ""))
+            except Exception:                                    # noqa: BLE001
+                pass
             cur.executemany("DELETE FROM jobs WHERE id=?",
                             [(r["id"],) for r in gone])
     kept = len(rows) - len(gone)

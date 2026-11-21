@@ -133,6 +133,9 @@ async def _run_due(limit: int = 20) -> int:
 
     now = time.time()
     with cursor() as cur:
+        # a retry row whose file is gone was hidden by the join below and so
+        # waited for good (two rows, 76 and 15 days old, 2026-11-20 audit)
+        cur.execute("DELETE FROM error_retry WHERE file_id NOT IN (SELECT id FROM files)")
         due = [dict(r) for r in cur.execute(
             "SELECT e.file_id, e.attempts, e.reason, f.path, f.title, f.state "
             "  FROM error_retry e JOIN files f ON f.id = e.file_id "

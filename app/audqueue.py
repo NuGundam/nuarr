@@ -724,6 +724,14 @@ def answer(file_id: int, question: str, choice: str,
     scopes = {"both": ("file", "show", "group"), "show": ("file", "show"),
               "group": ("file", "group"),
               "file": ("file",)}.get(scope, ("file", "show", "group"))
+    # WHAT IT GUESSED AND WHAT YOU SAID, written down while the question is
+    # still on the queue row - and two matching answers for this show from this
+    # release group become a remembered answer (asklog.py).
+    try:
+        from . import asklog as _alg
+        _alg.note("aud", int(file_id), path, question, choice)
+    except Exception:                                            # noqa: BLE001
+        pass
     learned = audplan.remember(int(file_id), path, question, choice,
                                scopes=scopes)
     bump()

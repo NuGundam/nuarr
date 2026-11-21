@@ -603,11 +603,31 @@ async def watch() -> None:
             base, key = _taut_cfg()
             last = float(kv_get("clientcaps.taut_at") or 0)
             due = time.time() - last >= taut_every_h() * 3600
+            # BACK OFF WHEN IT IS NOT ANSWERING (2026-11-20 audit): Tautulli was
+            # not running for nine days and this tried every 15 minutes - 679
+            # identical warnings and nothing on the health page. Each failure
+            # doubles the wait (15 min ... 6 h), the log line is written when a
+            # failure starts and once a day after, and health carries the row.
+            if TAUT_FAIL["n"] and time.time() < TAUT_FAIL["next"]:
+                due = False
             if taut_auto() and base and key and due and not TAUT["running"]:
                 with joblog.section("Tautulli capability import"):
                     d = await asyncio.to_thread(import_tautulli)
                     if d.get("error"):
-                        joblog.log(f"Tautulli import: {d['error']}", "warn")
+                        _n = TAUT_FAIL["n"] = TAUT_FAIL["n"] + 1
+                        if _n == 1:
+                            TAUT_FAIL["since"] = time.time()
+                        TAUT_FAIL["why"] = str(d["error"])[:200]
+                        TAUT_FAIL["next"] = time.time() + min(6 * 3600, 900 * 2 ** min(_n - 1, 6))
+                        if _n == 1 or time.time() - TAUT_FAIL["said"] > 86400:
+                            TAUT_FAIL["said"] = time.time()
+                            joblog.log(f"Tautulli import: {d['error']} - trying again less often "
+                                       f"until it answers", "warn")
+                    elif TAUT_FAIL["n"]:
+                        joblog.log("Tautulli import: answering again", "ok")
+                        TAUT_FAIL.update(n=0, since=0.0, next=0.0, why="")
+                    if d.get("error"):
+                        pass
                     elif d.get("learned"):
                         joblog.log(
                             f"Tautulli: read {d.get('done', 0)} session(s) and "
@@ -617,6 +637,10 @@ async def watch() -> None:
             joblog.log(f"Tautulli capability import: "
                        f"{type(e).__name__}: {e}", "warn")
         await asyncio.sleep(900)
+
+
+# how the Tautulli import is failing, for the back-off above and the health row
+TAUT_FAIL: dict = {"n": 0, "since": 0.0, "next": 0.0, "why": "", "said": 0.0}
 
 
 def observed() -> dict:

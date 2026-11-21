@@ -29,6 +29,12 @@ from .db import cursor, kv_get, kv_set
 
 KV = "convert.hevc10"
 SOURCE = "hevc10 convert"
+# BEHIND EVERYTHING A RULE ASKED FOR (2026-11-20 audit). Conversions were queued
+# at 80 and the feeder keeps ten waiting, so the encode pool never ran dry of
+# them: ten "subtitle rules changed" burns (priority 100) waited 76 hours while
+# 821 conversions went past. A conversion is the one job nobody is waiting on.
+CONVERT_PRIO = 120
+
 MIN_SAVING = 0.20
 DEFAULTS = {"on": False, "libraries": ["Anime Shows"],
             "min_mbps": {"1080": 4.0, "720": 3.0, "sd": 2.0}, "keep": 24}
@@ -292,7 +298,7 @@ async def feed() -> int:
     n = 0
     for r in pick:
         try:
-            if await jobs.enqueue(r["id"], r["path"], r["title"], source=SOURCE, priority=80):
+            if await jobs.enqueue(r["id"], r["path"], r["title"], source=SOURCE, priority=CONVERT_PRIO):
                 n += 1
         except Exception as e:                           # noqa: BLE001
             joblog.log(f"HEVC conversion: could not queue {r['path'][-60:]}: {e}", "warn")

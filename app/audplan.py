@@ -111,7 +111,15 @@ def group_key(path: str) -> str:
 def recall(file_id: int, path: str, question: str) -> tuple:
     """What you said last time. This file, then the show, then the group."""
     _mem_init()
+    # AND WHAT TWO MATCHING ANSWERS TAUGHT IT about this show from this release
+    # group (asklog.py) - narrower than the show, so it is read before it.
+    try:
+        from . import asklog as _alg
+        _sg = _alg.sg_key("aud", file_id, path)
+    except Exception:                                            # noqa: BLE001
+        _sg = ""
     for scope, key in (("file", str(int(file_id))),
+                       ("showgroup", _sg),
                        ("show", show_key(file_id)),
                        ("group", group_key(path))):
         if not key:

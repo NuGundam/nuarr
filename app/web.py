@@ -1610,6 +1610,34 @@ def _file_nuarr(path: str):
         q = _rows("SELECT kind FROM jobs WHERE file_id=? AND state IN ('queued','running') LIMIT 3",
                   (int(f["id"]),))
         out["pending"] = [r["kind"] for r in q]
+        # EVERY WORKER THAT HAS TOUCHED THE FILE, for the card's detail box
+        # (Erik, 2026-11-20: "showing what worker was run on the file with
+        # simple detail"). One line per worker, in the Concurrency page's own
+        # names: how many times, when last, how long, and its last word.
+        try:
+            _pool = {"sub_ocr": "subocr", "subs": "subs", "audio": "audio", "decode": "decode",
+                     "listen": "listen", "subread": "subread", "submake": "submake",
+                     "subtiming": "subtiming", "verify": "verify", "qwen": "qwen"}
+            ws: dict = {}
+            for r in _rows("SELECT kind, pool, state, started_at, finished_at, result_json, error "
+                           "FROM jobs WHERE file_id=? AND state IN ('done','skipped','failed') "
+                           "ORDER BY finished_at", (int(f["id"]),)):
+                k = r["kind"]
+                pool = ((r["pool"] or "encode") if k == "transcode" else _pool.get(k, k))
+                if pool not in ("encode", "passthrough") and k == "transcode":
+                    pool = "encode"
+                try:
+                    word = (_j.loads(r["result_json"] or "{}") or {}).get("summary") or ""
+                except Exception:                                # noqa: BLE001
+                    word = ""
+                word = word or (r["error"] or "")
+                w = ws.setdefault(pool, {"pool": pool, "n": 0, "secs": 0.0})
+                w["n"] += 1
+                w["secs"] += max(0.0, float(r["finished_at"] or 0) - float(r["started_at"] or 0))
+                w.update(at=r["finished_at"] or 0, state=r["state"], word=str(word)[:260])
+            out["workers"] = sorted(ws.values(), key=lambda w: w.get("at") or 0)
+        except Exception:                                        # noqa: BLE001
+            out["workers"] = []
         return out
 
     return _memo("nuarrfile:" + path, 60.0, _work)
@@ -7007,6 +7035,21 @@ def _health_build():
             "watcher unavailable", warn=False,
             when="watched continuously")
 
+    # TAUTULLI NOT ANSWERING - nine days of refused connections showed nowhere
+    # but the log (2026-11-20 audit). Listed only while it is configured.
+    try:
+        from . import clientcaps as _cc
+        if _cc.taut_auto() and all(_cc._taut_cfg()):
+            _tf = _cc.TAUT_FAIL
+            _down = bool(_tf["n"]) and time.time() - float(_tf["since"] or 0) > 3600
+            add("tautulli", "Tautulli import", "logs", 1 if _down else 0,
+                (f"not answering for {_ago_words(_tf['since']).replace(' ago', '')} - "
+                 f"{_tf['why'][:110]}" if _down
+                 else "retrying" if _tf["n"] else "answering"),
+                warn=_down, when="every import")
+    except Exception:                                        # noqa: BLE001
+        pass
+
     try:
         from . import observer as _ob
         st = _ob.state()
@@ -11327,6 +11370,15 @@ async def _bc_run(fn, *a):
         from concurrent.futures import ThreadPoolExecutor
         _BC_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bitcut")
     return await asyncio.get_running_loop().run_in_executor(_BC_POOL, fn, *a)
+
+
+@app.get("/api/asklog")
+def api_asklog():
+    """Answers with the guess they were given against, agreement by sure-%
+    bucket, and what show + release group learning has written (asklog.py)."""
+    from . import asklog
+    asklog.backfill()
+    return asklog.stats()
 
 
 @app.get("/api/bitcut")
@@ -17097,6 +17149,18 @@ tr.actsub.genhead .wrap>div.ell{white-space:nowrap;overflow:hidden;
 /* the name gives way first; the two pills only once it is down to nothing */
 .pxmeta>.pill{flex-shrink:1}.pxmeta>b{flex-shrink:20}
 .pxempty{display:none}
+.pxproc{cursor:pointer}
+.pxprocmore{font-size:10px;color:var(--acc);border-bottom:1px dotted var(--acc);margin-left:4px;white-space:nowrap}
+#pxProcBox{display:none;position:fixed;z-index:9000;background:#161b22;border:1px solid #3a4150;border-radius:8px;
+  padding:10px 12px;font-size:11.5px;line-height:1.45;box-shadow:0 10px 30px rgba(0,0,0,.55);
+  max-height:70vh;overflow:auto}
+#pxProcBox .pxphead{display:flex;gap:8px;align-items:baseline;margin-bottom:8px}
+#pxProcBox .pxpclose{margin-left:auto;cursor:pointer;color:var(--dim);font-size:10.5px;text-decoration:underline}
+#pxProcBox .pxprow{padding:6px 0;border-top:1px solid var(--line)}
+#pxProcBox .pxprow .pill{font-size:10.5px;padding:0 7px}
+#pxProcBox .pxpmeta{color:var(--dim);margin-left:6px;font-size:11px}
+#pxProcBox .pxpword{margin-top:3px;overflow-wrap:anywhere}
+#pxProcBox .pxpfoot{margin-top:8px;font-size:10px;border-top:1px solid var(--line);padding-top:6px}
 .pxrunnone{display:flex;align-items:center;justify-content:center;font-size:11px;padding:6px 0}
 .pxlegend.pxempty{visibility:hidden}
 /* clock, bar and percentage share one row pinned to the bottom of the card, so
@@ -33762,13 +33826,77 @@ function pxSignature(ss){
 // nothing at all to a person, and it left one card's file line starting four
 // characters further along than its neighbour's.
 // WHAT NUARR DID TO THE FILE BEING PLAYED - one line, the summary on hover.
+// THE DETAIL BOX. The processed line had a browser tooltip - one long sentence
+// that vanishes when the pointer moves. Now it opens a box on hover, a click
+// pins it, and it lists every worker that ran on the file in the Concurrency
+// page's names and colours: how often, when last, how long, its last word.
+const PX_WORKER = {encode:'Encode', passthrough:'Remux', subocr:'Subtitle OCR', subs:'Subtitle fix',
+  audio:'Audio tag fix', decode:'Decode check', listen:'Audio listen', subread:'Subtitle track read',
+  submake:'Subtitle maker', subtiming:'Subtitle timing check', verify:'Second opinion', qwen:'Qwen judge'};
+window._pxProcData = window._pxProcData || [];
+let _pxProcPinned = false;
 function pxProcessed(n){
+  const t = pxProcessedText(n);
+  if(!t || !n || !n.workers || !n.workers.length) return t;
+  const id = window._pxProcData.push(n) - 1;
+  return `<span class="pxproc" onmouseenter="pxProcShow(this,${id})" onmouseleave="pxProcHide()"
+    onclick="pxProcPin(event,this,${id})">${t.replace(/ title="[^"]*"/g,'')}
+    <span class="pxprocmore">details</span></span>`;
+}
+function pxProcBox(){
+  let b = document.getElementById('pxProcBox');
+  if(!b){
+    b = document.createElement('div'); b.id = 'pxProcBox';
+    b.onclick = e => e.stopPropagation();
+    document.body.appendChild(b);
+    document.addEventListener('click', () => { _pxProcPinned = false; b.style.display = 'none'; });
+  }
+  return b;
+}
+function pxProcShow(el, id){
+  if(_pxProcPinned) return;
+  const n = window._pxProcData[id]; if(!n) return;
+  const when = t => { if(!t) return ''; const d = new Date(t*1000);
+    return d.toLocaleDateString([], {month:'short', day:'numeric'}) + ' '
+      + d.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'}); };
+  const took = s => s < 1 ? 'under 1s' : s < 90 ? Math.round(s)+'s' : s < 5400 ? Math.round(s/60)+' min'
+                  : (s/3600).toFixed(1)+' h';
+  const rows = n.workers.map(w => {
+    const c = poolColor(w.pool);
+    const bad = w.state === 'failed' ? ' <span class="pxwarn">failed</span>'
+              : w.state === 'skipped' ? ' <span class="dim">skipped</span>' : '';
+    return `<div class="pxprow"><span class="pill" style="color:${c};border-color:${c}">${esc(PX_WORKER[w.pool]||w.pool)}</span>
+      <span class="pxpmeta">${w.n > 1 ? w.n + ' runs \u00b7 last ' : ''}${esc(when(w.at))} \u00b7 ${took(w.secs)}${w.n > 1 ? ' in all' : ''}${bad}</span>
+      <div class="pxpword">${esc(w.word || 'nothing to report')}</div></div>`;
+  }).join('');
+  const b = pxProcBox();
+  b.innerHTML = `<div class="pxphead"><b>What nuarr ran on this file</b>
+      <span class="dim">${n.workers.length} worker${n.workers.length===1?'':'s'}${
+        (n.pending&&n.pending.length) ? ' \u00b7 waiting: ' + esc(n.pending.join(', ')) : ''}</span>
+      <span class="pxpclose" onclick="_pxProcPinned=false;this.closest('#pxProcBox').style.display='none'">close</span></div>`
+    + (n.replaced ? `<div class="pxpword pxwarn" style="margin:0 0 6px">The file this viewer is still playing was replaced
+        while the stream was open - this is the replacement: ${esc(n.replaced)}</div>` : '')
+    + rows + `<div class="pxpfoot dim">hover to look \u00b7 click the line to keep this open</div>`;
+  b.style.display = 'block';
+  const r = el.getBoundingClientRect(), bw = Math.min(460, window.innerWidth - 16);
+  b.style.width = bw + 'px';
+  b.style.left = Math.max(8, Math.min(r.left, window.innerWidth - bw - 8)) + 'px';
+  const bh = b.offsetHeight;
+  b.style.top = (r.bottom + 6 + bh > window.innerHeight && r.top - bh - 6 > 0 ? r.top - bh - 6 : r.bottom + 6) + 'px';
+}
+function pxProcHide(){ if(!_pxProcPinned){ const b = document.getElementById('pxProcBox'); if(b) b.style.display = 'none'; } }
+function pxProcPin(ev, el, id){
+  ev.stopPropagation();                 // the card's own click opens/closes every card
+  if(_pxProcPinned){ _pxProcPinned = false; pxProcHide(); return; }
+  pxProcShow(el, id); _pxProcPinned = true;
+}
+function pxProcessedText(n){
   if(!n) return '';
   if(!n.known) return n.gone
     ? '<span class="pxwarn">this file has been removed since the stream began</span>'
     : '<span class="dim">not in nuarr\u2019s library</span>';
   if(n.replaced){
-    const rest = pxProcessed(Object.assign({}, n, {replaced: ''}));
+    const rest = pxProcessedText(Object.assign({}, n, {replaced: ''}));
     return `<span class="pxwarn" title="The file this viewer is still playing no longer exists - it was replaced while the stream was open. Plex keeps serving what the player already buffered; the details here are the replacement's.">replaced since this stream began</span>
       <span class="dim">\u2014 now</span> <span class="mono dim" style="overflow-wrap:anywhere">${esc(n.replaced)}</span><br>${rest}`;
   }
@@ -34046,6 +34174,7 @@ function pxToggle(){
 function pxRender(ss){
   const el = document.getElementById('plexCards');
   if(!el) return;
+  if(!_pxProcPinned) window._pxProcData = [];
   el.innerHTML = ss.map((s,i)=>{
     const col = PLAYCOL[s.decision] || 'var(--dim)';
     const how = s.decision === 'direct play' ? 'direct play'

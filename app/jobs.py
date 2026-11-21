@@ -1628,7 +1628,23 @@ def cache_probe(file_id: int, data: dict, changed: bool = True) -> None:
                                  (file_id,)).fetchone()
             _ip = (_r["path"] if _r else "") or ""
         if changed:
-            audiolang.invalidate(file_id, _ip)
+            # A SUBTITLE REWRITE'S OWN PROBE (2026-11-20 audit). A subs /
+            # sub_ocr / submake job swaps the file in, and _finish restamps
+            # the listen verdicts a few seconds later - but this probe lands
+            # in between, saw verdicts stamped for the old bytes and deleted
+            # them; the restamp then had nothing to stamp. Betterman S01E02:
+            # swapped 04:24:55, finished 04:24:59, verdict gone - listened to
+            # 3 times and then held as a loop, 13 files stuck in the queue.
+            # Only subtitle tracks changed, so the verdicts are restamped here.
+            with cursor() as cur:
+                _subrw = cur.execute(
+                    "SELECT 1 FROM jobs WHERE file_id=? AND kind IN ('subs','sub_ocr','submake') "
+                    "   AND (state='running' OR (state='done' AND finished_at > ?)) LIMIT 1",
+                    (file_id, time.time() - 120)).fetchone()
+            if _subrw and _ip:
+                audiolang.restamp(file_id, _ip)
+            else:
+                audiolang.invalidate(file_id, _ip)
     except Exception:                                    # noqa: BLE001
         pass
 
@@ -6585,10 +6601,21 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
     _conv_min = float(((getattr(job.plan, "venc", None) or {}).get("min_saving")) or 0)
     if _conv_min:
         grow_ok = False
+    # THE BURN HAS TO HAPPEN ANYWAY (2026-11-20 audit). A plan that burns
+    # subtitles in re-encodes the picture whatever the size comes to; when a
+    # library conversion rode along it was held to the conversion's 20 %, so
+    # the encode was thrown away, the file marked done with nothing burned in,
+    # and the burn encoded a second time as plain H.264: 439 discarded burns,
+    # 75 encoder-hours, in one week. Not a free pass - a burn + conversion that
+    # comes out LARGER than the source is still discarded and falls back to
+    # that path - but one that does not grow is kept: the same burn, one
+    # encode, and a better codec.
+    _burning = getattr(job.plan, "burn_index", None) is not None
+    _need = 0.0 if (_conv_min and _burning) else max(MIN_SAVING, _conv_min)
     if grow_ok:
         limit, how = growth_allowance(job.plan, size_before)
     else:
-        limit, how = (1.0 - max(MIN_SAVING, _conv_min)), "a shrink has to shrink"
+        limit, how = (1.0 - _need), "a shrink has to shrink"
     if job.plan.encode and ratio > limit:
         await asyncio.to_thread(_rm, out)
         if grow_ok:
@@ -6604,8 +6631,9 @@ async def _transcode(w: Worker, probe_data: dict) -> None:
         else:
             msg = (f"discarded: re-encode produced {ratio*100:.0f}% of the "
                    f"original ({size_before/1024**2:.0f} MB -> "
-                   f"{size_after/1024**2:.0f} MB); needs to save at least "
-                   f"{max(MIN_SAVING, _conv_min)*100:.0f}% to be worth keeping")
+                   f"{size_after/1024**2:.0f} MB); "
+                   + (f"needs to save at least {_need*100:.0f}% to be worth keeping" if _need
+                      else "a burn with a conversion must not come out larger than the source"))
             reason = "re-encode would not shrink it"
         joblog.log(msg, "warn", job.id)
         with cursor() as cur:
