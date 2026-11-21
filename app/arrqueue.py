@@ -554,6 +554,119 @@ def _import_known(items: list) -> list:
     return rows
 
 
+# ------------------------------------------ one file, and its length agrees --
+# THREE ROWS SAT FINISHED FOR DAYS (2026-11-20), "kept for a person":
+#   Slime the Movie - Scarlet Bond     "Unable to parse file"            S00E09
+#   Saga of Tanya the Evil - the Movie "Invalid season or episode"       S00E15
+#   Vixen S01 (one 30-minute file)     "Single episode file contains all
+#                                       episodes in seasons"             S01E01-06
+# In each the arr had already said which episode the grab was for - the queue
+# row carries it - and then would not read the FILE's name. A film filed as a
+# special never has an episode number in its name; a season cut into one file
+# has no single number to give. What a person does is look at how long it runs.
+# So does this: the download holds exactly one video, and
+#   one row  -> the file runs as long as that episode (within RUNTIME_SLACK,
+#               and at least RUNTIME_FLOOR_MIN, so a 24-minute episode's id
+#               cannot adopt a film by accident - see _import_known for how a
+#               wrong id happens) -> imported for it;
+#   several  -> the file runs as long as the episodes added together. If none
+#               of them has a file it is imported as one multi-episode file;
+#               if they already have their own files the pack is not an
+#               upgrade worth having - six episodes would become one entry -
+#               and it is removed and blocklisted.
+# Anything else stays for a person, as before. Each download is tried once.
+RUNTIME_SAYS = ("unable to parse file", "invalid season or episode",
+                "single episode file contains all episodes")
+RUNTIME_SLACK = 0.10
+RUNTIME_FLOOR_MIN = 40.0      # one row: only a film-length special is taken on its length alone
+KV_RUNTIME = "arrqueue.runtime_tried"
+
+
+def _minutes(path: str) -> float:
+    import subprocess
+    from .jobs import _ffprobe_exe
+    try:
+        r = subprocess.run([_ffprobe_exe(), "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+                           capture_output=True, text=True, timeout=120, creationflags=0x08000000 if os.name == "nt" else 0)
+        return float((r.stdout or "0").strip() or 0) / 60.0
+    except Exception:                                            # noqa: BLE001
+        return 0.0
+
+
+def _import_by_runtime(queues: list) -> tuple[list, set, set]:
+    """(rows for the log, queue ids dealt with, download ids to keep tracked)."""
+    from .db import kv_get, kv_set
+    out, gone, keep = [], set(), set()
+    try:
+        tried = set(json.loads(kv_get(KV_RUNTIME) or "[]"))
+    except Exception:                                            # noqa: BLE001
+        tried = set()
+    for a, rows in queues:
+        if a.kind != "sonarr":
+            continue
+        by: dict = {}
+        for r in rows:
+            if (r.get("status") or "") != "completed" or (r.get("sizeleft") or 0) > 0:
+                continue
+            if not (r.get("seriesId") and r.get("episodeId") and r.get("downloadId")):
+                continue
+            low = " | ".join(m for st in (r.get("statusMessages") or [])
+                             for m in list(st.get("messages") or [])).lower()
+            if any(k in low for k in RUNTIME_SAYS):
+                by.setdefault(str(r["downloadId"]), []).append((r, low))
+        for did, grp in by.items():
+            if did in tried:
+                continue
+            row0 = grp[0][0]
+            name = row0.get("title") or ""
+            try:
+                cands = _video_cands(a, row0)
+                if len(cands) != 1:
+                    continue                       # more than one video: not this rule's case
+                c = cands[0]
+                mins = _minutes(c["path"])
+                eps = [_call(a, f"/api/v3/episode/{r['episodeId']}") or {} for r, _ in grp]
+                want = sum(float(e.get("runtime") or 0) for e in eps)
+                if not mins or not want or abs(mins - want) > max(1.5, want * RUNTIME_SLACK):
+                    STATS["detail"].append(f"{a.name}: {name[:60]} - runs {mins:.0f} min, the episode(s) {want:.0f} - left for you")
+                    continue
+                packed = len(grp) > 1
+                if not packed and want < RUNTIME_FLOOR_MIN:
+                    continue
+                tried.add(did)
+                if packed and any(e.get("hasFile") for e in eps):
+                    for r, _ in grp[:1]:
+                        _remove(a, r, blocklist=True)
+                    for r, _ in grp:
+                        gone.add(r.get("id"))
+                    out.append({"at": time.time(), "arr": a.name, "title": name, "client": row0.get("downloadClient") or "",
+                                "kind": "misgrab",
+                                "why": f"one {mins:.0f}-minute file holding {len(grp)} episodes that already have files of "
+                                       "their own - not worth turning them into one entry; removed and blocklisted"})
+                    STATS["detail"].append(f"{a.name}: removed {name[:60]} - one file for {len(grp)} episodes that have their own")
+                    continue
+                f = {"path": c["path"], "quality": c.get("quality"), "languages": c.get("languages") or [],
+                     "releaseGroup": c.get("releaseGroup") or "", "downloadId": row0.get("downloadId") or "",
+                     "seriesId": row0["seriesId"], "episodeIds": [r["episodeId"] for r, _ in grp]}
+                _call(a, "/api/v3/command", "POST", {"name": "ManualImport", "files": [f], "importMode": "auto"})
+                for r, _ in grp:
+                    gone.add(r.get("id"))
+                keep.add(did)
+                what = (f"{len(grp)} episodes in one file" if packed else "the episode the arr grabbed it for")
+                out.append({"at": time.time(), "arr": a.name, "title": name, "client": row0.get("downloadClient") or "",
+                            "kind": "parsed",
+                            "why": f"the arr would not read the file's name; it holds one video that runs {mins:.0f} min, "
+                                   f"as long as {what} ({want:.0f} min) - imported for it"})
+                STATS["detail"].append(f"{a.name}: imported {name[:60]} by its length ({mins:.0f} min)")
+            except Exception as e:                               # noqa: BLE001
+                STATS["detail"].append(f"{a.name}: {name[:60]} - by length: {type(e).__name__}: {e}"[:160])
+    try:
+        kv_set(KV_RUNTIME, json.dumps(sorted(tried)[-500:]))
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out, gone, keep
+
+
 # ------------------------------------- refused for its shape, not its worth --
 # "Episode file on disk contains more episodes than this file contains": a
 # 2160p single refused because a 1080p DOUBLE (E09-E10) sits on disk. "Episode
@@ -959,12 +1072,25 @@ def _pass() -> str:
     # and the client sweep would then take them as untracked - an import in
     # flight deleted because Sonarr was slow to answer. No sweep this pass.
     sweep_ok = len(queues) == len(arrs)
+    # ONE FILE, AND ITS LENGTH AGREES - see _import_by_runtime. Before the
+    # readers below, which have already given these up once.
+    try:
+        rt_rows, rt_gone, rt_keep = _import_by_runtime(queues)
+    except Exception as e:                                       # noqa: BLE001
+        rt_rows, rt_gone, rt_keep = [], set(), set()
+        STATS["detail"].append(f"imports by length: {type(e).__name__}: {e}"[:160])
+    for d_ in rt_keep:                     # an import in flight is not an untracked download
+        tracked.add(str(d_).upper())
+        tracked.add(str(d_))
+    if rt_gone:
+        queues = [(a, [r for r in rows if r.get("id") not in rt_gone]) for a, rows in queues]
     unread = [(a, r) for a, rows in queues for r in rows if _unread(a, r)]
     if unread:
         new_parsed = _import_known(unread)
         new_parsed += _import_unread([(a, r) for a, r in unread if not r.get("_nuarr_imported")])
     else:
         new_parsed = []
+    new_parsed = rt_rows + new_parsed
     # A FULLER COPY NUARR FETCHED is "not a Custom Format upgrade" to the arr
     # by design - see bitcut.py. It is imported by hand here, and left out of
     # everything below, which would otherwise clear it as exactly that.

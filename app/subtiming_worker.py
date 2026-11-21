@@ -812,8 +812,34 @@ def _word_times(src: str, a_ord: int, lang: str, t0: float) -> list:
     """[(word, absolute seconds)] for one window of one audio track."""
     if _WM["m"] is None:
         from faster_whisper import WhisperModel
-        _WM["m"] = WhisperModel("small", device="cpu", compute_type="int8", cpu_threads=4,
-                                download_root=WORD_MODEL_DIR, local_files_only=True)
+        # THE CARD WHEN IT WILL HAVE IT: "small" is about a gigabyte there and
+        # hears a 45-minute episode in under a minute; on the CPU the same is
+        # ten. Any failure to load it there falls back, the same as the
+        # Subtitle maker does.
+        try:
+            if os.environ.get("NUARR_WORDS_CPU"):
+                raise RuntimeError("cpu asked for")
+            # the pip-installed CUDA DLLs are found by plain name, so they
+            # have to be on PATH - see audiolang._add_cuda_dirs
+            import glob as _glob
+            import site as _site
+            _dirs = [d for sp in _site.getsitepackages() for d in _glob.glob(os.path.join(sp, "nvidia", "*", "bin"))]
+            if _dirs:
+                os.environ["PATH"] = os.pathsep.join(_dirs) + os.pathsep + os.environ.get("PATH", "")
+                for d in _dirs:
+                    try:
+                        os.add_dll_directory(d)
+                    except (OSError, AttributeError):
+                        pass
+            _m = WhisperModel("small", device="cuda", compute_type="float16",
+                              download_root=WORD_MODEL_DIR, local_files_only=True)
+            # loading is not proof - the first encode is where a missing DLL shows
+            list(_m.transcribe(np.zeros(16000, np.float32), language="en")[0])
+            _WM["m"], _WM["dev"] = _m, "cuda"
+        except Exception:                                        # noqa: BLE001
+            _WM["m"] = WhisperModel("small", device="cpu", compute_type="int8", cpu_threads=4,
+                                    download_root=WORD_MODEL_DIR, local_files_only=True)
+            _WM["dev"] = "cpu"
     ff = _ff()[0]
     raw = subprocess.run([ff, "-v", "error", "-ss", f"{t0:.2f}", "-t", f"{WORD_LEN:.0f}", "-i", src, "-map",
                           f"0:a:{a_ord}", "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
@@ -915,6 +941,23 @@ def retime_words(src: str, dur: float, ord_: int, a_ord: int, lang: str) -> tupl
         if i and c["na"] < cues[i - 1]["na"] + 0.05:
             c["na"] = cues[i - 1]["na"] + 0.05
             c["nb"] = max(c["nb"], c["na"] + 0.7)
+    # AND UP LONG ENOUGH TO READ. The damage that started this (9-1-1 S10E06,
+    # Amazon's own file) was not only where the lines stood: 212 of 911 lasted
+    # under half a second - "You can come in." for 0.07 s. Moved onto its
+    # words such a line is on time and still gone before it can be read. A
+    # line gets 0.9 s plus 0.06 s a character (1.2 - 6 s), or as much of that
+    # as fits before the next line starts.
+    longer = 0
+    for i, c in enumerate(cues):
+        seen = re.sub(r"<[^>]+>|\{[^}]*\}", "", c["text"])
+        need = min(6.0, max(1.2, 0.9 + 0.06 * len(seen)))
+        if c["nb"] - c["na"] >= need:
+            continue
+        room = (cues[i + 1]["na"] - 0.05) if i + 1 < len(cues) else c["na"] + need
+        new_b = max(c["nb"], min(c["na"] + need, room))
+        if new_b > c["nb"] + 0.05:
+            c["nb"] = new_b
+            longer += 1
     for i, c in enumerate(cues[:-1]):
         if c["nb"] > cues[i + 1]["na"] - 0.02 and c["b"] <= cues[i + 1]["a"] + 0.05:
             c["nb"] = max(c["na"] + 0.5, cues[i + 1]["na"] - 0.02)
@@ -925,6 +968,7 @@ def retime_words(src: str, dur: float, ord_: int, a_ord: int, lang: str) -> tupl
     out = "".join(f"{i + 1}\r\n{ts(c['na'])} --> {ts(c['nb'])}\r\n{c['text']}\r\n\r\n" for i, c in enumerate(cues))
     shifts = sorted(abs(c["shift"]) for c in found)
     stats = {"cues": len(cues), "found": len(found), "moved": moved, "rode": rode, "left": left,
+             "longer": longer, "spoken": sum(1 for c in cues if len(c["w"]) >= 2), "device": _WM.get("dev", ""),
              "was_off": sum(1 for x in shifts if x >= 0.8),
              "median_move": round(shifts[len(shifts) // 2], 2) if shifts else None,
              "biggest": [{"at": round(c["a"], 1), "by": round(c["shift"], 2), "text": c["text"][:60]}
@@ -940,6 +984,7 @@ def words_stage(src: str, dur: float, tracks: list) -> None:
     """Confirm every track about to be called out of step against the spoken words."""
     import difflib
     todo = [t for t in tracks if t.get("verdict") in ("offset", "drift", "piecewise", "messy")
+            + (("ok", "unsure") if os.environ.get("NUARR_WORDS_ALWAYS") else ())
             and "audio_ord" in t and WORD_LANGS.get((t.get("lang") or "").lower())
             and WORD_LANGS.get((t.get("lang") or "").lower()) == WORD_LANGS.get((t.get("audio_lang") or "").lower())]
     if not todo or not os.path.isdir(WORD_MODEL_DIR):
@@ -1149,6 +1194,15 @@ def main() -> int:
         except Exception as e:                                   # noqa: BLE001
             for t in todo:
                 t.setdefault("words", {"note": f"word check failed: {type(e).__name__}: {e}"[:160]})
+        # WHAT THE LINE-BY-LINE REPAIR MAY BE TRIED ON: a SubRip track, in the
+        # language being spoken, that is still uneven or messy after all of the
+        # above. Tried, not trusted - subtiming.check_one keeps the result only
+        # when the rebuilt track reads in step against the words.
+        for t in todo:
+            lg = WORD_LANGS.get((t.get("lang") or "").lower())
+            if (t.get("verdict") in ("uneven", "messy") and t.get("codec") in ("subrip", "srt") and lg
+                    and lg == WORD_LANGS.get((t.get("audio_lang") or "").lower()) and os.path.isdir(WORD_MODEL_DIR)):
+                t["retime_ok"] = True
     print(json.dumps({"ok": True, "duration": dur, "speech_min": round(float(sp.sum()) * STEP / 60, 1),
                       "audio": [lg for _, lg in a_list], "sampled": sampled,
                       "heard_min": round(sum(b - a for a, b in WINDOWS) / 60, 1), "tracks": tracks}))

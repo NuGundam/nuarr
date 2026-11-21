@@ -116,7 +116,7 @@ def _bitrate_cuts() -> dict | None:
     if not rows:
         return None
     return {"what": "bitrate cuts", "n": len(rows), "note": f"{len(rows)} upgrades cut the picture",
-            "goto": "/settings#arrs@bcBox",
+            "goto": "/settings#janitor@bcBox",
             "items": [{"title": x.get("label") or "",
                        "detail": f"kept {round((x.get('share') or 0) * 100)}% of the picture - "
                                  + ("nothing fuller found" if x.get("state") == "none"
@@ -132,7 +132,7 @@ def _ban_collisions() -> dict | None:
     if not left:
         return None
     return {"what": "banned terms", "n": len(left), "note": "a banned term also matches a show title",
-            "goto": "/settings#arrs@job-release_ban",
+            "goto": "/settings#janitor@job-release_ban",
             "items": [{"title": f"{c.get('value')}", "detail": f"matches the title \"{c.get('title')}\""}
                       for c in left[:6]]}
 
@@ -159,7 +159,7 @@ def _download_leftovers() -> dict | None:
         return None
     return {"what": "download leftovers", "n": len(rows),
             "note": f"{len(rows)} left in the download folder with video in them",
-            "goto": "/settings#arrs@dlBox",
+            "goto": "/settings#janitor@dlBox",
             "items": [{"title": r["name"], "detail": f"{r['n_videos']} video(s), "
                        f"{round(r['size'] / 1e9, 1)} GB, {round(r['age_h'])} h old"} for r in rows[:6]]}
 

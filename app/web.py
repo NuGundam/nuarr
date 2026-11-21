@@ -30346,7 +30346,7 @@ const GATE_META={
     what:'Nuarr\u2019s own search for a replacement. It asks every indexer Prowlarr has, ranks the results by the arr\u2019s own quality profile, and for a series weighs a season pack against the single episode.',
     on:'A replacement is searched for as soon as a rejected file is deleted, and the arrs\u2019 wanted lists are swept for what their own searches have not filled. The winner is pushed to the arr, which downloads and imports it itself - a release the arr refuses (blocklisted, banned, over a size limit) is skipped for the next one.',
     off:'Nuarr never searches. A rejected file waits for the arr\u2019s own RSS sync or a search you start yourself.',
-    note:'Settings \u2192 Arrs shows what it searched for and what it found.'},
+    note:'Settings \u2192 Janitor shows what it searched for and what it found.'},
   'subdupe.enabled':{
     label:'Remove duplicate subtitle tracks',
     what:'One subtitle track per language and kind. A file can end up with the same subtitle two or three times - the same language and the same kind (full, forced, SDH). This sweep takes the extra copies out.',
@@ -31031,6 +31031,7 @@ function commitNum(key, el){
 // itself.
 const PANE_OF = {ffmpeg:'ffPane', backup:'bkPane',  rules:'rulesPane',
                  mkv:'mkvPane',   arrs:'arrsPane',  meta:'metaPane',
+                 janitor:'janitorPane',
                  gate:'gatePane', logs:'logsPane', jobs:'jobsPane',
                  health:'healthPane',
                  lang:'langPane', libs:'libPane',
@@ -31453,6 +31454,12 @@ function wtab(which){
   if(isAr){
     if(hint) hint.textContent='· arrs';
     paneLoad('arrs', loadArrsTab);
+    return;
+  }
+  if(which==='janitor'){
+    // the custom arr scripts - drawn by the same loader, into their own page
+    if(hint) hint.textContent='· janitor';
+    paneLoad('janitor', loadArrsTab);
     return;
   }
   if(isMk){
@@ -50428,6 +50435,9 @@ async function arrSyncFix(){
 let _arrsRefreshT=null;
 function arrsBusyEditing(){
   const body=document.getElementById('arrsBody'); if(!body) return true;
+  const jb_=document.getElementById('janitorBody'), a_=document.activeElement;
+  if(jb_ && a_ && jb_.contains(a_) && /^(INPUT|TEXTAREA|SELECT)$/.test(a_.tagName) && a_.type!=='checkbox') return true;
+  if(jb_ && [...jb_.querySelectorAll('[id^="pick-"]')].some(e=>e.style.display!=='none')) return true;
   const a=document.activeElement;
   if(a && body.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.type!=='checkbox') return true;
   if([...body.querySelectorAll('[id^="pick-"]')].some(e=>e.style.display!=='none')) return true;
@@ -50436,7 +50446,8 @@ function arrsBusyEditing(){
   return false;
 }
 async function arrsRefresh(){
-  const body=document.getElementById('arrsBody');
+  const body0=document.getElementById('arrsBody'), jb0=document.getElementById('janitorBody');
+  const body=(jb0 && jb0.offsetParent!==null) ? jb0 : body0;     // whichever of the two pages is showing
   if(!body || body.offsetParent===null || document.hidden || arrsBusyEditing()) return;
   const keep=[...body.querySelectorAll('.scrollbox, .rowbox')].map(e=>e.scrollTop);
   await loadArrsTab(true);
@@ -50685,7 +50696,7 @@ async function loadArrsTab(refresh){
         <span id="hookmsg" class="dim" style="font-size:11px"></span>
         <div id="hookstate" class="dim" style="margin-top:5px;font-size:11px"></div>
       </div>`], ['head', `<div style="margin:22px 0 10px;padding-top:14px;border-top:2px solid var(--line)">
-        <div style="font-size:15px;font-weight:600">Custom arrs scripts</div>
+        <div style="font-size:15px;font-weight:600">Janitor - custom arrs scripts</div>
         <div class="dim" style="font-size:11px;margin-top:3px;max-width:70ch">
           Optional jobs that keep something in Radarr/Sonarr the way you decided
           it, against a tool that would otherwise overwrite it. Each is off until
@@ -50696,7 +50707,10 @@ async function loadArrsTab(refresh){
   const scripts=[...cards.map(([k,h])=>[k, h.replace('</b>', '</b>'+chip(k))]),
     ['bcBox', `${chip('bcBox')?`<div style="margin:2px 0 4px">${chip('bcBox')}</div>`:''}<div id="bcBox" style="margin-top:12px"></div>`]]
     .sort((x,y)=>rank(x[0])-rank(y[0]));
-  const all=[...parts, ...scripts];
+  // TWO PAGES FROM ONE LOAD (2026-11-20): the Arrs page keeps what is about the
+  // connection (running, webhooks); the scripts - and their heading - are the
+  // Janitor page. One fetch, one set of cards, painted where each belongs.
+  const paintInto=(el,all)=>{
   const fresh=!el.querySelector(':scope > [data-k]');
   if(fresh){
     el.innerHTML=all.map(([k,h])=>`<div data-k="${k}">${h}</div>`).join('');
@@ -50721,6 +50735,13 @@ async function loadArrsTab(refresh){
       el.appendChild(w);
     });
   }
+  return fresh; };
+  const jel=document.getElementById('janitorBody');
+  let fresh;
+  if(jel){
+    paintInto(el, parts.filter(p=>p[0]!=='head'));
+    fresh=paintInto(jel, [...parts.filter(p=>p[0]==='head'), ...scripts]);
+  } else fresh=paintInto(el, [...parts, ...scripts]);
   loadHookState();
   if(fresh) _bcKey='';       // the box is new and empty - paint it whatever the data says
   bcLoad();
@@ -53172,6 +53193,7 @@ _SETTINGS_NAV = [
                     ("qwen",    "Qwen",            "language"),
                     ("ocr",     "OCR engines",     "language")]),
     ("Integrations", [("arrs", "Arrs",             "link"),
+                      ("janitor", "Janitor",       "tool"),
                       ("indexers", "Prowlarr & indexers", "search"),
                       ("groups", "Release groups", "list"),
                       ("plex", "Plex",             "play"),

@@ -247,7 +247,7 @@ def waiting() -> int:
 
 
 # ---------------------------------------------------------------- measure ----
-def _measure(path: str, tracks: str = "", check_only: bool = False) -> dict:
+def _measure(path: str, tracks: str = "", check_only: bool = False, words_always: bool = False) -> dict:
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     py = sys.executable
     if py.lower().endswith("pythonw.exe"):
@@ -261,7 +261,8 @@ def _measure(path: str, tracks: str = "", check_only: bool = False) -> dict:
     st, key = _st(), _key()      # the reader thread below is not this worker's thread
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
                          errors="replace", cwd=root, creationflags=NO_WINDOW | 0x00004000,   # below normal
-                         startupinfo=hidden_si(), stdin=subprocess.DEVNULL)
+                         startupinfo=hidden_si(), stdin=subprocess.DEVNULL,
+                         env=(dict(os.environ, NUARR_WORDS_ALWAYS="1") if words_always else None))
     _out.set_pid(key, p.pid)
     # PROGRESS AS IT GOES: the worker says "PROG i/n what" on stderr per piece
     base, span = (82.0, 8.0) if check_only else (5.0, 30.0)
@@ -294,6 +295,53 @@ def _measure(path: str, tracks: str = "", check_only: bool = False) -> dict:
         return json.loads((out or "").strip().splitlines()[-1])
     except Exception:                                            # noqa: BLE001
         return {"ok": False, "why": ([e.strip() for e in errs if e.strip()] or ["the measurement said nothing"])[-1][:300]}
+
+
+def _retime(path: str, ords: list) -> dict:
+    """{ord: {"text", stats...}} - each named track rewritten line by line onto
+    its words (subtiming_worker.retime_words). Nothing is changed here."""
+    import tempfile
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    py = sys.executable
+    if py.lower().endswith("pythonw.exe"):
+        py = py[:-5] + ".exe" if os.path.exists(py[:-5] + ".exe") else py
+    out: dict = {}
+    st, key = _st(), _key()
+    from . import outside as _out
+    with tempfile.TemporaryDirectory(prefix="nuarr_retime_") as td:
+        p = subprocess.Popen([py, "-m", "app.subtiming_worker", "--src", path, "--tracks",
+                              ",".join(str(o) for o in ords), "--retime-out", td],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                             errors="replace", cwd=root, creationflags=NO_WINDOW | 0x00004000,
+                             startupinfo=hidden_si(), stdin=subprocess.DEVNULL)
+        _out.set_pid(key, p.pid)
+
+        def _err():
+            for ln in p.stderr:
+                if ln.startswith("PROG "):
+                    try:
+                        i, n = ln.split()[1].split("/")
+                        st["pct"] = 36.0 + 40.0 * int(i) / max(1, int(n))
+                        st["stage"] = "hearing every line"
+                    except Exception:                            # noqa: BLE001
+                        pass
+        th = threading.Thread(target=_err, daemon=True)
+        th.start()
+        try:
+            so, _ = p.communicate(timeout=WORKER_TIMEOUT * 2)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            return {}
+        th.join(5)
+        try:
+            res = json.loads((so or "").strip().splitlines()[-1])
+        except Exception:                                        # noqa: BLE001
+            return {}
+        for t in res.get("tracks") or []:
+            if t.get("ok") and os.path.exists(t.get("file") or ""):
+                t["text"] = io.open(t["file"], encoding="utf-8", newline="").read()
+                out[int(t["ord"])] = t
+    return out
 
 
 def _ratio(k: float) -> str:
@@ -530,7 +578,11 @@ def fix_piecewise(file_id: int, path: str, tracks: list) -> dict:
                     return {"ok": False, "why": f"could not read track {t['ord'] + 1} out: {(r[2] or '').strip()[:200]}"}
                 txt = io.open(raw, encoding="utf-8", errors="replace").read()
                 pieces = t.get("pieces") or [{"to": None, "k": float(t.get("rate", 1.0)), "d": float(t.get("offset", 0.0))}]
-                new, moved, dropped = _retime_text(txt, ass, pieces, t.get("drops") or [])
+                if t.get("text") is not None:
+                    # rewritten line by line onto its words already - see _retime
+                    new, moved, dropped = t["text"], int(t.get("moved_n") or 0) + int(t.get("longer_n") or 0), 0
+                else:
+                    new, moved, dropped = _retime_text(txt, ass, pieces, t.get("drops") or [])
                 if moved < 10:
                     return {"ok": False, "why": f"track {t['ord'] + 1}: only {moved} cues could be retimed - not touched"}
                 io.open(raw, "w", encoding="utf-8", newline="").write(new)
@@ -563,7 +615,23 @@ def fix_piecewise(file_id: int, path: str, tracks: list) -> dict:
                 return {"ok": False, "why": (r.stderr or r.stdout or "mkvmerge failed").strip()[:300]}
             # 3. EXIT 0 IS NOT PROOF: measure the rebuilt file the same way
             st.update(stage="measuring the result", pct=82)
-            chk = _measure(tmp, ",".join(str(t["ord"]) for t in tracks), check_only=True)
+            by_words = any(t.get("text") is not None for t in tracks)
+            if by_words:
+                # A LINE-BY-LINE REWRITE IS JUDGED BY THE WORDS. The pattern
+                # match is what could not read this track in the first place.
+                chk = _measure(tmp, ",".join(str(t["ord"]) for t in tracks), words_always=True)
+                for t in (chk.get("tracks") or []):
+                    wd = t.get("words") or {}
+                    if wd.get("n", 0) >= 15 and (wd.get("near") or 0) >= 0.85 and -0.6 <= (wd.get("median") or 9) <= 0.3:
+                        t["verdict"] = "ok"
+                    elif t.get("verdict") == "ok" and "median" not in wd:
+                        pass                    # the pattern match alone calls it in step
+                    else:
+                        t["verdict"] = t.get("verdict") if t.get("verdict") != "ok" else "uneven"
+                        t["why"] = (f"by the words {int(round((wd.get('near') or 0) * 100))}% of lines are within 0.8s "
+                                    f"(median {wd.get('median')}s)") if "median" in wd else (t.get("why") or "")
+            else:
+                chk = _measure(tmp, ",".join(str(t["ord"]) for t in tracks), check_only=True)
             bad = [t for t in (chk.get("tracks") or []) if t.get("verdict") != "ok"]
             if not chk.get("ok") or bad or len(chk.get("tracks") or []) != len(tracks):
                 why = "; ".join(f"track {t['ord'] + 1}: {t.get('why', '')}" for t in bad) or chk.get("why") or "the check failed"
@@ -645,6 +713,30 @@ def check_one(row: dict, act: bool | None = None, w=None) -> dict:
         else:
             kinds = [t.get("verdict") for t in tracks]
             fixable = [t for t in tracks if t.get("verdict") in ("offset", "drift", "piecewise")]
+            # LINE BY LINE, WHERE NOTHING ELSE FITS (2026-11-20, Erik: "the goal
+            # is to fix as many files as possible"). A track still uneven or
+            # messy that the worker says can be read against its words is
+            # rewritten one line at a time; fix_piecewise then keeps it only if
+            # the rebuilt track is in step by those words.
+            wordy = [t for t in tracks if t.get("retime_ok")] if act else []
+            if wordy:
+                st.update(stage="hearing every line", pct=36)
+                got = _retime(path, [t["ord"] for t in wordy])
+                for t in wordy:
+                    g = got.get(int(t["ord"]))
+                    if not g or not g.get("text"):
+                        continue
+                    spoken = max(1, int(g.get("spoken") or 0))
+                    t["retime"] = {k_: g.get(k_) for k_ in ("cues", "found", "moved", "rode", "longer", "spoken",
+                                                            "device", "median_move", "was_off")}
+                    if (g.get("found") or 0) < 0.5 * spoken or (int(g.get("moved") or 0) + int(g.get("longer") or 0)) < 10:
+                        continue               # too little of it could be found in the speech
+                    t.update(text=g["text"], moved_n=g.get("moved"), longer_n=g.get("longer"), was=t["verdict"],
+                             verdict="piecewise",
+                             why=(f"timed line by line onto the spoken words: {g.get('moved')} of {g.get('cues')} lines "
+                                  f"moved, {g.get('longer')} given long enough to read"))
+                    fixable.append(t)
+                kinds = [t.get("verdict") for t in tracks]
             verdict = ("piecewise" if "piecewise" in kinds else "drift" if "drift" in kinds
                        else "offset" if "offset" in kinds else "messy" if "messy" in kinds
                        else "uneven" if "uneven" in kinds
@@ -654,10 +746,12 @@ def check_one(row: dict, act: bool | None = None, w=None) -> dict:
                 # when there is one, every fixable track goes that way (an
                 # offset or a rate is a one-piece map). Otherwise mkvmerge's
                 # --sync does the whole job without touching the text.
-                if any(t.get("pieces") for t in fixable):
+                if any(t.get("pieces") or t.get("text") is not None for t in fixable):
                     f = fix_piecewise(fid, path, [{"ord": t["ord"], "pieces": t.get("pieces"), "drops": t.get("drops"),
                                                    "offset": float(t.get("offset") or 0.0),
-                                                   "rate": float(t.get("rate") or 1.0)} for t in fixable])
+                                                   "rate": float(t.get("rate") or 1.0), "text": t.get("text"),
+                                                   "moved_n": t.get("moved_n"), "longer_n": t.get("longer_n")}
+                                                  for t in fixable])
                 else:
                     f = fix(fid, path, [{"ord": t["ord"], "offset": float(t["offset"]), "rate": float(t["rate"])}
                                         for t in fixable])
@@ -674,6 +768,9 @@ def check_one(row: dict, act: bool | None = None, w=None) -> dict:
                                + "; ".join(f"track {t['ord'] + 1} {t['why']}" for t in fixable), "ok")
                 else:
                     action, note = "fix failed", f.get("why") or ""
+                    for t in fixable:          # a rewrite that was not kept goes back to what it was
+                        if t.get("was"):
+                            t["verdict"] = t.pop("was")
                     joblog.log(f"subtitle timing: {_label(path)} - could not fix: {note}", "warn")
             elif fixable:
                 action = "found - waiting for you (advise mode)"
@@ -684,6 +781,8 @@ def check_one(row: dict, act: bool | None = None, w=None) -> dict:
                 joblog.log(f"subtitle timing: {_label(path)} is out of step in a way one correction cannot fix", "warn")
             else:
                 action = "nothing to do"
+        for t in tracks:
+            t.pop("text", None)
         mt = float(row.get("mtime") or (os.path.getmtime(path) if os.path.exists(path) else 0))
         secs = round(time.time() - t0, 1)
         with cursor() as cur:
