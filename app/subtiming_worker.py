@@ -780,6 +780,7 @@ WORD_WINDOWS = 4
 WORD_LEN = 75.0
 WORD_REACH = 6.0              # a line is looked for this far either side of its own time
 WORD_LEAD = 0.2               # a corrected line starts this long before its words (early is fine, late is not)
+WORD_TIGHT = 0.85             # this share of lines within 0.8 s of the middle one = in step
 WORD_MIN = 15                 # matched lines needed before the words overrule anything
 WORD_MODEL_DIR = os.environ.get("NUARR_WHISPER_DIR") or r"C:\ProgramData\nuarr\whisper"
 _WM = {"m": None}
@@ -822,6 +823,117 @@ def _word_times(src: str, a_ord: int, lang: str, t0: float) -> list:
         return []
     segs, _ = _WM["m"].transcribe(wav, word_timestamps=True, vad_filter=True, language=lang)
     return [(w_, t0 + x.start) for sg in segs for x in (sg.words or []) for w_ in [_norm_word(x.word)] if w_]
+
+
+def retime_words(src: str, dur: float, ord_: int, a_ord: int, lang: str) -> tuple:
+    r"""Every line moved onto its own words. Returns (new srt text, stats).
+
+    The whole file is transcribed with word times (CPU, about a fifth of the
+    running time), and each line is looked for near where it stands:
+      - found, and more than RETIME_MIN from its words -> starts WORD_LEAD
+        before them, keeps its length;
+      - found and already close -> not touched;
+      - not found (a sound description, a line too short to be sure of) ->
+        moved with its neighbours when both moved the same way, else left.
+    A line never ends up before the one in front of it, and never overlaps the
+    next. SubRip only - the text is rewritten, so a styled track is left alone.
+    """
+    import difflib
+    ff = _ff()[0]
+    raw = subprocess.run([ff, "-v", "error", "-i", src, "-map", f"0:s:{ord_}", "-f", "srt", "-"],
+                         capture_output=True, timeout=300, creationflags=NO_WINDOW).stdout.decode("utf-8", "replace")
+    cues = []
+    for blk in re.split(r"\r?\n\r?\n", raw.strip()):
+        m = re.search(r"(\d+):(\d+):(\d+)[,.](\d+) --> (\d+):(\d+):(\d+)[,.](\d+)[^\n]*\r?\n(.*)", blk, re.S)
+        if not m:
+            continue
+        g = [int(x) for x in m.groups()[:8]]
+        a0 = g[0] * 3600 + g[1] * 60 + g[2] + g[3] / 1000
+        a1 = g[4] * 3600 + g[5] * 60 + g[6] + g[7] / 1000
+        text = m.group(9).rstrip()
+        said = re.sub(r"<[^>]+>|\{[^}]*\}|\[[^\]]*\]|\([^)]*\)|^[A-Z][A-Z .']+:|[\u266a\u266b#]", " ", text, flags=re.M)
+        cues.append({"a": a0, "b": a1, "text": text, "w": [w for w in (_norm_word(x) for x in said.split()) if w]})
+    words = []
+    step = 600.0
+    n = int(dur // step) + 1
+    for i in range(n):
+        print(f"PROG {i}/{n} hearing what is said", file=sys.stderr, flush=True)
+        t0 = i * step
+        global WORD_LEN
+        keep, WORD_LEN = WORD_LEN, step
+        try:
+            words += _word_times(src, a_ord, lang, t0)
+        finally:
+            WORD_LEN = keep
+    words.sort(key=lambda x: x[1])
+    tw = [w for w, _ in words]
+    tt = [t for _, t in words]
+    import bisect
+    last_t = -1.0
+    for c in cues:
+        cw = c["w"]
+        c["shift"] = None
+        if len(cw) < 2:
+            continue
+        k = len(cw)
+        lo = bisect.bisect_left(tt, max(last_t, c["a"] - RETIME_REACH))
+        hi = bisect.bisect_right(tt, c["a"] + RETIME_REACH)
+        best = (0.0, -1)
+        for i in range(lo, hi):
+            if tw[i] != cw[0]:
+                continue
+            r = difflib.SequenceMatcher(None, cw, tw[i:i + k]).ratio()
+            # the same score twice (a line said again): the one nearer where it stands
+            if r > best[0] + 1e-9 or (abs(r - best[0]) < 1e-9 and best[1] >= 0
+                                      and abs(tt[i] - c["a"]) < abs(tt[best[1]] - c["a"])):
+                best = (r, i)
+        need = 0.99 if k == 2 else 0.8
+        if best[1] >= 0 and best[0] >= need:
+            c["shift"] = (tt[best[1]] - WORD_LEAD) - c["a"]
+            last_t = tt[best[1]]
+    found = [c for c in cues if c["shift"] is not None]
+    # lines nobody could find ride with their neighbours, when the neighbours agree
+    for i, c in enumerate(cues):
+        if c["shift"] is not None:
+            continue
+        prev = next((x for x in reversed(cues[:i]) if x["shift"] is not None and c["a"] - x["a"] <= 12), None)
+        nxt = next((x for x in cues[i + 1:] if x["shift"] is not None and x["a"] - c["a"] <= 12), None)
+        if prev and nxt and abs(prev["shift"] - nxt["shift"]) <= 0.6:
+            c["ride"] = (prev["shift"] + nxt["shift"]) / 2
+    moved = left = rode = 0
+    for c in cues:
+        sh = c["shift"] if c["shift"] is not None else c.get("ride")
+        if sh is None or abs(sh) < RETIME_MIN:
+            c["na"], c["nb"] = c["a"], c["b"]
+            left += 1
+            continue
+        c["na"], c["nb"] = max(0.0, c["a"] + sh), max(0.0, c["a"] + sh) + (c["b"] - c["a"])
+        moved += int(c["shift"] is not None)
+        rode += int(c["shift"] is None)
+    # in order, and not on top of each other
+    for i, c in enumerate(cues):
+        if i and c["na"] < cues[i - 1]["na"] + 0.05:
+            c["na"] = cues[i - 1]["na"] + 0.05
+            c["nb"] = max(c["nb"], c["na"] + 0.7)
+    for i, c in enumerate(cues[:-1]):
+        if c["nb"] > cues[i + 1]["na"] - 0.02 and c["b"] <= cues[i + 1]["a"] + 0.05:
+            c["nb"] = max(c["na"] + 0.5, cues[i + 1]["na"] - 0.02)
+
+    def ts(x):
+        ms = int(round(x * 1000))
+        return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
+    out = "".join(f"{i + 1}\r\n{ts(c['na'])} --> {ts(c['nb'])}\r\n{c['text']}\r\n\r\n" for i, c in enumerate(cues))
+    shifts = sorted(abs(c["shift"]) for c in found)
+    stats = {"cues": len(cues), "found": len(found), "moved": moved, "rode": rode, "left": left,
+             "was_off": sum(1 for x in shifts if x >= 0.8),
+             "median_move": round(shifts[len(shifts) // 2], 2) if shifts else None,
+             "biggest": [{"at": round(c["a"], 1), "by": round(c["shift"], 2), "text": c["text"][:60]}
+                         for c in sorted(found, key=lambda c: -abs(c["shift"]))[:8]]}
+    return out, stats
+
+
+RETIME_REACH = 8.0            # a line is looked for this far either side of where it stands
+RETIME_MIN = 0.45             # a line nearer its words than this is not touched
 
 
 def words_stage(src: str, dur: float, tracks: list) -> None:
@@ -880,7 +992,21 @@ def words_stage(src: str, dur: float, tracks: list) -> None:
         # IN STEP MEANS WHAT IT MEANS EVERYWHERE ELSE HERE: a line may lead its
         # words a little (subtitles are cut that way, and Erik's rule is early
         # is fine, late is not) - up to 0.6 s early, 0.3 s late, in every part.
-        if near >= 0.6 and -0.6 <= med <= 0.3 and all(-0.9 <= x <= 0.45 for x in per):
+        if 0.6 <= near < WORD_TIGHT and -0.6 <= med <= 0.3 and all(-0.9 <= x <= 0.45 for x in per) \
+                and t["verdict"] in ("messy", "piecewise"):
+            # LOOSE, LINE BY LINE. The track as a whole sits on its words, and one
+            # line in four does not: 9-1-1 S10E06 has "You can come in." 3.9 s
+            # before it is said and "Theo, hi." 1.7 s after. Calling that in step
+            # was wrong (the first version of this check did), and no shift or
+            # stretch fixes it - each line has its own error. Named for what it
+            # is; retime_words below is the repair.
+            for k_ in ("pieces", "drops"):
+                t.pop(k_, None)
+            off = int(round((1 - near) * 100))
+            t.update(verdict="uneven", why=(f"the track sits on its words overall, but {off}% of lines are more "
+                                            f"than 0.8s early or late, each by a different amount - the release "
+                                            f"timed its lines loosely ({len(allo)} lines checked against what is said)"))
+        elif near >= WORD_TIGHT and -0.6 <= med <= 0.3 and all(-0.9 <= x <= 0.45 for x in per):
             was = t["verdict"]
             for k_ in ("pieces", "drops"):
                 t.pop(k_, None)
@@ -900,6 +1026,7 @@ def main() -> int:
     ap.add_argument("--src", required=True)
     ap.add_argument("--tracks", default="", help="subtitle ordinals to measure (default: every text track)")
     ap.add_argument("--check-only", action="store_true")
+    ap.add_argument("--retime-out", default="", help="write each named track, retimed line by line onto its words, here")
     a = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
     pj = probe(a.src)
@@ -907,6 +1034,22 @@ def main() -> int:
     dur = float((pj.get("format") or {}).get("duration") or 0)
     auds = [s for s in st if s.get("codec_type") == "audio"]
     subs = [s for s in st if s.get("codec_type") == "subtitle"]
+    if a.retime_out:
+        sys.stdout.reconfigure(encoding="utf-8")
+        res = []
+        a_ord = next((i for i, s_ in enumerate(auds) if (s_.get("disposition") or {}).get("default")), 0)
+        a_lang = WORD_LANGS.get((((auds[a_ord].get("tags") or {}).get("language")) or "").lower()) if auds else None
+        for o in [int(x) for x in a.tracks.split(",") if x.strip().isdigit()]:
+            if not a_lang or (subs[o].get("codec_name") or "") not in ("subrip", "srt"):
+                res.append({"ord": o, "ok": False, "why": "not a SubRip track in a language the words can be read in"})
+                continue
+            txt, stt = retime_words(a.src, dur, o, a_ord, a_lang)
+            fp = os.path.join(a.retime_out, f"retimed.{o}.srt")
+            with open(fp, "w", encoding="utf-8", newline="") as fh:
+                fh.write(txt)
+            res.append({"ord": o, "ok": True, "file": fp, **stt})
+        print(json.dumps({"ok": True, "duration": dur, "tracks": res}))
+        return 0
     if not auds or dur < 300:
         print(json.dumps({"ok": False, "why": "no audio" if not auds else "shorter than five minutes"}))
         return 0

@@ -30332,6 +30332,27 @@ const GATE_META={
     what:'Waits while an arr is moving files around.',
     on:'No job starts while an arr reports itself busy. Touching a file mid-rename is the original cause of the ENOENT/EBUSY failures this pipeline was built to avoid.',
     off:'Jobs may start while an arr is moving files. Nuarr still checks the individual file is unlocked before touching it.'},
+  // NOT GATE CHECKS, BUT THEY LIVE IN THE SAME LIST - and with no entry here
+  // they were drawn as their raw key (arrs.tvdb_fix) over an ON and an OFF
+  // with nothing beside either.
+  'arrs.tvdb_fix':{
+    label:'Re-link a series TheTVDB re-added under a new id',
+    what:'TheTVDB sometimes deletes a series and adds it back with a new id. Sonarr then lists the old one as removed and stops finding episodes for it. This repair points Sonarr at the new id.',
+    on:'When Sonarr\u2019s lookup returns exactly one series with the same title and year under a new id, the series is removed from Sonarr with its files kept, its folder is renamed to the new id, and it is added back with the same profile, tags and monitoring. Anything less certain is listed on Settings \u2192 Arrs for you and nothing is touched.',
+    off:'Nothing is re-linked. A series TheTVDB re-added stays broken in Sonarr until you fix it there by hand.',
+    note:'Checked every few hours. No file is deleted; Sonarr\u2019s history for a repaired series is lost.'},
+  'arrs.prowlarr_search':{
+    label:'Search Prowlarr when a download is rejected, and sweep the wanted lists',
+    what:'Nuarr\u2019s own search for a replacement. It asks every indexer Prowlarr has, ranks the results by the arr\u2019s own quality profile, and for a series weighs a season pack against the single episode.',
+    on:'A replacement is searched for as soon as a rejected file is deleted, and the arrs\u2019 wanted lists are swept for what their own searches have not filled. The winner is pushed to the arr, which downloads and imports it itself - a release the arr refuses (blocklisted, banned, over a size limit) is skipped for the next one.',
+    off:'Nuarr never searches. A rejected file waits for the arr\u2019s own RSS sync or a search you start yourself.',
+    note:'Settings \u2192 Arrs shows what it searched for and what it found.'},
+  'subdupe.enabled':{
+    label:'Remove duplicate subtitle tracks',
+    what:'One subtitle track per language and kind. A file can end up with the same subtitle two or three times - the same language and the same kind (full, forced, SDH). This sweep takes the extra copies out.',
+    on:'An extra track of the same language and kind is removed with a remux - nothing is re-encoded. The copy with the most lines stays, and the rebuilt file is read back before it replaces the original. An SDH track beside a full one, or signs beside dialogue, is not a duplicate.',
+    off:'Duplicate tracks are left in the file. They are harmless, but the player lists the same subtitle twice.',
+    note:'This one removes something from a file, which is why it waited to be switched on.'},
   'gate.manual_pause':{
     label:'Manual pause',
     what:'The stop switch. Nothing to do with what Plex or the arrs are doing.',

@@ -647,6 +647,7 @@ def check_one(row: dict, act: bool | None = None, w=None) -> dict:
             fixable = [t for t in tracks if t.get("verdict") in ("offset", "drift", "piecewise")]
             verdict = ("piecewise" if "piecewise" in kinds else "drift" if "drift" in kinds
                        else "offset" if "offset" in kinds else "messy" if "messy" in kinds
+                       else "uneven" if "uneven" in kinds
                        else "ok" if "ok" in kinds else "unsure" if "unsure" in kinds else "skipped")
             if fixable and act:
                 # ONE REMUX. A piecewise track needs its cue times rewritten;
@@ -676,6 +677,8 @@ def check_one(row: dict, act: bool | None = None, w=None) -> dict:
                     joblog.log(f"subtitle timing: {_label(path)} - could not fix: {note}", "warn")
             elif fixable:
                 action = "found - waiting for you (advise mode)"
+            elif verdict == "uneven":
+                action = "left alone - lines mistimed one by one"
             elif verdict == "messy":
                 action = "left alone"
                 joblog.log(f"subtitle timing: {_label(path)} is out of step in a way one correction cannot fix", "warn")
