@@ -577,7 +577,7 @@ async def _send_basic(items: list) -> None:
             ok, err = await send(f"{arr} · {line}", _esc(line), app=arr)
             _remember({"at": time.time(), "arr": arr, "title": it["label"], "detail": "basic",
                        "eng": 0, "ok": ok, "error": err, "kind": "upgraded" if it["upgrade"] else "imported",
-                       "files": 1, "ptitle": f"{arr} · {line}", "msg": _esc(line)})
+                       "files": 1, "ptitle": f"{arr} · {line}", "msg": _esc(line), "pid": it.get("mid")})
         return
     items.sort(key=lambda x: x["ep"])
     series = items[0]["series"]
@@ -587,7 +587,8 @@ async def _send_basic(items: list) -> None:
     ok, err = await send(f"{arr} · {series} · {len(items)} {verb}", _esc(line), app=arr)
     _remember({"at": time.time(), "arr": arr, "title": f"{series} ({len(items)} files)", "detail": "basic",
                "eng": 0, "ok": ok, "error": err, "kind": "upgraded" if ups == len(items) else "imported",
-               "files": len(items), "ptitle": f"{arr} · {series} · {len(items)} {verb}", "msg": _esc(line)})
+               "files": len(items), "ptitle": f"{arr} · {series} · {len(items)} {verb}", "msg": _esc(line),
+               "pid": items[0].get("mid")})
 
 
 async def _send_group(items: list) -> None:
@@ -612,7 +613,7 @@ async def _send_group(items: list) -> None:
                        "detail": _plain(it["spec"] or (it["lines"][0] if it["lines"] else "")),
                        "eng": int(bool(it.get("eng"))), "ok": ok, "error": err,
                        "kind": "upgraded" if it["upgrade"] else "imported", "files": 1,
-                       "ptitle": title, "msg": msg})
+                       "ptitle": title, "msg": msg, "pid": it.get("mid")})
             if not ok:
                 joblog.log(f"pushover: could not send {it['label']}: {err}", "warn")
         return
@@ -656,7 +657,7 @@ async def _send_group(items: list) -> None:
     _remember({"at": time.time(), "arr": arr, "title": f"{series} ({len(items)} files)",
                "detail": what, "eng": engs, "ok": ok, "error": err,
                "kind": "upgraded" if ups == len(items) else "imported", "files": len(items),
-               "ptitle": title, "msg": msg})
+               "ptitle": title, "msg": msg, "pid": items[0].get("mid")})
     if not ok:
         joblog.log(f"pushover: could not send the {series} digest: {err}", "warn")
 
@@ -777,7 +778,7 @@ async def seerr(body: dict) -> str:
         ok, err = await send(f"Seerr · {verb} · {subject}", _esc(line))
         _remember({"at": time.time(), "arr": "Seerr", "title": subject, "detail": f"{verb} (basic)",
                    "ok": ok, "error": err, "kind": "seerr", "files": "", "ptitle": f"Seerr · {verb} · {subject}",
-                   "msg": _esc(line)})
+                   "msg": _esc(line), "img": str(body.get("image") or "")})
         return f"{verb}: {subject}" + ("" if ok else f" (send failed: {err})")
     who = (req.get("requestedBy_username") or iss.get("reportedBy_username")
            or com.get("commentedBy_username") or "")
@@ -803,10 +804,65 @@ async def seerr(body: dict) -> str:
     ok, err = await send(title, msg, url=_link(), attachment=img)
     _remember({"at": time.time(), "arr": "Seerr", "title": subject,
                "detail": verb + (f" by {who}" if who else ""), "ok": ok, "error": err,
-               "kind": "seerr", "files": "", "ptitle": title, "msg": msg})
+               "kind": "seerr", "files": "", "ptitle": title, "msg": msg,
+               "img": str(body.get("image") or "")})
     if not ok:
         joblog.log(f"pushover: could not send Seerr {nt} for {subject}: {err}", "warn")
     return f"{verb}: {subject}" + ("" if ok else f" (send failed: {err})")
+
+
+# POSTERS ON THE PAGE'S LIST. Each row keeps the arr's id of the show or film
+# ("pid") and the page shows it through /api/poster (cached on disk, the key
+# never in the page). Rows sent before the id was kept are matched by title
+# against the arr's own list - the longest title the row's name starts with -
+# fetched in the background and kept for 6 h, so the page never waits on it.
+# Seerr rows carry Seerr's own poster URL ("img").
+_TITLES: dict = {"at": 0.0, "busy": False, "by_arr": {}}
+TITLES_S = 6 * 3600
+
+
+def _load_titles() -> None:
+    from .arrqueue import _call
+    out = {}
+    for a in [a for a in SETTINGS.arrs if a.enabled and a.kind in ("sonarr", "radarr")]:
+        try:
+            rows = _call(a, "/api/v3/series" if a.kind == "sonarr" else "/api/v3/movie", timeout=60) or []
+            out[a.name] = sorted(((str(r.get("title") or "").lower(), r.get("id")) for r in rows
+                                  if r.get("title") and r.get("id")), key=lambda t: -len(t[0]))
+        except Exception:                                        # noqa: BLE001
+            continue
+    if out:
+        _TITLES["by_arr"] = out
+    _TITLES["at"] = time.time()
+    _TITLES["busy"] = False
+
+
+def _title_id(arr: str, title: str):
+    if time.time() - _TITLES["at"] > TITLES_S and not _TITLES["busy"]:
+        import threading
+        _TITLES["busy"] = True
+        threading.Thread(target=_load_titles, daemon=True, name="po-titles").start()
+    t = str(title or "").lower()
+    for name, pid in _TITLES["by_arr"].get(arr) or []:
+        if t.startswith(name) and (len(t) == len(name) or t[len(name)] in " (."):
+            return pid
+    return None
+
+
+def _with_posters(rows: list) -> list:
+    from urllib.parse import quote
+    out = []
+    for r in rows:
+        r = dict(r)
+        arr = str(r.get("arr") or "")
+        if r.get("img"):
+            r["poster"] = r["img"]
+        elif arr and arr != "Seerr":
+            pid = r.get("pid") or _title_id(arr, r.get("title"))
+            if pid:
+                r["poster"] = f"/api/poster/{quote(arr)}/{int(pid)}"
+        out.append(r)
+    return out
 
 
 def snapshot() -> dict:
@@ -814,5 +870,5 @@ def snapshot() -> dict:
             "user_set": bool(SETTINGS.pushover_user), "enabled": enabled(),
             "apps": {k: bool(app_token(k)) for k in ("sonarr", "radarr")},
             "on": str(kv_get(KV_ON) or "0") == "1", "opts": opts(),
-            "stats": dict(STATS), "recent": _recent(), "quiet_s": QUIET_S,
+            "stats": dict(STATS), "recent": _with_posters(_recent()), "quiet_s": QUIET_S,
             "link": _link(), "roots": roots()}

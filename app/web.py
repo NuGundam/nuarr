@@ -51476,7 +51476,8 @@ function poMsgHtml(m){
 }
 function poDetail(r){
   const row=(k,v)=>`<div style="display:flex;gap:8px;margin:2px 0"><span class="dim" style="flex:none;width:96px;text-align:right">${k}</span><span style="min-width:0;overflow-wrap:anywhere">${v}</span></div>`;
-  return `<div style="font-size:11px;padding:6px 10px 8px 34px;white-space:normal">
+  return `<div style="font-size:11px;padding:6px 10px 8px 34px;white-space:normal;display:flex;gap:12px;align-items:flex-start">
+    ${r.poster?`<img src="${esc(r.poster)}" loading="lazy" alt="" style="flex:none;width:80px;height:120px;object-fit:cover;border-radius:5px;background:var(--line)" onerror="this.remove()">`:''}<div style="min-width:0;flex:1">
     ${r.ptitle?row('title',`<b>${r.arr&&r.ptitle.startsWith(r.arr)
         ?`${arrIcon(r.arr, 13)} <span style="color:${arrLook(r.arr).c}">${esc(r.arr)}</span>${esc(r.ptitle.slice(r.arr.length))}`
         :esc(r.ptitle)}</b>`):''}
@@ -51484,7 +51485,7 @@ function poDetail(r){
            :row('message','<span class="dim">sent before nuarr kept the full text — only the summary is on file</span>')}
     ${row('sent', esc(new Date((r.at||0)*1000).toLocaleString())+(r.resent?' <span class="dim">(resent)</span>':''))}
     ${r.ok?'':row('error',`<span style="color:#e0575b">${esc(r.error||'unknown')}</span>`)}
-  </div>`;
+  </div></div>`;
 }
 function poRowHtml(r){
   const id=poId(r), on=_poSel.has(id), open=_poOpen.has(id), q=jsq(id);
@@ -51493,7 +51494,7 @@ function poRowHtml(r){
     <td class="c mono dim" style="font-size:10.5px;white-space:nowrap" title="${esc(new Date((r.at||0)*1000).toLocaleString())}">${ago(r.at)}</td>
     <td class="c" style="font-weight:600;${r.arr?'color:'+arrLook(r.arr).c:''}">${esc(r.arr||'—')}</td>
     <td class="l" style="cursor:pointer" onclick="poOpenRow('${q}',event)" title="${esc(r.ptitle||r.title||'')}"
-      ><span class="actcaret">${open?'▾':'▸'}</span><span class="mono">${esc(r.title||'')}</span>${
+      >${r.poster?`<img src="${esc(r.poster)}" loading="lazy" alt="" style="float:left;width:24px;height:36px;object-fit:cover;border-radius:3px;margin:0 8px 0 0;background:var(--line)" onerror="this.style.visibility='hidden'">`:''}<span class="actcaret">${open?'▾':'▸'}</span><span class="mono">${esc(r.title||'')}</span>${
         r.eng?` <span style="font-size:10px;color:#7fd4a3;border:1px solid #7fd4a355;border-radius:3px;padding:0 4px">+ English audio${r.eng>1?' ×'+r.eng:''}</span>`:''}${
         r.resent?' <span class="dim" style="font-size:10px">resent</span>':''}
       <div class="dim" style="font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-left:14px${r.ok?'':';color:#e0575b'}">${esc(r.ok?(r.detail||''):('failed: '+(r.error||'')))}</div></td>
