@@ -839,9 +839,15 @@ def _load_titles() -> None:
 
 def _title_id(arr: str, title: str):
     if time.time() - _TITLES["at"] > TITLES_S and not _TITLES["busy"]:
-        import threading
         _TITLES["busy"] = True
-        threading.Thread(target=_load_titles, daemon=True, name="po-titles").start()
+        if not _TITLES["at"]:
+            # THE FIRST PAGE AFTER A RESTART WAITS ONCE (about a second). With
+            # the list only ever loaded in the background, that page was drawn
+            # with no posters at all and nothing redrew it.
+            _load_titles()
+        else:
+            import threading
+            threading.Thread(target=_load_titles, daemon=True, name="po-titles").start()
     t = str(title or "").lower()
     for name, pid in _TITLES["by_arr"].get(arr) or []:
         if t.startswith(name) and (len(t) == len(name) or t[len(name)] in " (."):

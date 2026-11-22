@@ -12143,6 +12143,15 @@ async def api_profadv_apply(series_id: int):
     return await profadvisor.apply(series_id)
 
 
+@app.get("/api/bitrate")
+def api_bitrate(force: int = 0):
+    """Recommended bitrate per codec and resolution, and the files outside it."""
+    from . import bitrate
+    d = bitrate.report(bool(force))
+    return {**d, "under_total": len(d["under"]), "over_total": len(d["over"]),
+            "under": d["under"][:400], "over": d["over"][:400]}
+
+
 @app.get("/api/convert")
 def api_convert():
     from . import hevcconvert
@@ -22545,7 +22554,7 @@ function renderBrowse(d){
     const info = f.probed
       ? `${esc(f.video||'?')}${f.height?' '+f.height+'p':''}`
         + (f.audio?` · ${esc(f.audio)}`:'')
-        + (f.bitrate?` · ${Math.round(f.bitrate/1000)} kbps`:'')
+        + (f.bitrate?` · ${brMbps(f.bitrate)}`:'')
         + (f.duration?` · ${Math.round(f.duration/60)} min`:'')
       : '<span class="dim">not probed</span>';
     // The encode's own report card: the CQ the quality search chose, the
@@ -22657,7 +22666,7 @@ async function noEncodeSet(id, box){
 function renderMediaInfo(d){
   const tag=(t,cls)=>`<span class="mtag ${cls||''}">${esc(t)}</span>`;
   const flags=f=>(f||[]).map(x=>tag(x,'mflag')).join('');
-  const br=b=>b?`${Math.round(b/1000)} kbps`:'';
+  const br=b=>b?brMbps(b):'';
 
   const v=(d.video||[]).map(s=>`<div class="mrow">
       <span class="mk">video</span>
@@ -31408,7 +31417,7 @@ function wtab(which){
     const side = which==='vcodec' ? 'video' : 'audio';
     if(hint) hint.textContent = '· '+(side==='video'?'video':'audio')+' codec';
     paneLoad(which, loadCodecTab, side);
-    if(side==='video'){ loadVmaf(); loadConvert(); }
+    if(side==='video'){ loadVmaf(); loadConvert(); loadBitrate(); }
     // The title check belongs beside the settings that caused the mismatch:
     // this page decides what tracks are converted TO, and the title is what
     // the picker will then claim they are.
@@ -36827,6 +36836,73 @@ function convLeftNote(){
 function convBusy(on){
   const b=document.getElementById('convBusy');
   if(b) b.innerHTML=on?'<span class="loaddot" style="margin:0 0 0 8px"></span>':'';
+}
+// ---- Bitrate check ---------------------------------------------------------
+// ONE UNIT FOR A FILE'S BITRATE. "3135 kbps" beside "5379 kbps" had to be read
+// digit by digit; "3.1 Mbps" beside "5.4 Mbps" is read at a glance. Under
+// 1 Mbps (an audio track) stays in kbps, where Mbps would be "0.6".
+function brMbps(b){ b=+b||0; return b>=1e6 ? (b/1e6).toFixed(1)+' Mbps' : Math.round(b/1000)+' kbps'; }
+let _brData=null, _brOpen={under:false, over:false}, _brLib='';
+async function loadBitrate(force){
+  const el=document.getElementById('brBox'); if(!el) return;
+  if(!el.firstElementChild) el.innerHTML=`<div class="lkind" style="padding:10px 12px"><b style="color:#6fb0ff">Bitrate check</b>
+    <span class="dim" style="font-size:11.5px;margin-left:10px"><span class="loaddot"></span>measuring the library against the table</span></div>`;
+  try{ _brData=await (await fetch('/api/bitrate'+(force?'?force=1':''))).json(); }catch(e){ return; }
+  brPaint();
+}
+function brToggle(k){ _brOpen[k]=!_brOpen[k]; brPaint(); }
+function brLib(v){ _brLib=v; brPaint(); }
+function brPaint(){
+  const el=document.getElementById('brBox'), d=_brData; if(!el||!d) return;
+  const n=x=>(x||0).toLocaleString();
+  const cell=(v,col)=>v?`<span style="color:${col};font-weight:600">${n(v)}</span>`:'<span class="dim">—</span>';
+  const half=anim=>{
+    const rows=d.table.filter(t=>!!t.anim===anim);
+    if(!rows.length) return '';
+    return `<tr><td colspan="9" class="dim" style="padding:8px 6px 3px;font-size:10.5px;text-transform:uppercase;letter-spacing:.05em">${
+      anim?`Animation libraries <span style="text-transform:none;letter-spacing:0">— ${Math.round(d.anim_scale*100)}% of the live-action figures (the floor ${Math.round(d.anim_floor_scale*100)}%); flat colour needs fewer bits</span>`:'Live action'}</td></tr>`
+    + rows.map(t=>`<tr>
+      <td class="l"><b>${esc(t.name)}</b></td><td class="c">${t.res}</td>
+      <td class="c" style="color:#e0575b" title="Under this a copy is starved - replace it">&lt; ${t.floor}</td>
+      <td class="c" style="color:#7fd4a3" title="The recommended range">${t.lo} – ${t.hi}</td>
+      <td class="c" style="color:#e2b341" title="Over this the extra bits are not visible">&gt; ${t.ceil}</td>
+      <td class="c dim">${n(t.n)}</td><td class="c mono">${t.median}</td>
+      <td class="c">${cell(t.under,'#e0575b')}${t.measured?` <span class="dim" style="font-size:10px" title="Below the floor, but nuarr encoded these itself and measured VMAF ${d.measured_ok}+ - easy content, not a starved copy">+${n(t.measured)} measured</span>`:''}</td>
+      <td class="c">${cell(t.over,'#e2b341')}${t.over?` <span class="dim" style="font-size:10px">${n(Math.round(t.over_gb))} GB</span>`:''}</td></tr>`).join('');
+  };
+  const libs=[...new Set([...d.under,...d.over].map(g=>g.library))].sort();
+  const list=(k,col,head,tip)=>{
+    const all=d[k].filter(g=>!_brLib||g.library===_brLib), open=_brOpen[k];
+    const files=all.reduce((a,g)=>a+g.n,0);
+    const rows=!open?'':`<div class="rowbox" style="max-height:420px;margin-top:4px"><table class="sktbl" style="width:100%;font-size:11.5px">
+      <thead><tr class="dim" style="font-size:10.5px"><th class="l">title</th><th class="l">library</th><th class="c">codec</th><th class="c">files</th>
+        <th class="c" title="Average of the files outside the range">average</th><th class="c">${k==='under'?'lowest':'highest'}</th><th class="c">${k==='under'?'floor':'ceiling'}</th><th class="c">size</th></tr></thead>
+      <tbody>${all.map(g=>`<tr>
+        <td class="l" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:420px">${g.pid&&g.arr?`<img src="/api/poster/${encodeURIComponent(g.arr)}/${g.pid}" loading="lazy" alt="" style="width:18px;height:27px;object-fit:cover;border-radius:2px;vertical-align:middle;margin-right:7px;background:var(--line)" onerror="this.style.visibility='hidden'">`:''}${esc(g.title)}</td>
+        <td class="l dim">${esc(g.library||'')}</td>
+        <td class="c dim">${g.fam==='hevc'?'HEVC':g.fam==='h264'?'H.264':'AV1'} ${g.res}</td>
+        <td class="c">${n(g.n)}</td>
+        <td class="c mono" style="color:${col};font-weight:600">${g.avg} Mbps</td>
+        <td class="c mono dim">${k==='under'?g.lo:g.hi}</td>
+        <td class="c mono dim">${k==='under'?g.floor:g.ceil}</td>
+        <td class="c dim">${g.gb>=10?Math.round(g.gb):g.gb} GB</td></tr>`).join('')}</tbody></table></div>
+      ${d[k+'_total']>d[k].length?`<div class="dim" style="font-size:10.5px;margin-top:3px">showing the first ${d[k].length} of ${n(d[k+'_total'])} titles</div>`:''}`;
+    return `<div style="margin-top:10px"><span style="cursor:pointer" onclick="brToggle('${k}')" title="${esc(tip)}"><span class="actcaret">${open?'▾':'▸'}</span>
+      <b style="color:${col}">${head}</b> <span class="dim" style="font-size:11.5px">${n(all.length)} titles · ${n(files)} files</span></span>${rows}</div>`;
+  };
+  el.innerHTML=`<div class="lkind" style="padding:10px 12px">
+    <b style="color:#6fb0ff">Bitrate check</b>
+    <span class="dim" style="font-size:11.5px;margin-left:10px">${n(d.files)} files against the recommended bitrate for their codec and resolution · whole-file Mbps</span>
+    <span style="float:right;font-size:11px"><a href="#" onclick="loadBitrate(true);return false" title="The figures are kept for 10 minutes; this measures again now">measure again</a></span>
+    <table class="sktbl" style="width:100%;font-size:11.5px;margin-top:6px">
+      <thead><tr class="dim" style="font-size:10.5px"><th class="l">codec</th><th class="c">resolution</th><th class="c">starved</th><th class="c">recommended</th>
+        <th class="c">oversized</th><th class="c">files</th><th class="c" title="The middle file's bitrate">median</th><th class="c">under</th><th class="c">over</th></tr></thead>
+      <tbody>${half(false)}${half(true)}</tbody></table>
+    <div style="margin-top:10px;font-size:11.5px"><span class="dim">show</span>
+      <select onchange="brLib(this.value)" style="font-size:11px;margin-left:4px"><option value="">every library</option>${libs.map(l=>`<option ${l===_brLib?'selected':''}>${esc(l)}</option>`).join('')}</select></div>
+    ${list('under','#e0575b','Under — should be replaced','Starved copies, the furthest below the floor first. A fuller release is the fix; converting cannot add detail back.')}
+    ${list('over','#e2b341','Over — oversized','More bits than the picture shows, the most disk first. Nothing is wrong with these; they are where space can be won back.')}
+  </div>`;
 }
 async function loadConvert(force){
   const el=document.getElementById('convBox'); if(!el) return;
