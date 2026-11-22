@@ -12143,6 +12143,28 @@ async def api_profadv_apply(series_id: int):
     return await profadvisor.apply(series_id)
 
 
+@app.get("/api/fuller")
+def api_fuller():
+    """Find fuller copies: what it is doing now, the queue, the last results."""
+    from . import fuller
+    return fuller.snapshot()
+
+
+@app.post("/api/fuller/queue")
+async def api_fuller_queue(request: Request):
+    """Queue titles ({items:[{arr,pid,title}]}) for a fuller-copy search."""
+    from . import fuller
+    body = await request.json()
+    return fuller.queue(body.get("items") or [])
+
+
+@app.post("/api/fuller/cancel")
+def api_fuller_cancel():
+    """Clear the queue and stop after the file being searched."""
+    from . import fuller
+    return fuller.cancel()
+
+
 @app.get("/api/bitrate")
 def api_bitrate(force: int = 0):
     """Recommended bitrate per codec and resolution, and the files outside it."""
@@ -36848,7 +36870,80 @@ async function loadBitrate(force){
   if(!el.firstElementChild) el.innerHTML=`<div class="lkind" style="padding:10px 12px"><b style="color:#6fb0ff">Bitrate check</b>
     <span class="dim" style="font-size:11.5px;margin-left:10px"><span class="loaddot"></span>measuring the library against the table</span></div>`;
   try{ _brData=await (await fetch('/api/bitrate'+(force?'?force=1':''))).json(); }catch(e){ return; }
-  brPaint();
+  brPaint(); fuLoad();
+}
+// ---- Find fuller copies ---------------------------------------------------
+// THE FIX FOR A STARVED TITLE IS A FULLER RELEASE, NOT A CONVERSION: nothing
+// can add back detail a 1 Mbps encode threw away. fuller.py asks the arr for
+// every release of each starved episode and grabs the best one that is really
+// fuller. It runs one title at a time; the strip below says which title, which
+// file and which step, with the counts and the last results.
+let _fu=null, _fuT=null;
+const fuKey=(a,p)=>a+'/'+p;
+function fuState(g){
+  if(!_fu||!g.pid) return '';
+  if(_fu.running && _fu.arr===g.arr && +_fu.pid===+g.pid) return 'run';
+  if((_fu.queue||[]).some(q=>q.arr===g.arr&&+q.pid===+g.pid)) return 'queued';
+  const f=(_fu.finished||[]).find(q=>q.arr===g.arr&&+q.pid===+g.pid);
+  return f?'done':'';
+}
+function fuBtn(g){
+  if(!g.pid||!g.arr) return '<span class="dim" style="font-size:10.5px">no arr id</span>';
+  const s=fuState(g);
+  if(s==='run') return '<span class="dlspin"></span> <span style="font-size:10.5px;color:var(--acc)">searching</span>';
+  if(s==='queued') return '<span class="dim" style="font-size:10.5px">queued</span>';
+  const f=s==='done'?(_fu.finished||[]).find(q=>q.arr===g.arr&&+q.pid===+g.pid):null;
+  const res=f?`<span style="font-size:10.5px;margin-right:6px;color:${f.grabbed?'#7fd4a3':'var(--dim)'}">${f.error?'error':f.grabbed+' grabbed'}</span>`:'';
+  return res+`<button style="font-size:10.5px;padding:1px 7px" onclick="fuQueue([{arr:'${jsq(g.arr)}',pid:${+g.pid},title:'${jsq(g.title)}'}])">${f?'again':'find fuller'}</button>`;
+}
+async function fuQueue(items){
+  try{ _fu=await (await fetch('/api/fuller/queue',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({items})})).json(); }catch(e){ return; }
+  fuPaint(); fuPoll();
+}
+function fuQueueAll(){
+  const all=(_brData&&_brData.under||[]).filter(g=>(!_brLib||g.library===_brLib)&&g.pid&&g.arr);
+  if(!all.length) return;
+  const files=all.reduce((a,g)=>a+g.n,0);
+  if(!confirm(`Search for fuller copies of ${all.length} titles (${files} files)?\n\nEach starved file is searched on the indexers and the best fuller release the profile accepts is grabbed. This runs in the background, one title at a time.`)) return;
+  fuQueue(all.map(g=>({arr:g.arr,pid:g.pid,title:g.title})));
+}
+async function fuCancel(){ try{ _fu=await (await fetch('/api/fuller/cancel',{method:'POST'})).json(); }catch(e){} fuPaint(); }
+async function fuLoad(){ try{ _fu=await (await fetch('/api/fuller')).json(); }catch(e){} fuPaint(); fuPoll(); }
+function fuPoll(){
+  clearTimeout(_fuT);
+  if(_fu&&(_fu.running||(_fu.queue||[]).length)) _fuT=setTimeout(()=>shownPoll('brBox', fuLoad), 2000);
+}
+function fuPaint(){
+  const box=document.getElementById('fuBox'); if(!box||!_fu) return;
+  // the per-row buttons follow the state too
+  const s=_fu, q=s.queue||[], log=(s.log||[]).slice(0,12);
+  const pct=s.total?Math.round(100*s.done/s.total):0;
+  const col={grab:'#7fd4a3',none:'var(--dim)',skip:'var(--dim)',error:'#e0575b'};
+  const icon={grab:'↓',none:'·',skip:'–',error:'✗'};
+  const live=s.running?`<div style="display:flex;align-items:center;gap:10px;margin-top:2px">
+      <span class="dlspin"></span>
+      <div style="min-width:0;flex:1">
+        <div style="font-size:12px"><b>${esc(s.title)}</b> <span class="dim">· ${esc(s.arr)}</span>
+          ${s.file?` <span class="dim">·</span> <span class="mono">${esc(s.file)}</span>`:''}
+          ${s.step?` <span style="color:var(--acc)">— ${esc(s.step)}</span>`:''}</div>
+        <div style="height:5px;border-radius:3px;background:var(--line);margin-top:5px;overflow:hidden">
+          <div style="height:100%;width:${pct}%;background:var(--acc);transition:width .6s"></div></div>
+        <div class="dim" style="font-size:10.5px;margin-top:3px">file ${Math.min(s.done+1,s.total||1)} of ${s.total||'?'}
+          · <span style="color:#7fd4a3">${s.grabbed} grabbed</span> · ${s.none} nothing fuller${s.skipped?` · ${s.skipped} skipped`:''}
+          · ${Math.round((s.now-s.started)/60)} min${q.length?` · ${q.length} more title${q.length>1?'s':''} queued`:''}</div>
+      </div>
+      <button style="font-size:10.5px" onclick="fuCancel()" title="Clear the queue and stop after the file being searched">stop</button></div>`:'';
+  const recent=log.length?`<div style="margin-top:6px;font-size:11px;max-height:190px;overflow:auto">${log.map(l=>`<div style="display:flex;gap:8px;padding:1px 0">
+      <span class="dim mono" style="flex:none;width:46px;text-align:right">${ago(l.at)}</span>
+      <span style="flex:none;width:12px;color:${col[l.kind]||'var(--dim)'}">${icon[l.kind]||'·'}</span>
+      <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><span class="dim">${esc(l.title)}</span> ${esc(l.text)}</span></div>`).join('')}</div>`:'';
+  box.innerHTML=(live||recent)?`<div style="margin:6px 0 4px;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:rgba(255,255,255,.02)">
+      ${live||`<div class="dim" style="font-size:11px">fuller-copy search idle${(s.finished||[]).length?` · last: <b>${esc(s.finished[0].title)}</b> — ${s.finished[0].grabbed} grabbed, ${s.finished[0].none} nothing fuller`:''}</div>`}
+      ${recent}</div>`:'';
+  // refresh the row buttons without repainting the list (keeps scroll)
+  if(_brData) document.querySelectorAll('#brBox tr[data-g]').forEach(tr=>{
+    const g=_brData.under[+tr.dataset.g]; const td=tr.lastElementChild; if(g&&td) td.innerHTML=fuBtn(g); });
 }
 function brToggle(k){ _brOpen[k]=!_brOpen[k]; brPaint(); }
 function brLib(v){ _brLib=v; brPaint(); }
@@ -36876,8 +36971,8 @@ function brPaint(){
     const files=all.reduce((a,g)=>a+g.n,0);
     const rows=!open?'':`<div class="rowbox" style="max-height:420px;margin-top:4px"><table class="sktbl" style="width:100%;font-size:11.5px">
       <thead><tr class="dim" style="font-size:10.5px"><th class="l">title</th><th class="l">library</th><th class="c">codec</th><th class="c">files</th>
-        <th class="c" title="Average of the files outside the range">average</th><th class="c">${k==='under'?'lowest':'highest'}</th><th class="c">${k==='under'?'floor':'ceiling'}</th><th class="c">size</th></tr></thead>
-      <tbody>${all.map(g=>`<tr>
+        <th class="c" title="Average of the files outside the range">average</th><th class="c">${k==='under'?'lowest':'highest'}</th><th class="c">${k==='under'?'floor':'ceiling'}</th><th class="c">size</th>${k==='under'?'<th class="c" title="Search the indexers for a fuller copy of every starved file of this title, and grab the best one">fix</th>':''}</tr></thead>
+      <tbody>${all.map(g=>`<tr ${k==='under'?`data-g="${d.under.indexOf(g)}"`:''}>
         <td class="l" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:420px">${g.pid&&g.arr?`<img src="/api/poster/${encodeURIComponent(g.arr)}/${g.pid}" loading="lazy" alt="" style="width:18px;height:27px;object-fit:cover;border-radius:2px;vertical-align:middle;margin-right:7px;background:var(--line)" onerror="this.style.visibility='hidden'">`:''}${esc(g.title)}</td>
         <td class="l dim">${esc(g.library||'')}</td>
         <td class="c dim">${g.fam==='hevc'?'HEVC':g.fam==='h264'?'H.264':'AV1'} ${g.res}</td>
@@ -36885,10 +36980,13 @@ function brPaint(){
         <td class="c mono" style="color:${col};font-weight:600">${g.avg} Mbps</td>
         <td class="c mono dim">${k==='under'?g.lo:g.hi}</td>
         <td class="c mono dim">${k==='under'?g.floor:g.ceil}</td>
-        <td class="c dim">${g.gb>=10?Math.round(g.gb):g.gb} GB</td></tr>`).join('')}</tbody></table></div>
+        <td class="c dim">${g.gb>=10?Math.round(g.gb):g.gb} GB</td>
+        ${k==='under'?`<td class="c" style="white-space:nowrap">${fuBtn(g)}</td>`:''}</tr>`).join('')}</tbody></table></div>
       ${d[k+'_total']>d[k].length?`<div class="dim" style="font-size:10.5px;margin-top:3px">showing the first ${d[k].length} of ${n(d[k+'_total'])} titles</div>`:''}`;
     return `<div style="margin-top:10px"><span style="cursor:pointer" onclick="brToggle('${k}')" title="${esc(tip)}"><span class="actcaret">${open?'▾':'▸'}</span>
-      <b style="color:${col}">${head}</b> <span class="dim" style="font-size:11.5px">${n(all.length)} titles · ${n(files)} files</span></span>${rows}</div>`;
+      <b style="color:${col}">${head}</b> <span class="dim" style="font-size:11.5px">${n(_brLib?all.length:d[k+'_total'])} titles${_brLib||d[k+'_total']<=d[k].length?` · ${n(files)} files`:''}</span></span>
+      ${k==='under'&&open?`<span style="margin-left:12px"><button style="font-size:11px" onclick="fuQueueAll()" title="Queue a fuller-copy search for every title in this list (the library filter applies)">find fuller copies for all ${n(all.filter(g=>g.pid&&g.arr).length)}</button></span>`:''}
+      ${k==='under'?'<div id="fuBox"></div>':''}${rows}</div>`;
   };
   el.innerHTML=`<div class="lkind" style="padding:10px 12px">
     <b style="color:#6fb0ff">Bitrate check</b>
@@ -36903,6 +37001,7 @@ function brPaint(){
     ${list('under','#e0575b','Under — should be replaced','Starved copies, the furthest below the floor first. A fuller release is the fix; converting cannot add detail back.')}
     ${list('over','#e2b341','Over — oversized','More bits than the picture shows, the most disk first. Nothing is wrong with these; they are where space can be won back.')}
   </div>`;
+  fuPaint();
 }
 async function loadConvert(force){
   const el=document.getElementById('convBox'); if(!el) return;
