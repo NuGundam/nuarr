@@ -158,7 +158,7 @@ def report(force: bool = False) -> dict:
             rows.append({**{k: g[k] for k in ("library", "title", "fam", "res", "anim", "n", "arr", "pid")},
                          "avg": round(g["sum"] / g["n"], 1), "lo": round(g["lo"], 1),
                          "hi": round(g["hi"], 1), "gb": round(g["gb"], 1),
-                         "floor": g["lim"][0], "ceil": g["lim"][3]})
+                         "floor": g["lim"][0], "ceil": g["lim"][3], "rlo": g["lim"][1], "rhi": g["lim"][2]})
         rows.sort(key=key)
         return rows
     data = {"at": time.time(), "anim_scale": ANIM_SCALE, "anim_floor_scale": ANIM_FLOOR_SCALE, "measured_ok": MEASURED_OK,

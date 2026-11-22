@@ -517,3 +517,103 @@ def snapshot() -> dict:
             "recent": _recent()[:RECENT_KEEP],
             "active": [dict(v) for v in ACTIVE.values()],
             "sweep": dict(SWEEP), "now": time.time()}
+
+
+# ------------------------------------------------------- fuller copies ----
+# THE SAME ENGINE, A DIFFERENT QUESTION. The Bitrate check's "find fuller"
+# asks not "is anything better by the profile" but "is there a copy of this
+# episode with more bits that the profile likes at least as well". Prowlarr
+# is asked exactly as above and every name is read with the arr's parser; then
+# only singles (a pack's per-episode bitrate is a guess), not Remux, at least
+# the file's resolution and at least min_size bytes are kept, ranked by the
+# profile (quality, score) and then size.
+#
+# THE ARR SAYS "NOT AN UPGRADE" TO A FULLER COPY OF THE SAME QUALITY - it does
+# not weigh bits. A push refused ONLY for that kind of reason is followed by
+# the arr's own manual grab of the pushed release (POST /release with the
+# guid the push answered with), which is what its interactive search does
+# when a person clicks a release it marked as not an upgrade. Any other
+# refusal (blocklisted, banned, wrong language, size limits) moves on.
+SOFT_REJECT = ("equal or higher", "not an upgrade", "not a custom format upgrade", "is not wanted in profile",
+               "existing file", "cutoff", "already meets", "not an improvement")
+
+
+def _qheight(qname: str) -> int:
+    m = re.search(r"(\d{3,4})p", qname or "")
+    return int(m.group(1)) if m else (480 if qname in ("SDTV", "DVD", "DVD-R") else 0)
+
+
+async def _push_or_grab(client, a, c: dict) -> tuple[bool, str]:
+    body = {"title": c["title"], "downloadUrl": c["downloadUrl"], "protocol": c["protocol"],
+            "publishDate": c["publishDate"] or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "size": c["size"], "indexer": c["indexer"]}
+    try:
+        r = await client._post("/release/push", body)
+    except Exception as e:                                       # noqa: BLE001
+        txt = ""
+        try:
+            txt = e.response.text[:200]                          # type: ignore[attr-defined]
+        except Exception:                                        # noqa: BLE001
+            pass
+        return False, f"push: {type(e).__name__}: {txt or e}"[:200]
+    rows = [x for x in (r if isinstance(r, list) else [r]) if isinstance(x, dict)]
+    rej = [str(j) for x in rows for j in (x.get("rejections") or [])]
+    if rows and not rej and (rows[0].get("approved") or rows[0].get("downloadAllowed") or "approved" not in rows[0]):
+        return True, "pushed"
+    hard = [j for j in rej if not any(s in j.lower() for s in SOFT_REJECT)]
+    if hard or not rows:
+        return False, "; ".join(rej)[:200] or "refused"
+    try:
+        await client._post("/release", {"guid": rows[0].get("guid"), "indexerId": int(rows[0].get("indexerId") or 0)})
+        return True, "grabbed past: " + "; ".join(rej)[:120]
+    except Exception as e:                                       # noqa: BLE001
+        txt = ""
+        try:
+            txt = e.response.text[:160]                          # type: ignore[attr-defined]
+        except Exception:                                        # noqa: BLE001
+            pass
+        return False, f"grab after push: {type(e).__name__}: {txt or e}"[:200]
+
+
+async def find_fuller(a, want: dict, min_size: int, min_height: int, step=None) -> dict:
+    """want as for find(). -> {ok, release, mbps_size, why, found, raw}"""
+    from .arr import shared_client
+    from .arrqueue import _call
+    client = shared_client(a)
+    say = step or (lambda s: None)
+    say("reading the quality profile")
+    prof = await asyncio.to_thread(_profile, lambda p: _call(a, p), a, want["profileId"])
+    if a.kind == "sonarr":
+        qs = [{"query": want["title"], "type": "tvsearch", "season": want["season"], "ep": want["episode"], "limit": 200}]
+        if want.get("tvdbId"):
+            qs.append({"query": want["title"], "type": "tvsearch", "tvdbId": want["tvdbId"], "season": want["season"],
+                       "ep": want["episode"], "limit": 200})
+    else:
+        qs = [{"query": f"{want['title']} {want.get('year') or ''}".strip(), "type": "movie", "limit": 200}]
+        if want.get("tmdbId"):
+            qs.append({"query": want["title"], "type": "movie", "tmdbId": want["tmdbId"], "limit": 200})
+    say(f"asking Prowlarr ({len(qs)} queries, every indexer)")
+    raw = await _searches(qs)
+    rows = [r for r in _prefilter(raw, want.get("season"), want.get("episode"), a.kind)
+            if int(r.get("size") or 0) >= min_size]
+    say(f"reading {min(len(rows), PARSE_MAX)} of {len(raw)} names with {a.name}'s parser")
+    cands = await _read(client, a, rows, want, prof)
+    blocked = await _blocklisted(client, a, want)
+    cands = [c for c in cands if not c["pack"] and "Remux" not in c["quality"] and c["size"] >= min_size
+             and _qheight(c["quality"]) >= min_height and _norm(c["title"]) not in blocked
+             and not (c["protocol"] == "torrent" and c.get("seeders") is not None and int(c["seeders"] or 0) < 2)]
+    order = _distinct(sorted(cands, key=lambda c: (c["qrank"], c["score"], c["size"]), reverse=True))
+    if not order:
+        return {"ok": False, "why": f"nothing fuller among {len(raw)} names from Prowlarr", "raw": len(raw), "found": 0}
+    refused = []
+    for c in order[:TRY_MAX]:
+        say(f"handing {c['title'][:70]} to {a.name}" + (f" (try {len(refused) + 1})" if refused else ""))
+        ok, why = await _push_or_grab(client, a, c)
+        if ok:
+            STATS["pushed"] += 1
+            return {"ok": True, "release": c["title"], "size": c["size"], "quality": c["quality"], "score": c["score"],
+                    "indexer": c["indexer"], "protocol": c["protocol"], "seeders": c.get("seeders"), "how": why,
+                    "raw": len(raw), "found": len(order), "refused": len(refused)}
+        refused.append(f"{c['title'][:50]}: {why}")
+    return {"ok": False, "why": f"the arr refused {len(refused)} fuller name(s): " + " | ".join(refused)[:300],
+            "raw": len(raw), "found": len(order)}

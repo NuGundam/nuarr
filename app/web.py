@@ -1093,6 +1093,9 @@ async def _startup() -> None:
     asyncio.create_task(_arrqueue.watch())
     from . import prowlsearch as _prowlsearch
     asyncio.create_task(_prowlsearch.watch())
+    # FULLER COPIES' AUTO BACKLOG: off until switched on in the Bitrate check.
+    from . import fuller as _fuller
+    asyncio.create_task(_fuller.watch())
     # Import loops: a release the arr takes, nuarr rewrites, the arr takes
     # again (Bleach S17E50, fifteen laps in a night). Reads the arr's history.
     from . import arrloop as _arrloop
@@ -12155,7 +12158,14 @@ async def api_fuller_queue(request: Request):
     """Queue titles ({items:[{arr,pid,title}]}) for a fuller-copy search."""
     from . import fuller
     body = await request.json()
-    return fuller.queue(body.get("items") or [])
+    return fuller.queue(body.get("items") or [], source="by hand")
+
+
+@app.post("/api/fuller/auto")
+def api_fuller_auto(on: int = 1):
+    """Auto backlog: queue the most starved titles on its own every few hours."""
+    from . import fuller
+    return fuller.set_auto(bool(on))
 
 
 @app.post("/api/fuller/cancel")
@@ -36908,6 +36918,7 @@ function fuQueueAll(){
   if(!confirm(`Search for fuller copies of ${all.length} titles (${files} files)?\n\nEach starved file is searched on the indexers and the best fuller release the profile accepts is grabbed. This runs in the background, one title at a time.`)) return;
   fuQueue(all.map(g=>({arr:g.arr,pid:g.pid,title:g.title})));
 }
+async function fuAuto(on){ try{ _fu=await (await fetch('/api/fuller/auto?on='+(on?1:0),{method:'POST'})).json(); }catch(e){} brPaint(); }
 async function fuCancel(){ try{ _fu=await (await fetch('/api/fuller/cancel',{method:'POST'})).json(); }catch(e){} fuPaint(); }
 async function fuLoad(){ try{ _fu=await (await fetch('/api/fuller')).json(); }catch(e){} fuPaint(); fuPoll(); }
 function fuPoll(){
@@ -36924,7 +36935,7 @@ function fuPaint(){
   const live=s.running?`<div style="display:flex;align-items:center;gap:10px;margin-top:2px">
       <span class="dlspin"></span>
       <div style="min-width:0;flex:1">
-        <div style="font-size:12px"><b>${esc(s.title)}</b> <span class="dim">· ${esc(s.arr)}</span>
+        <div style="font-size:12px"><b>${esc(s.title)}</b> <span class="dim">· ${esc(s.arr)}${s.source?' · '+esc(s.source):''}</span>
           ${s.file?` <span class="dim">·</span> <span class="mono">${esc(s.file)}</span>`:''}
           ${s.step?` <span style="color:var(--acc)">— ${esc(s.step)}</span>`:''}</div>
         <div style="height:5px;border-radius:3px;background:var(--line);margin-top:5px;overflow:hidden">
@@ -36938,8 +36949,9 @@ function fuPaint(){
       <span class="dim mono" style="flex:none;width:46px;text-align:right">${ago(l.at)}</span>
       <span style="flex:none;width:12px;color:${col[l.kind]||'var(--dim)'}">${icon[l.kind]||'·'}</span>
       <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><span class="dim">${esc(l.title)}</span> ${esc(l.text)}</span></div>`).join('')}</div>`:'';
-  box.innerHTML=(live||recent)?`<div style="margin:6px 0 4px;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:rgba(255,255,255,.02)">
+  box.innerHTML=(live||recent||s.auto)?`<div style="margin:6px 0 4px;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:rgba(255,255,255,.02)">
       ${live||`<div class="dim" style="font-size:11px">fuller-copy search idle${(s.finished||[]).length?` · last: <b>${esc(s.finished[0].title)}</b> — ${s.finished[0].grabbed} grabbed, ${s.finished[0].none} nothing fuller`:''}</div>`}
+      ${s.auto?`<div class="dim" style="font-size:10.5px;margin-top:4px">auto backlog on · next look ${s.auto_next>s.now?'in '+Math.max(1,Math.round((s.auto_next-s.now)/60))+' min':'soon'}${s.auto_last?' · last: '+esc(s.auto_last):''}</div>`:''}
       ${recent}</div>`:'';
   // refresh the row buttons without repainting the list (keeps scroll)
   if(_brData) document.querySelectorAll('#brBox tr[data-g]').forEach(tr=>{
@@ -36971,7 +36983,7 @@ function brPaint(){
     const files=all.reduce((a,g)=>a+g.n,0);
     const rows=!open?'':`<div class="rowbox" style="max-height:420px;margin-top:4px"><table class="sktbl" style="width:100%;font-size:11.5px">
       <thead><tr class="dim" style="font-size:10.5px"><th class="l">title</th><th class="l">library</th><th class="c">codec</th><th class="c">files</th>
-        <th class="c" title="Average of the files outside the range">average</th><th class="c">${k==='under'?'lowest':'highest'}</th><th class="c">${k==='under'?'floor':'ceiling'}</th><th class="c">size</th>${k==='under'?'<th class="c" title="Search the indexers for a fuller copy of every starved file of this title, and grab the best one">fix</th>':''}</tr></thead>
+        <th class="c" title="Average of the files outside the range">average</th><th class="c">${k==='under'?'lowest':'highest'}</th><th class="c">${k==='under'?'floor':'ceiling'}</th><th class="c" title="The recommended bitrate for this codec and resolution - what a good copy carries">should be</th><th class="c">size</th>${k==='under'?'<th class="c" title="Search the indexers for a fuller copy of every starved file of this title, and grab the best one">fix</th>':''}</tr></thead>
       <tbody>${all.map(g=>`<tr ${k==='under'?`data-g="${d.under.indexOf(g)}"`:''}>
         <td class="l" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:420px">${g.pid&&g.arr?`<img src="/api/poster/${encodeURIComponent(g.arr)}/${g.pid}" loading="lazy" alt="" style="width:18px;height:27px;object-fit:cover;border-radius:2px;vertical-align:middle;margin-right:7px;background:var(--line)" onerror="this.style.visibility='hidden'">`:''}${esc(g.title)}</td>
         <td class="l dim">${esc(g.library||'')}</td>
@@ -36980,11 +36992,13 @@ function brPaint(){
         <td class="c mono" style="color:${col};font-weight:600">${g.avg} Mbps</td>
         <td class="c mono dim">${k==='under'?g.lo:g.hi}</td>
         <td class="c mono dim">${k==='under'?g.floor:g.ceil}</td>
+        <td class="c mono" style="color:#7fd4a3;white-space:nowrap">${g.rlo}–${g.rhi} Mbps</td>
         <td class="c dim">${g.gb>=10?Math.round(g.gb):g.gb} GB</td>
         ${k==='under'?`<td class="c" style="white-space:nowrap">${fuBtn(g)}</td>`:''}</tr>`).join('')}</tbody></table></div>
       ${d[k+'_total']>d[k].length?`<div class="dim" style="font-size:10.5px;margin-top:3px">showing the first ${d[k].length} of ${n(d[k+'_total'])} titles</div>`:''}`;
     return `<div style="margin-top:10px"><span style="cursor:pointer" onclick="brToggle('${k}')" title="${esc(tip)}"><span class="actcaret">${open?'▾':'▸'}</span>
       <b style="color:${col}">${head}</b> <span class="dim" style="font-size:11.5px">${n(_brLib?all.length:d[k+'_total'])} titles${_brLib||d[k+'_total']<=d[k].length?` · ${n(files)} files`:''}</span></span>
+      ${k==='under'?`<label class="gsw" style="display:inline-flex;margin-left:12px;vertical-align:middle" title="Auto backlog: every 3 hours nuarr takes the most starved titles not tried lately (about 40 files) and looks for fuller copies itself, with the Prowlarr searcher's engine. A title is tried again 3 days after a grab, 21 days after nothing fuller was found."><input type="checkbox" ${_fu&&_fu.auto?'checked':''} onchange="fuAuto(this.checked)"><span class="gname">Auto backlog</span><span class="gstate ${_fu&&_fu.auto?'on':'off'}">${_fu&&_fu.auto?'on':'off'}</span></label>`:''}
       ${k==='under'&&open?`<span style="margin-left:12px"><button style="font-size:11px" onclick="fuQueueAll()" title="Queue a fuller-copy search for every title in this list (the library filter applies)">find fuller copies for all ${n(all.filter(g=>g.pid&&g.arr).length)}</button></span>`:''}
       ${k==='under'?'<div id="fuBox"></div>':''}${rows}</div>`;
   };
