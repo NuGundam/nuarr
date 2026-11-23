@@ -20,7 +20,7 @@ import json
 import re
 import time
 
-from .db import kv_get, kv_set
+from .db import cursor, kv_get, kv_set
 
 KV = "fuller.grabs"
 KEEP_S = 14 * 86400        # a grab older than this is not ours to force any more
@@ -31,10 +31,18 @@ def _norm(s: str) -> str:
 
 
 def _load() -> list:
+    # Read the table, not kv_get's in-process cache: grabs are also recorded
+    # by scripts outside nuarr, and a cached read here wrote over them
+    # (2026-11-23: 12 Pitt/SNW grabs lost, all deleted as "not an upgrade").
     try:
-        return json.loads(kv_get(KV) or "[]")
+        with cursor() as cur:
+            row = cur.execute("SELECT v FROM kv WHERE k=?", (KV,)).fetchone()
+        return json.loads((row["v"] if row else None) or "[]")
     except Exception:                                            # noqa: BLE001
-        return []
+        try:
+            return json.loads(kv_get(KV) or "[]")
+        except Exception:                                        # noqa: BLE001
+            return []
 
 
 def remember(arr: str, kind: str, item_id: int, release: str) -> None:
