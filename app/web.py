@@ -36931,6 +36931,14 @@ function fuPoll(){
   if(_fu&&(_fu.running||(_fu.queue||[]).length)) _fuT=setTimeout(()=>shownPoll('brBox', fuLoad), 2000);
 }
 function fuPaint(){
+  // the Auto backlog box is drawn with the list, often before /api/fuller has
+  // answered - it showed OFF after a reload until the section was opened
+  if(_fu){
+    const lab=document.querySelector('#brBox [data-list="under"] label.gsw');
+    if(lab){ const cb=lab.querySelector('input'), st=lab.querySelector('.gstate');
+      if(cb) cb.checked=!!_fu.auto;
+      if(st){ st.textContent=_fu.auto?'on':'off'; st.className='gstate '+(_fu.auto?'on':'off'); } }
+  }
   const box=document.getElementById('fuBox'); if(!box||!_fu) return;
   // the per-row buttons follow the state too
   const s=_fu, q=s.queue||[], log=(s.log||[]).slice(0,12);

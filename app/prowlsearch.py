@@ -560,7 +560,7 @@ def _qheight(qname: str) -> int:
     return int(m.group(1)) if m else (480 if qname in ("SDTV", "DVD", "DVD-R") else 0)
 
 
-async def _push_or_grab(client, a, c: dict) -> tuple[bool, str]:
+async def _push_or_grab(client, a, c: dict, want: dict | None = None, own: dict | None = None) -> tuple[bool, str]:
     body = {"title": c["title"], "downloadUrl": c["downloadUrl"], "protocol": c["protocol"],
             "publishDate": c["publishDate"] or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "size": c["size"], "indexer": c["indexer"]}
@@ -580,8 +580,27 @@ async def _push_or_grab(client, a, c: dict) -> tuple[bool, str]:
     hard = [j for j in rej if not any(s in j.lower() for s in SOFT_REJECT)]
     if hard or not rows:
         return False, "; ".join(rej)[:200] or "refused"
+    # A PUSHED RELEASE CANNOT BE GRABBED BY ITS GUID: the push answers with
+    # indexerId 0 and the arr keeps no copy of it, so POST /release failed
+    # "Indexer Id must be greater than 0" on every soft refusal (2026-11-23,
+    # every auto-backlog title). The arr's OWN search of the episode or film
+    # does keep its rows, so that is run once per item and the same name is
+    # grabbed from it - what a person does in Interactive Search.
     try:
-        await client._post("/release", {"guid": rows[0].get("guid"), "indexerId": int(rows[0].get("indexerId") or 0)})
+        from .arrqueue import _call
+        own = own if own is not None else {}
+        if "rows" not in own:
+            q = (f"/api/v3/release?episodeId={want['episodeId']}" if a.kind == "sonarr"
+                 else f"/api/v3/release?movieId={want['movieId']}") if want else ""
+            got = await asyncio.to_thread(_call, a, q, "GET", None, 240.0) if q else []
+            own["rows"] = got if isinstance(got, list) else []
+        key = _norm(c["title"])
+        hit = next((x for x in own["rows"] if _norm(x.get("title") or "") == key and int(x.get("indexerId") or 0) > 0
+                    and not [j for j in (x.get("rejections") or []) if not any(s in str(j).lower() for s in SOFT_REJECT)]),
+                   None)
+        if not hit:
+            return False, f"refused as not an upgrade, and not among the {len(own['rows'])} names of the arr's own search"
+        await client._post("/release", {"guid": hit.get("guid"), "indexerId": int(hit["indexerId"])})
         return True, "grabbed past: " + "; ".join(rej)[:120]
     except Exception as e:                                       # noqa: BLE001
         txt = ""
@@ -620,9 +639,10 @@ async def find_fuller(a, want: dict, min_size: int, min_height: int, step=None) 
     if not order:
         return {"ok": False, "why": f"nothing fuller among {len(raw)} names from Prowlarr", "raw": len(raw), "found": 0}
     refused = []
+    own: dict = {}          # the arr's own search rows, fetched once if a push is refused
     for c in order[:TRY_MAX]:
         say(f"handing {c['title'][:70]} to {a.name}" + (f" (try {len(refused) + 1})" if refused else ""))
-        ok, why = await _push_or_grab(client, a, c)
+        ok, why = await _push_or_grab(client, a, c, want, own)
         if ok:
             STATS["pushed"] += 1
             try:
