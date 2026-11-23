@@ -124,14 +124,18 @@ def report(force: bool = False) -> dict:
             continue
         mbps = bps / 1e6
         v = verdict(mbps, lim, (meas.get(r["id"]) or 0) >= MEASURED_OK)
-        c = cells.setdefault((fam, res, anim), {"n": 0, "under": 0, "over": 0, "ok": 0, "measured": 0,
-                                                "gb": 0.0, "over_gb": 0.0, "all": []})
-        c["n"] += 1
-        c[v] += 1
-        c["gb"] += (r["size"] or 0) / 1e9
-        c["all"].append(mbps)
-        if v == "over":
-            c["over_gb"] += (r["size"] or 0) / 1e9
+        # THE TABLE FOLLOWS THE LIBRARY FILTER. Cells are kept per library
+        # ("" = every library), so picking TV Shows shows TV Shows' counts and
+        # medians, not the whole collection's under a TV Shows heading.
+        for lib in ("", r["library"] or "?"):
+            c = cells.setdefault((lib, fam, res, anim), {"n": 0, "under": 0, "over": 0, "ok": 0, "measured": 0,
+                                                         "gb": 0.0, "over_gb": 0.0, "all": []})
+            c["n"] += 1
+            c[v] += 1
+            c["gb"] += (r["size"] or 0) / 1e9
+            c["all"].append(mbps)
+            if v == "over":
+                c["over_gb"] += (r["size"] or 0) / 1e9
         if v in groups:
             g = groups[v].setdefault((r["library"], r["title"] or "?", fam, res), {
                 "library": r["library"], "title": r["title"] or "?", "fam": fam, "res": res,
@@ -142,15 +146,20 @@ def report(force: bool = False) -> dict:
             g["lo"] = min(g["lo"], mbps)
             g["hi"] = max(g["hi"], mbps)
             g["gb"] += (r["size"] or 0) / 1e9
-    table = []
-    for (fam, res, anim), c in cells.items():
+    tables: dict = {}
+    for (lib, fam, res, anim), c in cells.items():
         a = sorted(c.pop("all"))
         lim = limits(fam, res, anim)
-        table.append({"fam": fam, "name": FAM_NAME[fam], "res": res, "anim": anim,
-                      "floor": lim[0], "lo": lim[1], "hi": lim[2], "ceil": lim[3],
-                      "median": round(a[len(a) // 2], 1), **{k: (round(v, 1) if isinstance(v, float) else v)
-                                                             for k, v in c.items()}})
-    table.sort(key=lambda t: (t["anim"], ["hevc", "h264", "av1"].index(t["fam"]), RES_ORDER.index(t["res"])))
+        m = len(a) // 2
+        tables.setdefault(lib, []).append({
+            "fam": fam, "name": FAM_NAME[fam], "res": res, "anim": anim,
+            "floor": lim[0], "lo": lim[1], "hi": lim[2], "ceil": lim[3],
+            # a true median: the mean of the middle two when the count is even
+            "median": round(a[m] if len(a) % 2 else (a[m - 1] + a[m]) / 2, 1),
+            **{k: (round(v, 1) if isinstance(v, float) else v) for k, v in c.items()}})
+    for t in tables.values():
+        t.sort(key=lambda t: (t["anim"], ["hevc", "h264", "av1"].index(t["fam"]), RES_ORDER.index(t["res"])))
+    table = tables.pop("", [])
 
     def out(d, key):
         rows = []
@@ -162,7 +171,7 @@ def report(force: bool = False) -> dict:
         rows.sort(key=key)
         return rows
     data = {"at": time.time(), "anim_scale": ANIM_SCALE, "anim_floor_scale": ANIM_FLOOR_SCALE, "measured_ok": MEASURED_OK,
-            "files": sum(t["n"] for t in table), "table": table,
+            "files": sum(t["n"] for t in table), "table": table, "libtables": tables,
             # under: the most starved first (furthest below the floor, as a share)
             "under": out(groups["under"], lambda g: (g["avg"] / g["floor"], -g["n"])),
             # over: the most disk to win back first

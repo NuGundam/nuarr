@@ -12180,8 +12180,9 @@ def api_bitrate(force: int = 0):
     """Recommended bitrate per codec and resolution, and the files outside it."""
     from . import bitrate
     d = bitrate.report(bool(force))
-    return {**d, "under_total": len(d["under"]), "over_total": len(d["over"]),
-            "under": d["under"][:400], "over": d["over"][:400]}
+    # The whole lists: a cap here cut them BEFORE the page's library filter,
+    # so a filtered list could miss titles. They are a few hundred rows.
+    return {**d, "under_total": len(d["under"]), "over_total": len(d["over"])}
 
 
 @app.get("/api/convert")
@@ -36889,7 +36890,6 @@ async function loadBitrate(force){
 // fuller. It runs one title at a time; the strip below says which title, which
 // file and which step, with the counts and the last results.
 let _fu=null, _fuT=null;
-const fuKey=(a,p)=>a+'/'+p;
 function fuState(g){
   if(!_fu||!g.pid) return '';
   if(_fu.running && _fu.arr===g.arr && +_fu.pid===+g.pid) return 'run';
@@ -36918,7 +36918,12 @@ function fuQueueAll(){
   if(!confirm(`Search for fuller copies of ${all.length} titles (${files} files)?\n\nEach starved file is searched on the indexers and the best fuller release the profile accepts is grabbed. This runs in the background, one title at a time.`)) return;
   fuQueue(all.map(g=>({arr:g.arr,pid:g.pid,title:g.title})));
 }
-async function fuAuto(on){ try{ _fu=await (await fetch('/api/fuller/auto?on='+(on?1:0),{method:'POST'})).json(); }catch(e){} brPaint(); }
+async function fuAuto(on){
+  try{ _fu=await (await fetch('/api/fuller/auto?on='+(on?1:0),{method:'POST'})).json(); }catch(e){}
+  const st=document.querySelector('#brBox [data-list="under"] .gstate');
+  if(st&&_fu){ st.textContent=_fu.auto?'on':'off'; st.className='gstate '+(_fu.auto?'on':'off'); }
+  fuPaint();
+}
 async function fuCancel(){ try{ _fu=await (await fetch('/api/fuller/cancel',{method:'POST'})).json(); }catch(e){} fuPaint(); }
 async function fuLoad(){ try{ _fu=await (await fetch('/api/fuller')).json(); }catch(e){} fuPaint(); fuPoll(); }
 function fuPoll(){
@@ -36958,13 +36963,43 @@ function fuPaint(){
     const g=_brData.under[+tr.dataset.g]; const td=tr.lastElementChild; if(g&&td) td.innerHTML=fuBtn(g); });
 }
 function brToggle(k){ _brOpen[k]=!_brOpen[k]; brPaint(); }
+// COLUMN SORTING. Click a heading to sort by it, again to reverse; numbers
+// start largest first, words A-Z. The summary table sorts within each half
+// (live action, animation) so the two figure sets never interleave.
+let _brSort={table:null, under:null, over:null};
+const BR_FAM=['hevc','h264','av1'], BR_RES=['2160p','1080p','720p','SD'];
+function brSortBy(t,k,text){
+  const s=_brSort[t];
+  _brSort[t]= s&&s.k===k ? {k, dir:-s.dir} : {k, dir:text?1:-1};
+  // keep the open list's scroll position across the repaint
+  const box=document.querySelector(`#brBox [data-list="${t}"] .rowbox`), top=box?box.scrollTop:0;
+  brPaint();
+  const nb=document.querySelector(`#brBox [data-list="${t}"] .rowbox`); if(nb) nb.scrollTop=top;
+}
+function brSorted(t,rows){
+  const s=_brSort[t]; if(!s) return rows;
+  const val=g=>{
+    switch(s.k){
+      case 'codec': return BR_FAM.indexOf(g.fam)*10+BR_RES.indexOf(g.res);
+      case 'res': return -BR_RES.indexOf(g.res);
+      case 'title': case 'library': case 'name': return String(g[s.k]||'').toLowerCase();
+      default: return +g[s.k]||0;
+    }
+  };
+  return rows.slice().sort((a,b)=>{ const x=val(a), y=val(b); return (x<y?-1:x>y?1:0)*s.dir; });
+}
+function brTh(t,k,label,cls,tip,text){
+  const s=_brSort[t], on=s&&s.k===k;
+  return `<th class="${cls||'c'}" style="cursor:pointer;user-select:none;${on?'color:var(--fg)':''}" title="${esc((tip?tip+' - ':'')+'click to sort')}" onclick="brSortBy('${t}','${k}',${text?1:0})">${label}${on?(s.dir>0?' ▴':' ▾'):''}</th>`;
+}
 function brLib(v){ _brLib=v; brPaint(); }
 function brPaint(){
   const el=document.getElementById('brBox'), d=_brData; if(!el||!d) return;
   const n=x=>(x||0).toLocaleString();
   const cell=(v,col)=>v?`<span style="color:${col};font-weight:600">${n(v)}</span>`:'<span class="dim">—</span>';
+  const tbl=_brLib?((d.libtables||{})[_brLib]||[]):d.table;
   const half=anim=>{
-    const rows=d.table.filter(t=>!!t.anim===anim);
+    const rows=brSorted('table', tbl.filter(t=>!!t.anim===anim));
     if(!rows.length) return '';
     return `<tr><td colspan="9" class="dim" style="padding:8px 6px 3px;font-size:10.5px;text-transform:uppercase;letter-spacing:.05em">${
       anim?`Animation libraries <span style="text-transform:none;letter-spacing:0">— ${Math.round(d.anim_scale*100)}% of the live-action figures (the floor ${Math.round(d.anim_floor_scale*100)}%); flat colour needs fewer bits</span>`:'Live action'}</td></tr>`
@@ -36977,13 +37012,15 @@ function brPaint(){
       <td class="c">${cell(t.under,'#e0575b')}${t.measured?` <span class="dim" style="font-size:10px" title="Below the floor, but nuarr encoded these itself and measured VMAF ${d.measured_ok}+ - easy content, not a starved copy">+${n(t.measured)} measured</span>`:''}</td>
       <td class="c">${cell(t.over,'#e2b341')}${t.over?` <span class="dim" style="font-size:10px">${n(Math.round(t.over_gb))} GB</span>`:''}</td></tr>`).join('');
   };
-  const libs=[...new Set([...d.under,...d.over].map(g=>g.library))].sort();
+  // every library that has files, not only those with something under or over
+  const libs=Object.keys(d.libtables||{}).filter(l=>l&&l!=='?').sort();
+  const nfiles=tbl.reduce((a,t)=>a+t.n,0);
   const list=(k,col,head,tip)=>{
-    const all=d[k].filter(g=>!_brLib||g.library===_brLib), open=_brOpen[k];
+    const all=brSorted(k, d[k].filter(g=>!_brLib||g.library===_brLib)), open=_brOpen[k];
     const files=all.reduce((a,g)=>a+g.n,0);
     const rows=!open?'':`<div class="rowbox" style="max-height:420px;margin-top:4px"><table class="sktbl" style="width:100%;font-size:11.5px">
-      <thead><tr class="dim" style="font-size:10.5px"><th class="l">title</th><th class="l">library</th><th class="c">codec</th><th class="c">files</th>
-        <th class="c" title="Average of the files outside the range">average</th><th class="c">${k==='under'?'lowest':'highest'}</th><th class="c">${k==='under'?'floor':'ceiling'}</th><th class="c" title="The recommended bitrate for this codec and resolution - what a good copy carries">should be</th><th class="c">size</th>${k==='under'?'<th class="c" title="Search the indexers for a fuller copy of every starved file of this title, and grab the best one">fix</th>':''}</tr></thead>
+      <thead><tr class="dim" style="font-size:10.5px">${brTh(k,'title','title','l','',1)}${brTh(k,'library','library','l','',1)}${brTh(k,'codec','codec')}${brTh(k,'n','files')}
+        ${brTh(k,'avg','average','c','Average of the files outside the range')}${k==='under'?brTh(k,'lo','lowest'):brTh(k,'hi','highest')}${k==='under'?brTh(k,'floor','floor'):brTh(k,'ceil','ceiling')}${brTh(k,'rlo','should be','c','The recommended bitrate for this codec and resolution - what a good copy carries')}${brTh(k,'gb','size')}${k==='under'?'<th class="c" title="Search the indexers for a fuller copy of every starved file of this title, and grab the best one">fix</th>':''}</tr></thead>
       <tbody>${all.map(g=>`<tr ${k==='under'?`data-g="${d.under.indexOf(g)}"`:''}>
         <td class="l" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:420px">${g.pid&&g.arr?`<img src="/api/poster/${encodeURIComponent(g.arr)}/${g.pid}" loading="lazy" alt="" style="width:18px;height:27px;object-fit:cover;border-radius:2px;vertical-align:middle;margin-right:7px;background:var(--line)" onerror="this.style.visibility='hidden'">`:''}${esc(g.title)}</td>
         <td class="l dim">${esc(g.library||'')}</td>
@@ -36995,21 +37032,21 @@ function brPaint(){
         <td class="c mono" style="color:#7fd4a3;white-space:nowrap">${g.rlo}–${g.rhi} Mbps</td>
         <td class="c dim">${g.gb>=10?Math.round(g.gb):g.gb} GB</td>
         ${k==='under'?`<td class="c" style="white-space:nowrap">${fuBtn(g)}</td>`:''}</tr>`).join('')}</tbody></table></div>
-      ${d[k+'_total']>d[k].length?`<div class="dim" style="font-size:10.5px;margin-top:3px">showing the first ${d[k].length} of ${n(d[k+'_total'])} titles</div>`:''}`;
-    return `<div style="margin-top:10px"><span style="cursor:pointer" onclick="brToggle('${k}')" title="${esc(tip)}"><span class="actcaret">${open?'▾':'▸'}</span>
-      <b style="color:${col}">${head}</b> <span class="dim" style="font-size:11.5px">${n(_brLib?all.length:d[k+'_total'])} titles${_brLib||d[k+'_total']<=d[k].length?` · ${n(files)} files`:''}</span></span>
+`;
+    return `<div style="margin-top:10px" data-list="${k}"><span style="cursor:pointer" onclick="brToggle('${k}')" title="${esc(tip)}"><span class="actcaret">${open?'▾':'▸'}</span>
+      <b style="color:${col}">${head}</b> <span class="dim" style="font-size:11.5px">${n(all.length)} titles · ${n(files)} files</span></span>
       ${k==='under'?`<label class="gsw" style="display:inline-flex;margin-left:12px;vertical-align:middle" title="Auto backlog: every 3 hours nuarr takes the most starved titles not tried lately (about 40 files) and looks for fuller copies itself, with the Prowlarr searcher's engine. A title is tried again 3 days after a grab, 21 days after nothing fuller was found."><input type="checkbox" ${_fu&&_fu.auto?'checked':''} onchange="fuAuto(this.checked)"><span class="gname">Auto backlog</span><span class="gstate ${_fu&&_fu.auto?'on':'off'}">${_fu&&_fu.auto?'on':'off'}</span></label>`:''}
       ${k==='under'&&open?`<span style="margin-left:12px"><button style="font-size:11px" onclick="fuQueueAll()" title="Queue a fuller-copy search for every title in this list (the library filter applies)">find fuller copies for all ${n(all.filter(g=>g.pid&&g.arr).length)}</button></span>`:''}
       ${k==='under'&&open?'<div id="fuBox"></div>':''}${rows}</div>`;
   };
   el.innerHTML=`<div class="lkind" style="padding:10px 12px">
     <b style="color:#6fb0ff">Bitrate check</b>
-    <span class="dim" style="font-size:11.5px;margin-left:10px">${n(d.files)} files against the recommended bitrate for their codec and resolution · whole-file Mbps</span>
+    <span class="dim" style="font-size:11.5px;margin-left:10px">${n(nfiles)} files${_brLib?' in '+esc(_brLib):''} against the recommended bitrate for their codec and resolution · whole-file Mbps</span>
     <span style="float:right;font-size:11px"><a href="#" onclick="loadBitrate(true);return false" title="The figures are kept for 10 minutes; this measures again now">measure again</a></span>
     <table class="sktbl" style="width:100%;font-size:11.5px;margin-top:6px">
-      <thead><tr class="dim" style="font-size:10.5px"><th class="l">codec</th><th class="c">resolution</th><th class="c">starved</th><th class="c">recommended</th>
-        <th class="c">oversized</th><th class="c">files</th><th class="c" title="The middle file's bitrate">median</th><th class="c">under</th><th class="c">over</th></tr></thead>
-      <tbody>${half(false)}${half(true)}</tbody></table>
+      <thead><tr class="dim" style="font-size:10.5px">${brTh('table','codec','codec','l')}${brTh('table','res','resolution')}${brTh('table','floor','starved')}${brTh('table','lo','recommended')}
+        ${brTh('table','ceil','oversized')}${brTh('table','n','files')}${brTh('table','median','median','c',"The middle file's bitrate")}${brTh('table','under','under')}${brTh('table','over','over')}</tr></thead>
+      <tbody>${half(false)}${half(true)}${tbl.length?'':'<tr><td colspan="9" class="dim" style="padding:8px 6px">no measured files in this library</td></tr>'}</tbody></table>
     <div style="margin-top:10px;font-size:11.5px"><span class="dim">show</span>
       <select onchange="brLib(this.value)" style="font-size:11px;margin-left:4px"><option value="">every library</option>${libs.map(l=>`<option ${l===_brLib?'selected':''}>${esc(l)}</option>`).join('')}</select></div>
     ${list('under','#e0575b','Under — should be replaced','Starved copies, the furthest below the floor first. A fuller release is the fix; converting cannot add detail back.')}
