@@ -37000,7 +37000,7 @@ function brPaint(){
       <b style="color:${col}">${head}</b> <span class="dim" style="font-size:11.5px">${n(_brLib?all.length:d[k+'_total'])} titles${_brLib||d[k+'_total']<=d[k].length?` · ${n(files)} files`:''}</span></span>
       ${k==='under'?`<label class="gsw" style="display:inline-flex;margin-left:12px;vertical-align:middle" title="Auto backlog: every 3 hours nuarr takes the most starved titles not tried lately (about 40 files) and looks for fuller copies itself, with the Prowlarr searcher's engine. A title is tried again 3 days after a grab, 21 days after nothing fuller was found."><input type="checkbox" ${_fu&&_fu.auto?'checked':''} onchange="fuAuto(this.checked)"><span class="gname">Auto backlog</span><span class="gstate ${_fu&&_fu.auto?'on':'off'}">${_fu&&_fu.auto?'on':'off'}</span></label>`:''}
       ${k==='under'&&open?`<span style="margin-left:12px"><button style="font-size:11px" onclick="fuQueueAll()" title="Queue a fuller-copy search for every title in this list (the library filter applies)">find fuller copies for all ${n(all.filter(g=>g.pid&&g.arr).length)}</button></span>`:''}
-      ${k==='under'?'<div id="fuBox"></div>':''}${rows}</div>`;
+      ${k==='under'&&open?'<div id="fuBox"></div>':''}${rows}</div>`;
   };
   el.innerHTML=`<div class="lkind" style="padding:10px 12px">
     <b style="color:#6fb0ff">Bitrate check</b>

@@ -70,6 +70,24 @@ def _pget(path: str, **q):
     return json.loads(urllib.request.urlopen(req, timeout=SEARCH_TIMEOUT).read().decode())
 
 
+def _tvq(title: str, tvdb=None, season=None, ep=None) -> list[dict]:
+    """Episode queries in the form Prowlarr reads.
+
+    PROWLARR IGNORES season= AND ep= PARAMETERS (found 2026-11-22). It reads
+    them only as tokens inside the query - "Title{Season:01}{Episode:03}" -
+    so every episode search had been a bare title search: "Velvet" brought
+    back 974 names of anything called Velvet, the parser threw away nearly
+    all of them, and a long-running show's episode could fall outside the
+    PARSE_MAX names read. Measured: Squidbillies S06E03 bare 974 names, with
+    tokens 46, all the right episode."""
+    tok = (f"{{Season:{int(season):02}}}" if season is not None else "") + \
+          (f"{{Episode:{int(ep):02}}}" if ep is not None else "")
+    qs = [{"query": f"{title}{tok}", "type": "tvsearch", "limit": 200}]
+    if tvdb:
+        qs.append({"query": f"{{TvdbId:{tvdb}}}{tok}", "type": "tvsearch", "limit": 200})
+    return qs
+
+
 async def _searches(queries: list[dict]) -> list[dict]:
     """Every query at once; results merged, one row per guid."""
     outs = await asyncio.gather(*(asyncio.to_thread(_pget, "/api/v1/search", **q) for q in queries),
@@ -304,14 +322,13 @@ async def _find(a, want: dict, source: str, client, label: str) -> dict:
     from .arrqueue import _call
     prof = await asyncio.to_thread(_profile, lambda p: _call(a, p), a, want["profileId"])
     if a.kind == "sonarr":
-        qs = [{"query": want["title"], "type": "tvsearch", "season": want["season"], "ep": want["episode"], "limit": 200},
-              {"query": want["title"], "type": "tvsearch", "season": want["season"], "limit": 200}]
+        qs = _tvq(want["title"], None, want["season"], want["episode"]) + _tvq(want["title"], None, want["season"])
         if want.get("tvdbId"):
-            qs.append({"query": want["title"], "type": "tvsearch", "tvdbId": want["tvdbId"], "season": want["season"], "ep": want["episode"], "limit": 200})
+            qs += _tvq(want["title"], want["tvdbId"], want["season"], want["episode"])[1:]
     else:
         qs = [{"query": f"{want['title']} {want.get('year') or ''}".strip(), "type": "movie", "limit": 200}]
         if want.get("tmdbId"):
-            qs.append({"query": want["title"], "type": "movie", "tmdbId": want["tmdbId"], "limit": 200})
+            qs.append({"query": f"{{TmdbId:{want['tmdbId']}}}", "type": "movie", "limit": 200})   # tokens only: Prowlarr ignores tmdbId=
     t0 = time.time()
     _at(label, f"asking Prowlarr ({len(qs)} queries, every indexer)")
     raw = await _searches(qs)
@@ -584,14 +601,11 @@ async def find_fuller(a, want: dict, min_size: int, min_height: int, step=None) 
     say("reading the quality profile")
     prof = await asyncio.to_thread(_profile, lambda p: _call(a, p), a, want["profileId"])
     if a.kind == "sonarr":
-        qs = [{"query": want["title"], "type": "tvsearch", "season": want["season"], "ep": want["episode"], "limit": 200}]
-        if want.get("tvdbId"):
-            qs.append({"query": want["title"], "type": "tvsearch", "tvdbId": want["tvdbId"], "season": want["season"],
-                       "ep": want["episode"], "limit": 200})
+        qs = _tvq(want["title"], want.get("tvdbId"), want["season"], want["episode"])
     else:
         qs = [{"query": f"{want['title']} {want.get('year') or ''}".strip(), "type": "movie", "limit": 200}]
         if want.get("tmdbId"):
-            qs.append({"query": want["title"], "type": "movie", "tmdbId": want["tmdbId"], "limit": 200})
+            qs.append({"query": f"{{TmdbId:{want['tmdbId']}}}", "type": "movie", "limit": 200})   # tokens only: Prowlarr ignores tmdbId=
     say(f"asking Prowlarr ({len(qs)} queries, every indexer)")
     raw = await _searches(qs)
     rows = [r for r in _prefilter(raw, want.get("season"), want.get("episode"), a.kind)
