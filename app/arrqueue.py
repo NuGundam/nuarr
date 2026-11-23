@@ -1224,6 +1224,39 @@ def _pass() -> str:
                           f"{100 * (1 - (r.get('sizeleft') or 0) / max(1, r.get('size') or 1)):.0f}% - ")
                          + "blocklisted, the arr will look for another release")
             why = bad or stall or losers.get(r["id"]) or _verdict(a, r)
+            # A FULLER COPY NUARR GRABBED IS IMPORTED PAST "NOT AN UPGRADE"
+            # (fullergrab.py): the arr's score knows nothing of bitrate, and
+            # removing it threw away a download picked for exactly that.
+            if why.endswith("not an upgrade on the file it already has"):
+                try:
+                    from . import fullergrab
+                    fg = fullergrab.match(a, r, lambda path: _call(a, path))
+                    if fg:
+                        fullergrab.mark_forced(fg, did)
+                        cands = _video_cands(a, r)
+                        if len(cands) == 1:
+                            c = cands[0]
+                            f = {"path": c["path"], "quality": c.get("quality") or r.get("quality"),
+                                 "languages": c.get("languages") or r.get("languages") or [],
+                                 "releaseGroup": c.get("releaseGroup") or "", "downloadId": r.get("downloadId") or ""}
+                            if a.kind == "sonarr":
+                                f.update(seriesId=r.get("seriesId"), episodeIds=[r.get("episodeId")])
+                            else:
+                                f.update(movieId=r.get("movieId"))
+                            _call(a, "/api/v3/command", "POST",
+                                  {"name": "ManualImport", "files": [f], "importMode": "auto"})
+                            new.append({"at": time.time(), "arr": a.name, "title": r.get("title") or "",
+                                        "client": r.get("downloadClient") or "",
+                                        "why": "a fuller copy nuarr grabbed - the arr called it not an upgrade "
+                                               "(its score ignores bitrate), so it was imported by hand",
+                                        "kind": "fuller"})
+                            STATS["detail"].append(f"{a.name}: imported fuller copy {(r.get('title') or '')[:60]} "
+                                                   "past 'not an upgrade'")
+                            continue
+                        STATS["detail"].append(f"{a.name}: fuller copy {(r.get('title') or '')[:60]}: "
+                                               f"{len(cands)} video files offered, not forced")
+                except Exception as e:                           # noqa: BLE001
+                    STATS["detail"].append(f"{a.name}: fuller-copy import: {type(e).__name__}: {e}"[:160])
             if not why:
                 if (r.get("trackedDownloadStatus") or "") == "warning":
                     kept += 1

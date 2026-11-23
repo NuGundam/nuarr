@@ -625,6 +625,12 @@ async def find_fuller(a, want: dict, min_size: int, min_height: int, step=None) 
         ok, why = await _push_or_grab(client, a, c)
         if ok:
             STATS["pushed"] += 1
+            try:
+                from . import fullergrab
+                fullergrab.remember(a.name, "episode" if a.kind == "sonarr" else "movie",
+                                    want["episodeId"] if a.kind == "sonarr" else want["movieId"], c["title"])
+            except Exception:                                    # noqa: BLE001
+                pass
             return {"ok": True, "release": c["title"], "size": c["size"], "quality": c["quality"], "score": c["score"],
                     "indexer": c["indexer"], "protocol": c["protocol"], "seeders": c.get("seeders"), "how": why,
                     "raw": len(raw), "found": len(order), "refused": len(refused)}
