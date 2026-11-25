@@ -45,7 +45,7 @@ RECENT_KEEP = 30
 QUIET_S = 60.0            # a pack lands one file every few seconds - Sugar Apple had a 29 s gap after E01
 MSG_LIMIT = 1024          # Pushover's message cap
 DEFAULT_OPTS = {"imports": True, "upgrades": True, "digest": True,
-                "priority": -1, "sound": "", "link": True, "seerr": True, "art": False}
+                "priority": -1, "sound": "", "link": True, "seerr": True, "art": True, "seerr_art": False}
 
 STATS: dict = {"sent": 0, "failed": 0, "last_sent": 0.0, "last_error": "",
                "pending": 0, "limit": None, "remaining": None, "reset": None}
@@ -600,9 +600,9 @@ async def _send_group(items: list) -> None:
     if tier == "basic":
         return await _send_basic(items)
     # NO POSTER, OR NO ICON. Pushover on Android shows the blue P instead of the
-    # app icon (Sonarr, Radarr, Seerr's) on any message with an image attached, so posters on
-    # the phone are off unless asked for.
-    art = tier == "full" and opts().get("art", False)
+    # app icon (Sonarr, Radarr, Seerr's) on any message with an image attached, so each kind
+    # of message has its own switch: arrs with posters, Seerr without (Erik, 2026-11-25).
+    art = tier == "full" and opts().get("art", True)
 
     async def poster(it):
         return await _item_poster(it) if art else None
@@ -806,7 +806,7 @@ async def seerr(body: dict) -> str:
         lines.append('<font color="#8b949e">' + _esc(text[:360] + ("…" if len(text) > 360 else "")) + "</font>")
     msg = _arr_tag("Seerr", "seerr") + " · <b>" + _esc(subject) + "</b>\n" + "\n".join(lines)
     title = f"Seerr · {verb} · {subject}"
-    img = await _poster(str(body.get("image") or "")) if tier == "full" and opts().get("art", False) else None
+    img = await _poster(str(body.get("image") or "")) if tier == "full" and opts().get("seerr_art", False) else None
     ok, err = await send(title, msg, url=_link(), attachment=img, app="seerr")
     _remember({"at": time.time(), "arr": "Seerr", "title": subject,
                "detail": verb + (f" by {who}" if who else ""), "ok": ok, "error": err,
