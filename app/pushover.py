@@ -45,7 +45,7 @@ RECENT_KEEP = 30
 QUIET_S = 60.0            # a pack lands one file every few seconds - Sugar Apple had a 29 s gap after E01
 MSG_LIMIT = 1024          # Pushover's message cap
 DEFAULT_OPTS = {"imports": True, "upgrades": True, "digest": True,
-                "priority": -1, "sound": "", "link": True, "seerr": True}
+                "priority": -1, "sound": "", "link": True, "seerr": True, "art": False}
 
 STATS: dict = {"sent": 0, "failed": 0, "last_sent": 0.0, "last_error": "",
                "pending": 0, "limit": None, "remaining": None, "reset": None}
@@ -596,7 +596,10 @@ async def _send_group(items: list) -> None:
     tier = items[0].get("tier") or "full"
     if tier == "basic":
         return await _send_basic(items)
-    art = tier == "full"
+    # NO POSTER, OR NO ICON. Pushover on Android shows the blue P instead of the
+    # Sonarr / Radarr icon on any message with an image attached, so posters on
+    # the phone are off unless asked for.
+    art = tier == "full" and opts().get("art", False)
 
     async def poster(it):
         return await _item_poster(it) if art else None
