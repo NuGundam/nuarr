@@ -908,7 +908,7 @@ def findings(limit: int = 200) -> list[dict]:
         init()
     kinds = {CORRUPT: "file/corrupt", UNREADABLE: "file/unreadable",
              SHORT: "file/short", ENCRYPTED: "audio/encrypted"}
-    from . import runtimecheck
+    from . import runtimecheck, samecheck
     try:
         with cursor() as cur:
             return [{"file_id": r["file_id"],
@@ -921,15 +921,17 @@ def findings(limit: int = 200) -> list[dict]:
                         "   AND f.state NOT IN ('deleted','duplicate') "
                         " ORDER BY i.at DESC LIMIT ?",
                         (CORRUPT, UNREADABLE, SHORT, ENCRYPTED, int(limit)))
-                    ] + runtimecheck.findings(limit)
+                    ] + runtimecheck.findings(limit) + samecheck.findings(limit)
     except Exception:                                            # noqa: BLE001
         return []
 
 
 def auto_findings(limit: int = 50) -> list[dict]:
-    """What the remedy may see: not a short file on one reading, and not the
-    runtime list, which is a person's."""
+    """What the remedy may see: not a short file on one reading, not the
+    runtime list, which is a person's, and not a pair of identical episodes
+    whose dates do not say which one is wrong."""
     return [f for f in findings(limit) if f["kind"] != "file/runtime"
+            and (f["kind"] != "file/same-episode" or f.get("certain"))
             and (f["kind"] != "file/short" or SECOND_READ in (f.get("why") or ""))]
 
 

@@ -131,6 +131,10 @@ _kind("file/short", False, True, True,
 _kind("file/runtime", False, True, False,
       "far shorter than Radarr lists - cut short, the wrong file, or a wrong "
       "listing, so the replacement is yours to ask for")
+# -- the neighbouring episode under this one's name. Only findings whose dates
+#    prove which of the two is wrong reach the unattended pass; see samecheck.
+_kind("file/same-episode", False, True, True,
+      "this is another episode's recording under this episode's name")
 # -- DRM left on a track. Not file/unreadable's limit of this toolchain: the
 #    file says so itself, with an enca/encv tag, and no player has the key.
 _kind("audio/encrypted", False, True, True,
@@ -733,9 +737,14 @@ async def replace(file_id: int, kind: str, source: str = "", why: str = "",
         if kind in RESTORE_KINDS:
             out = await refetch.restore_prior(int(file_id),
                                               why or policy(kind)["why"])
+        if kind == "file/same-episode":
+            from . import samecheck
+            out = await samecheck.reject_unaired(int(file_id), why or policy(kind)["why"])
         if out is None:
+            # NOT BANNED BY NAME when the fake wore the real release's name
             out = await refetch.run(int(file_id),
-                                    reason=why or policy(kind)["why"])
+                                    reason=why or policy(kind)["why"],
+                                    ban=kind != "file/same-episode")
     except Exception as e:                                       # noqa: BLE001
         _note(file_id, kind, REPLACE, source, auto, False,
               f"{type(e).__name__}: {e}")

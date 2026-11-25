@@ -1019,6 +1019,8 @@ async def _startup() -> None:
     asyncio.create_task(_arrgap.watch())
     from . import remuxlabel as _remuxlabel, runtimecheck as _runtimecheck
     asyncio.create_task(_runtimecheck.watch())
+    from . import samecheck as _samecheck
+    asyncio.create_task(_samecheck.watch())
     asyncio.create_task(_remuxlabel.watch())
     asyncio.create_task(ffmpeg_update.watch())
     # Notices a GPU driver swap, re-measures NVENC, and hands in-flight encodes
@@ -9983,9 +9985,10 @@ def api_integrity():
 
 @app.post("/api/integrity/keep")
 def api_integrity_keep(file_id: int):
-    """This film's length is right. Holds until the file changes."""
-    from . import runtimecheck, userinput
-    ok = runtimecheck.keep(file_id)
+    """This film's length, or this episode's sound, is right. Holds until the
+    file changes."""
+    from . import runtimecheck, samecheck, userinput
+    ok = runtimecheck.keep(file_id) | samecheck.keep(file_id)
     userinput.rows(fresh=True)
     return {"ok": ok}
 
@@ -25428,7 +25431,7 @@ function igPaint(){
         <td style="padding:3px 0;white-space:nowrap">${
           remedyBtns(r.file_id, r.kind||'file/corrupt',
                      {source:'integrity'})}${r.keep?` <button onclick="igKeep(${r.file_id})"
-            title="This length is right. Asked again only if the file changes.">Keep</button>`:''}</td>
+            title="${r.kind==='file/same-episode'?'This is the right episode.':'This length is right.'} Asked again only if the file changes.">Keep</button>`:''}</td>
       </tr>`).join('')}</tbody></table>`
     : `<div class="dim" style="font-size:11.5px">${
         tested ? 'Every file read so far decoded in every window.'

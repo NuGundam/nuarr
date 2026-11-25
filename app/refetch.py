@@ -354,7 +354,7 @@ async def restore_prior(file_id: int, reason: str) -> dict | None:
 
 
 async def run(file_id: int, delete_file: bool = True,
-              reason: str = "", after_delete=None) -> dict:
+              reason: str = "", after_delete=None, ban: bool = True) -> dict:
     r"""Delete the file, blocklist the release, search for a replacement.
 
     Re-plans rather than trusting whatever the caller was shown: the panel may
@@ -539,7 +539,7 @@ async def run(file_id: int, delete_file: bool = True,
     # offered, as a -10000 custom format. Off unless the card says on.
     try:
         from .gate import get_toggle
-        if _ban_name and get_toggle("arrs.release_ban"):
+        if ban and _ban_name and get_toggle("arrs.release_ban"):
             from . import arrban
             b = arrban.note_rejection(_ban_name, _why, "refetch")
             if (b.get("release") or {}).get("new"):

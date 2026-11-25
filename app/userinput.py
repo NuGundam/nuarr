@@ -175,7 +175,19 @@ def _short_films() -> dict | None:
             "items": [{"title": r["title"], "detail": r["why"]} for r in rows[:6]]}
 
 
-SOURCES = (_subtitle_input, _raws, _audio_questions, _rules_gap, _bitrate_cuts,
+def _same_episodes() -> dict | None:
+    """Two episodes with one recording, and the dates do not say which is wrong."""
+    from . import samecheck
+    rows = [r for r in samecheck.findings(200) if not r["certain"]]
+    if not rows:
+        return None
+    return {"what": "same episode twice", "n": len(rows),
+            "note": f"{len(rows)} with the same sound as the episode next to it",
+            "goto": "/settings#ruleschk@igCard",
+            "items": [{"title": r["title"], "detail": r["why"]} for r in rows[:6]]}
+
+
+SOURCES = (_same_episodes, _subtitle_input, _raws, _audio_questions, _rules_gap, _bitrate_cuts,
            _ban_collisions, _tvdb_left, _download_leftovers, _short_films)
 
 
