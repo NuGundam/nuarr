@@ -489,6 +489,7 @@ class Settings:
     # an application that has it. Unset = the Nuarr app, as before.
     pushover_token_sonarr: str | None = None
     pushover_token_radarr: str | None = None
+    pushover_token_seerr: str | None = None
 
     # PLEX, DIRECTLY. Tautulli is a live passthrough to Plex for get_activity -
     # measured, it is not serving a cache - but it costs 2,177 ms per call

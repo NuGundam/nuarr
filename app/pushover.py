@@ -233,15 +233,18 @@ async def resend(ids: list) -> dict:
 
 
 # ------------------------------------------------------------ sending ------
+APPS = ("sonarr", "radarr", "seerr")       # the ones that may have a Pushover application of their own
+
+
 def app_of(name: str) -> str:
-    """'sonarr' / 'radarr' for an arr's name or kind, else ''."""
+    """'sonarr' / 'radarr' / 'seerr' for a sender's name or kind, else ''."""
     n = str(name or "").lower()
-    return "sonarr" if "sonarr" in n else "radarr" if "radarr" in n else ""
+    return next((a for a in APPS if a in n), "")
 
 
 def app_token(app: str) -> str:
     """The token of the arr's own Pushover application, '' when none is set."""
-    return str(getattr(SETTINGS, f"pushover_token_{app}", "") or "") if app in ("sonarr", "radarr") else ""
+    return str(getattr(SETTINGS, f"pushover_token_{app}", "") or "") if app in APPS else ""
 
 
 async def send(title: str, message: str, *, priority: int | None = None,
@@ -597,7 +600,7 @@ async def _send_group(items: list) -> None:
     if tier == "basic":
         return await _send_basic(items)
     # NO POSTER, OR NO ICON. Pushover on Android shows the blue P instead of the
-    # Sonarr / Radarr icon on any message with an image attached, so posters on
+    # app icon (Sonarr, Radarr, Seerr's) on any message with an image attached, so posters on
     # the phone are off unless asked for.
     art = tier == "full" and opts().get("art", False)
 
@@ -778,7 +781,7 @@ async def seerr(body: dict) -> str:
     who0 = (req.get("requestedBy_username") or _obj(body.get("issue")).get("reportedBy_username") or "")
     if tier == "basic":
         line = f"{subject} - {verb}" + (f" by {who0}" if who0 else "")
-        ok, err = await send(f"Seerr · {verb} · {subject}", _esc(line))
+        ok, err = await send(f"Seerr · {verb} · {subject}", _esc(line), app="seerr")
         _remember({"at": time.time(), "arr": "Seerr", "title": subject, "detail": f"{verb} (basic)",
                    "ok": ok, "error": err, "kind": "seerr", "files": "", "ptitle": f"Seerr · {verb} · {subject}",
                    "msg": _esc(line), "img": str(body.get("image") or "")})
@@ -803,8 +806,8 @@ async def seerr(body: dict) -> str:
         lines.append('<font color="#8b949e">' + _esc(text[:360] + ("…" if len(text) > 360 else "")) + "</font>")
     msg = _arr_tag("Seerr", "seerr") + " · <b>" + _esc(subject) + "</b>\n" + "\n".join(lines)
     title = f"Seerr · {verb} · {subject}"
-    img = await _poster(str(body.get("image") or "")) if tier == "full" else None
-    ok, err = await send(title, msg, url=_link(), attachment=img)
+    img = await _poster(str(body.get("image") or "")) if tier == "full" and opts().get("art", False) else None
+    ok, err = await send(title, msg, url=_link(), attachment=img, app="seerr")
     _remember({"at": time.time(), "arr": "Seerr", "title": subject,
                "detail": verb + (f" by {who}" if who else ""), "ok": ok, "error": err,
                "kind": "seerr", "files": "", "ptitle": title, "msg": msg,
@@ -877,7 +880,7 @@ def _with_posters(rows: list) -> list:
 def snapshot() -> dict:
     return {"configured": configured(), "token_set": bool(SETTINGS.pushover_token),
             "user_set": bool(SETTINGS.pushover_user), "enabled": enabled(),
-            "apps": {k: bool(app_token(k)) for k in ("sonarr", "radarr")},
+            "apps": {k: bool(app_token(k)) for k in APPS},
             "on": str(kv_get(KV_ON) or "0") == "1", "opts": opts(),
             "stats": dict(STATS), "recent": _with_posters(_recent()), "quiet_s": QUIET_S,
             "link": _link(), "roots": roots()}
