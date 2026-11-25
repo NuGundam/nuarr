@@ -3531,12 +3531,12 @@ setInterval(()=>{{document.getElementById('pv').src='/tv/wallpaper.jpg?'+Date.no
 
 @app.get("/arr-icon/{name}")
 def arr_icon(name: str):
-    """The arrs' official logos (taken from the arrs' own web UI, kept in
-    app/assets) - for arrIcon() and anywhere else the page names an arr."""
+    """The arrs' and Seerr's official logos (from the projects themselves, kept
+    in app/assets) - for arrIcon() and anywhere else the page names an arr."""
     import pathlib
     from fastapi.responses import FileResponse
     stem, _, ext = name.lower().partition(".")
-    if stem not in ("sonarr", "radarr") or ext not in ("svg", "png"):
+    if stem not in ("sonarr", "radarr", "seerr") or ext not in ("svg", "png") or (stem, ext) == ("seerr", "png"):
         raise HTTPException(404, "no such icon")
     p = pathlib.Path(__file__).parent / "assets" / f"{stem}.{ext}"
     return FileResponse(str(p), media_type="image/svg+xml" if ext == "svg" else "image/png",
@@ -50103,9 +50103,9 @@ function arrLook(kind){
 }
 function arrIcon(kind, size){
   const L=arrLook(kind), s=size||14;
-  // THE OFFICIAL LOGO for Sonarr and Radarr (Erik, 2026-11-19), served from
-  // app/assets; the lettered tile stays for the rest.
-  const off=/sonarr/i.test(kind||'')?'sonarr':/radarr/i.test(kind||'')?'radarr':'';
+  // THE OFFICIAL LOGO for Sonarr, Radarr and Seerr (Erik, 2026-11-19 / 25),
+  // served from app/assets; the lettered tile stays for the rest.
+  const off=/sonarr/i.test(kind||'')?'sonarr':/radarr/i.test(kind||'')?'radarr':/seerr/i.test(kind||'')?'seerr':'';
   if(off) return `<img src="/arr-icon/${off}.svg" alt="" title="${esc(kind||'')}"
     style="width:${s}px;height:${s}px;flex:0 0 auto;vertical-align:-${Math.round(s*0.2)}px">`;
   return `<span title="${esc(kind||'')}" style="display:inline-flex;
@@ -51766,8 +51766,8 @@ function poPaint(){
         <label class="gsw" title="A file replacing one the arr already had - the message shows old and new."><input type="checkbox" ${o.upgrades?'checked':''} onchange="poOpt('upgrades',this.checked)"><span class="gname">upgrades</span><span class="gstate ${o.upgrades?'on':'off'}">${o.upgrades?'on':'off'}</span></label>
         <label class="gsw" title="Several files for one series within ${Math.round(d.quiet_s||20)} seconds go out as one message listing them all. Off sends one message per file."><input type="checkbox" ${o.digest?'checked':''} onchange="poOpt('digest',this.checked)"><span class="gname">packs as one digest</span><span class="gstate ${o.digest?'on':'off'}">${o.digest?'on':'off'}</span></label>
         <label class="gsw" title="Attach the poster to Sonarr and Radarr imports. Pushover on Android shows its own P instead of the Sonarr or Radarr icon on a message with an image."><input type="checkbox" ${o.art?'checked':''} onchange="poOpt('art',this.checked)"><span class="gname">arr posters on the phone</span><span class="gstate ${o.art?'on':'off'}">${o.art?'on':'off'}</span></label>
-        <label class="gsw" title="Seerr's own webhook posts here: new requests (and ones waiting for approval), declined or failed requests, and reported issues. Available is left to the import message."><input type="checkbox" ${o.seerr?'checked':''} onchange="poOpt('seerr',this.checked)"><span class="gname">Seerr requests</span><span class="gstate ${o.seerr?'on':'off'}">${o.seerr?'on':'off'}</span></label>
-        <label class="gsw" title="Attach the poster to Seerr messages. Pushover on Android shows its own P instead of the Seerr icon on a message with an image."><input type="checkbox" ${o.seerr_art?'checked':''} onchange="poOpt('seerr_art',this.checked)"><span class="gname">Seerr posters on the phone</span><span class="gstate ${o.seerr_art?'on':'off'}">${o.seerr_art?'on':'off'}</span></label>
+        <label class="gsw" title="Seerr's own webhook posts here: new requests (and ones waiting for approval), declined or failed requests, and reported issues. Available is left to the import message."><input type="checkbox" ${o.seerr?'checked':''} onchange="poOpt('seerr',this.checked)"><span class="gname">${arrIcon('seerr', 13)} Seerr requests</span><span class="gstate ${o.seerr?'on':'off'}">${o.seerr?'on':'off'}</span></label>
+        <label class="gsw" title="Attach the poster to Seerr messages. Pushover on Android shows its own P instead of the Seerr icon on a message with an image."><input type="checkbox" ${o.seerr_art?'checked':''} onchange="poOpt('seerr_art',this.checked)"><span class="gname">${arrIcon('seerr', 13)} Seerr posters on the phone</span><span class="gstate ${o.seerr_art?'on':'off'}">${o.seerr_art?'on':'off'}</span></label>
         <label class="gsw" title="Attach a link that opens nuarr from the notification."><input type="checkbox" ${o.link?'checked':''} onchange="poOpt('link',this.checked)"><span class="gname">link to nuarr</span><span class="gstate ${o.link?'on':'off'}">${o.link?'on':'off'}</span></label>
         <span style="display:flex;align-items:center;gap:6px;font-size:11.5px">priority
           <select onchange="poOpt('priority',this.value)" style="font-size:11.5px">
@@ -51845,7 +51845,7 @@ function poRowHtml(r){
   return `<tr class="${on?'sel':''}">
     <td class="l"><input type="checkbox" ${on?'checked':''} onclick="poToggle('${q}',event)"></td>
     <td class="c mono dim" style="font-size:10.5px;white-space:nowrap" title="${esc(new Date((r.at||0)*1000).toLocaleString())}">${ago(r.at)}</td>
-    <td class="c" style="font-weight:600;${r.arr?'color:'+arrLook(r.arr).c:''}">${esc(r.arr||'—')}</td>
+    <td class="c" style="font-weight:600;white-space:nowrap;${r.arr?'color:'+arrLook(r.arr).c:''}">${r.arr?arrIcon(r.arr, 13)+' ':''}${esc(r.arr||'—')}</td>
     <td class="l" style="cursor:pointer" onclick="poOpenRow('${q}',event)" title="${esc(r.ptitle||r.title||'')}"
       >${r.poster?`<img src="${esc(r.poster)}" loading="lazy" alt="" style="float:left;width:24px;height:36px;object-fit:cover;border-radius:3px;margin:0 8px 0 0;background:var(--line)" onerror="this.style.visibility='hidden'">`:''}<span class="actcaret">${open?'▾':'▸'}</span><span class="mono">${esc(r.title||'')}</span>${
         r.eng?` <span style="font-size:10px;color:#7fd4a3;border:1px solid #7fd4a355;border-radius:3px;padding:0 4px">+ English audio${r.eng>1?' ×'+r.eng:''}</span>`:''}${
