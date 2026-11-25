@@ -183,7 +183,7 @@ def _same_episodes() -> dict | None:
         return None
     return {"what": "same episode twice", "n": len(rows),
             "note": f"{len(rows)} with the same sound as the episode next to it",
-            "goto": "/settings#ruleschk@igCard",
+            "goto": "/settings#janitor@samBox",
             "items": [{"title": r["title"], "detail": r["why"]} for r in rows[:6]]}
 
 

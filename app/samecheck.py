@@ -47,6 +47,7 @@ from .db import cursor, kv_get, kv_set
 KIND = "file/same-episode"
 KEY = "samecheck"
 TITLE = "Same episode twice"
+ENABLED = "samecheck.enabled"    # on unless turned off
 HOLDS = "samecheck.holds"        # [{arr, episode, air, title, at}]
 
 SR, HOP, WIN = 8000, 400, 1024   # 20 frames a second
@@ -181,10 +182,22 @@ def _key(a: dict, b: dict) -> str:
     return f"{a.get('arr_file_id')}/{b.get('arr_file_id')}"
 
 
-def _pending() -> list:
+def enabled() -> bool:
+    return str(kv_get(ENABLED) or "1") == "1"
+
+
+def set_enabled(on: bool) -> None:
+    from . import idle
+    kv_set(ENABLED, "1" if on else "0")
+    idle.bump(KEY)
+
+
+def _pending(limit: int = PASS) -> list:
     """[(file, neighbour)] not compared yet, newest file first."""
     if not _READY:
         init()
+    if not enabled():
+        return []
     sonarr = [c.name for c in SETTINGS.arrs if c.enabled and c.kind == "sonarr"]
     if not sonarr:
         return []
@@ -228,7 +241,7 @@ def _pending() -> list:
             if _LATER.get((r["id"], o["id"]), 0) > time.time():
                 continue
             out.append((r, o))
-            if len(out) >= PASS:         # a short pass, so a new arrival is not behind the backlog
+            if len(out) >= limit:         # a short pass, so a new arrival is not behind the backlog
                 return out
     return out
 
@@ -347,6 +360,70 @@ def keep(file_id: int) -> bool:
         return bool(cur.execute("UPDATE same_episode SET kept=1 WHERE file_id=?", (int(file_id),)).rowcount)
 
 
+_LEFT = {"at": 0.0, "n": 0}
+
+
+def stats() -> dict:
+    """The Janitor panel."""
+    from . import idle, integrity
+    if not _READY:
+        init()
+    if time.time() - _LEFT["at"] > 60:
+        _LEFT.update(n=len(_pending(10 ** 9)), at=time.time())
+    with cursor() as cur:
+        n = {r[0]: r[1] for r in cur.execute("SELECT verdict, COUNT(*) FROM same_checked GROUP BY 1")}
+        last = [dict(r) for r in cur.execute(
+            "SELECT c.at, c.verdict, c.detail, f.title, f.season, f.episode, o.episode AS other "
+            "  FROM same_checked c JOIN files f ON f.id=c.file_id JOIN files o ON o.id=c.other_id "
+            " ORDER BY c.at DESC LIMIT 12")]
+        rows = [dict(r) for r in cur.execute(
+            "SELECT s.*, f.state, f.arr_file_id AS now_id, o.state AS ostate, o.path AS opath, "
+            "  (SELECT detail FROM remedy_log r WHERE r.file_id=s.file_id AND r.kind=? AND r.ok=1 "
+            "    ORDER BY r.at DESC LIMIT 1) AS did, "
+            "  (SELECT detail FROM remedy_log r WHERE r.file_id=s.file_id AND r.kind=? AND r.ok=0 "
+            "    ORDER BY r.at DESC LIMIT 1) AS failed "
+            "  FROM same_episode s LEFT JOIN files f ON f.id=s.file_id LEFT JOIN files o ON o.id=s.other_id "
+            " ORDER BY s.at DESC LIMIT 100", (KIND, KIND))]
+    out = []
+    for r in rows:
+        gone = r["state"] in (None, "deleted", "duplicate") or r["now_id"] != r["arr_file_id"]
+        other_gone = r["ostate"] in (None, "deleted", "duplicate")
+        st = ("removed" if r["did"] else "kept" if r["kept"] else "gone" if gone
+              else "othergone" if other_gone else "auto" if r["certain"] else "yours")
+        out.append({"file_id": r["file_id"], "title": r["title"], "path": r["path"], "other": r["opath"] or "",
+                    "why": r["why"], "at": r["at"], "state": st, "did": r["did"] or "",
+                    "failed": r["failed"] or ""})
+    p = idle.progress(KEY)
+    return {"on": enabled(), "mode": integrity.mode(), "back_days": BACK_DAYS, "hit": HIT,
+            "compared": sum(n.values()), "unknown": n.get("unknown", 0), "left": _LEFT["n"],
+            "rows": out, "holds": sorted(_holds(), key=lambda h: h["air"]),
+            "last": [{**r, "points": json.loads(r["detail"] or "[]")} for r in last],
+            "run": {k: p.get(k) for k in ("running", "paused", "paused_why", "now", "last_error", "secs_each")}
+            | {"flight": [f.get("now") for f in p.get("flight") or []]}}
+
+
+async def look_now() -> dict:
+    from . import idle
+    _LATER.clear()
+    _LEFT["at"] = 0.0
+    idle.bump(KEY)
+    await release_holds()
+    return await asyncio.to_thread(stats)
+
+
+async def unhold(episode: int) -> dict:
+    """Monitor a held episode now instead of when it airs."""
+    from .arr import shared_client
+    h = next((x for x in _holds() if x["episode"] == int(episode)), None)
+    if not h:
+        return {"ok": False, "why": "not held"}
+    cl = shared_client(next(c for c in SETTINGS.arrs if c.name == h["arr"]))
+    await cl._put("/episode/monitor", {"episodeIds": [h["episode"]], "monitored": True})
+    kv_set(HOLDS, json.dumps([x for x in _holds() if x["episode"] != int(episode)]))
+    joblog.log(f"same episode: {h['title']} monitored again by hand", "ok")
+    return {"ok": True}
+
+
 # ---------------------------------------------- an episode not aired yet ----
 def _holds() -> list:
     try:
@@ -445,4 +522,4 @@ async def watch() -> None:
                    label=lambda p: f"{p[0]['title']} {_tag(p[0])} / {_tag(p[1])}"[:120],
                    disk_of=lambda p: p[0].get("pool_disk") or "",
                    note_of=lambda p: f"listening for the same episode twice ({_tag(p[0])} / {_tag(p[1])})",
-                   system_name=TITLE, goto="/settings#ruleschk@igCard")
+                   system_name=TITLE, goto="/settings#janitor@samBox")

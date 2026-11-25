@@ -9993,6 +9993,31 @@ def api_integrity_keep(file_id: int):
     return {"ok": ok}
 
 
+@app.get("/api/samecheck")
+def api_samecheck():
+    from . import samecheck
+    return samecheck.stats()
+
+
+@app.post("/api/samecheck/run")
+async def api_samecheck_run():
+    from . import samecheck
+    return await samecheck.look_now()
+
+
+@app.post("/api/samecheck/on")
+def api_samecheck_on(on: bool):
+    from . import samecheck
+    samecheck.set_enabled(on)
+    return samecheck.stats()
+
+
+@app.post("/api/samecheck/unhold")
+async def api_samecheck_unhold(episode: int):
+    from . import samecheck
+    return await samecheck.unhold(episode)
+
+
 @app.post("/api/integrity/run")
 async def api_integrity_run(limit: int = 0, force: bool = True):
     """Sweep now. `force` skips the idle check, because a person pressing the
@@ -50846,6 +50871,8 @@ async function loadArrsTab(refresh){
     queue_janitor:{need:(qjs.kicked||{}).why?'stopped - see why':'',
                    changed:recent(qjst)&&(+qjst.removed||0)>0?`removed ${qjst.removed}`:''},
     prowlarr_search:{need:'', changed:((d.prowlarr_search||{}).active||[]).length?'searching now':(recent((d.prowlarr_search||{}).stats)&&(+((d.prowlarr_search||{}).stats||{}).pushed||0)>0?'pushed releases lately':'')},
+    samBox:{need:((_sam&&_sam.rows)||[]).some(r=>r.state==='yours')?'decide':'',
+            changed:((_sam&&_sam.rows)||[]).some(r=>r.state==='removed'&&now-r.at<6*3600)?'removed':''},
     bcBox:{need:bcOpen?`${bcOpen} cut upgrade${bcOpen===1?'':'s'} to decide`:'', changed:''},
   };
   const chip=k=>{ const a=attn[k]||{}; return a.need?`<span class="pill" style="color:#e2b341;border-color:#e2b341;margin-left:8px;font-size:10.5px">needs you · ${esc(a.need)}</span>`
@@ -50918,8 +50945,8 @@ async function loadArrsTab(refresh){
         d.toggles.prowlarr_search, (d.prowlarr_search||{}).stats||{},
         {label:'', kind:'prowlarr_search', names:{}, empty:'', adder:psList(d.prowlarr_search||{})})],
   ];
-  const order=['profile_guard','trash_anime','release_ban','queue_janitor','prowlarr_search','bcBox'];
-  const rank=k=>{ const a=attn[k]||{}, on=k==='bcBox'?true:!!d.toggles[k];
+  const order=['profile_guard','trash_anime','release_ban','queue_janitor','prowlarr_search','samBox','bcBox'];
+  const rank=k=>{ const a=attn[k]||{}, on=(k==='bcBox'||k==='samBox')?true:!!d.toggles[k];
     return (a.need?0:a.changed?1:on?2:3)*10+order.indexOf(k); };
   const parts=[['running', (d.stats.running?`<div class="dim" style="margin-bottom:8px">running: ${esc(d.stats.running)}…</div>`:'')], ['hooks', `<div style="border:1px solid var(--line);border-radius:8px;padding:10px 14px">
         <div style="display:flex;align-items:center;gap:10px">
@@ -50942,6 +50969,7 @@ async function loadArrsTab(refresh){
         </div>
       </div>`]];
   const scripts=[...cards.map(([k,h])=>[k, h.replace('</b>', '</b>'+chip(k))]),
+    ['samBox', '<div id="samBox"></div>'],
     ['bcBox', `${chip('bcBox')?`<div style="margin:2px 0 4px">${chip('bcBox')}</div>`:''}<div id="bcBox" style="margin-top:12px"></div>`]]
     .sort((x,y)=>rank(x[0])-rank(y[0]));
   // TWO PAGES FROM ONE LOAD (2026-11-20): the Arrs page keeps what is about the
@@ -50983,7 +51011,93 @@ async function loadArrsTab(refresh){
   if(fresh) _bcKey='';       // the box is new and empty - paint it whatever the data says
   bcLoad();
   dlLoad();
+  samLoad();
 }
+
+// ---- an episode that is its neighbour under a new name - samecheck.py ------
+let _sam=null, _samT=null, _samKey='', _samLast=false;
+async function samLoad(){
+  const el=document.getElementById('samBox'); if(!el) return;
+  clearTimeout(_samT);
+  try{ const r=await fetch('/api/samecheck'); if(!r.ok) throw 0; _sam=await r.json(); await rmPolicy(); samPaint(); }
+  catch(e){ if(!el.firstElementChild) el.innerHTML='<span class="dim">could not load</span>'; }
+  clearTimeout(_samT);
+  _samT=setTimeout(()=>shownPoll('samBox', samLoad), _sam&&_sam.run.running?4000:20000);
+}
+async function samOn(on){ try{ _sam=await (await fetch('/api/samecheck/on?on='+(on?'true':'false'),{method:'POST'})).json(); }catch(e){} samPaint(); }
+async function samRun(btn){
+  btn.disabled=true; btn.textContent='looking…';
+  try{ _sam=await (await fetch('/api/samecheck/run',{method:'POST'})).json(); }catch(e){}
+  _samKey=''; samLoad();
+}
+async function samKeep(id){ try{ await fetch('/api/integrity/keep?file_id='+id,{method:'POST'}); }catch(e){} samLoad(); }
+async function samUnhold(id,btn){ btn.disabled=true; try{ await fetch('/api/samecheck/unhold?episode='+id,{method:'POST'}); }catch(e){} _samKey=''; samLoad(); }
+function samPaint(){
+  const el=document.getElementById('samBox'); if(!el||!_sam) return;
+  const d=_sam, r=d.run||{}, rows=d.rows||[], holds=d.holds||[], last=d.last||[];
+  const yours=rows.filter(x=>x.state==='yours').length, removed=rows.filter(x=>x.state==='removed').length;
+  const ST={removed:['#3fb950','removed'],kept:['#8b949e','kept'],gone:['#8b949e','file replaced since'],
+    othergone:['#8b949e','the other file is gone'],yours:['#e3b341','yours to decide'],
+    auto:['#e3b341',d.mode==='auto'?'waiting for the remedy':'proven - yours to replace']};
+  const name=p=>String(p||'').split(String.fromCharCode(92)).pop();
+  const e2=x=>'E'+String(x).padStart(2,'0');
+  const when=t=>new Date(t*1000).toLocaleString([], {weekday:'short',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+  const state=!d.on?'<span class="dim">off</span>'
+    :r.running?`<span class="dlspin"></span><span style="color:var(--acc)">listening</span> ${esc((r.flight||[]).join(' · ')||r.now||'')}`
+    :r.paused?`<span class="dim">waiting: ${esc(r.paused_why||'')}</span>`:'<span class="dim">idle</span>';
+  const found=rows.map(x=>{
+    const s=ST[x.state]||['#8b949e',x.state], open=x.state==='yours'||x.state==='auto';
+    return `<tr>
+      <td class="l" style="white-space:normal"><b>${esc(x.title)}</b> <span class="dim">· ${ago(x.at)}</span>
+        <div class="dim mono" style="font-size:10px;word-break:break-word">${esc(name(x.path))}</div>
+        <div class="dim mono" style="font-size:10px;word-break:break-word">= ${esc(name(x.other))}</div></td>
+      <td class="l" style="white-space:normal">${esc(x.why)}</td>
+      <td class="l" style="white-space:normal"><span style="color:${s[0]}">${esc(s[1])}</span>
+        ${x.did?`<div class="dim" style="font-size:10.5px">${esc(x.did)}</div>`:''}
+        ${open&&x.failed?`<div class="err" style="font-size:10.5px">${esc(x.failed)}</div>`:''}
+        ${open?`<div style="margin-top:3px">${remedyBtns(x.file_id,'file/same-episode',{source:'samecheck'})}
+          <button class="rmb" onclick="samKeep(${x.file_id})" title="This is the right episode. Asked again only if the file changes.">Keep</button></div>`:''}</td></tr>`; }).join('');
+  const html=`<style>.dlspin{display:inline-block;width:9px;height:9px;border:2px solid #79c0ff;border-right-color:transparent;border-radius:50%;animation:dlrot .8s linear infinite;vertical-align:-1px;margin-right:4px}@keyframes dlrot{to{transform:rotate(360deg)}}</style>
+  <div style="border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin-bottom:10px">
+    <div style="display:flex;align-items:center;gap:10px">
+      <b>Same episode twice</b>
+      ${yours?`<span class="pill" style="color:#e2b341;border-color:#e2b341;font-size:10.5px">needs you · ${yours} to decide</span>`:''}
+      <span class="pill ${d.on?'p-ok':'p-dim'}" style="cursor:pointer" title="click to turn ${d.on?'off':'on'}" onclick="samOn(${d.on?0:1})">${d.on?'ON':'off'}</span>
+      <button style="margin-left:auto" onclick="samRun(this)">Run now</button>
+    </div>
+    <div class="dim" style="font-size:11px;margin:6px 0 4px">Listens to each new episode next to the two before it and the one after,
+      and finds one that is really its neighbour under a new name. Six 30-second clips are matched, so another codec or bitrate does not hide it.
+      The dates say which of the two is wrong: if the other was here before this one aired, this is the fake, and
+      ${d.mode==='auto'?'it is replaced without asking (the integrity check is on auto)':'it is listed here (the integrity check is on manual)'}.
+      A fake of an episode that has not aired is deleted, and the episode unmonitored until it does. When the dates do not settle it, it is yours.
+      Goes back ${d.back_days} days; specials and multi-episode files are skipped.</div>
+    <div class="mono" style="font-size:11px;display:flex;gap:14px;flex-wrap:wrap">
+      <span>${state}</span>
+      <span>${fmt(d.compared)} <span class="dim">pairs compared</span></span>
+      <span>${fmt(d.left)} <span class="dim">to go</span></span>
+      <span>${fmt(removed)} <span class="dim">removed</span></span>
+      ${d.unknown?`<span>${fmt(d.unknown)} <span class="dim">could not be heard well enough</span></span>`:''}
+    </div>
+    ${r.last_error?`<div class="warn" style="font-size:11px">${esc(r.last_error)}</div>`:''}
+    <div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px;font-size:11px;font-weight:600">Found${rows.length?` (${rows.length})`:''}</div>
+    ${rows.length?`<div class="rowbox scrollbox" style="height:auto;max-height:300px;overflow-y:auto"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <colgroup><col style="width:auto"><col style="width:32%"><col style="width:290px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px"><th class="l">EPISODE</th><th class="l">WHY</th><th class="l">RESULT</th></tr></thead>
+      <tbody>${found}</tbody></table></div>`:'<div class="dim" style="font-size:11px">nothing yet</div>'}
+    ${holds.length?`<div style="margin-top:8px;font-size:11px;font-weight:600">Unmonitored until they air (${holds.length})</div>
+      ${holds.map(h=>`<div style="font-size:11.5px;margin-top:3px"><b>${esc(h.title)}</b> <span class="dim">· airs ${esc(when(h.air))}</span>
+        <button class="rmb" style="margin-left:6px" onclick="samUnhold(${+h.episode},this)" title="Monitor it in ${esc(h.arr)} again now">Monitor now</button></div>`).join('')}`:''}
+    ${last.length?`<div style="margin-top:8px;font-size:11px"><span style="cursor:pointer;font-weight:600" onclick="_samLast=!_samLast;samPaint()"><span class="actcaret">${_samLast?'▾':'▸'}</span> Last compared</span>
+      ${_samLast?`<div class="mono" style="font-size:10.5px;margin-top:3px">${last.map(x=>`<div><span class="dim">${ago(x.at)}</span> ${esc(x.title)} S${String(x.season).padStart(2,'0')}${e2(x.episode)} / ${e2(x.other)}
+        <span style="color:${x.verdict==='same'?'#e3b341':'#8b949e'}">${esc(x.verdict)}</span> <span class="dim" title="how well each clip matched; ${d.hit} or more is the same sound">${(x.points||[]).map(p=>p==null?'-':p.toFixed(2)).join(' ')}</span></div>`).join('')}</div>`:''}</div>`:''}
+  </div>`;
+  if(html===_samKey && el.firstElementChild) return;      // nothing moved; leave the DOM alone
+  if(el.querySelector('[data-asking="1"]')) return;       // a question is open in a row
+  const box=el.querySelector('.rowbox'), top=box?box.scrollTop:0;
+  _samKey=html; el.innerHTML=html;
+  const nb=el.querySelector('.rowbox'); if(nb) nb.scrollTop=top;
+}
+
 
 // ---- upgrades that cut the bitrate - see bitcut.py -------------------------
 // THE SAME TABLE AS SUBTITLE USER INPUT: a checkbox per row (shift-click takes
