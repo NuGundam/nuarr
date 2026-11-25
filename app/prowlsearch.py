@@ -337,6 +337,8 @@ async def _find(a, want: dict, source: str, client, label: str) -> dict:
     cands = await _read(client, a, rows, want, prof)
     STATS["searched"] += 1
     blocked = await _blocklisted(client, a, want)
+    if want.get("exclude"):
+        blocked.add(_norm(want["exclude"]))
     n_blocked = sum(1 for c in cands if _norm(c["title"]) in blocked)
     cands = [c for c in cands if _norm(c["title"]) not in blocked]
     singles = sorted([c for c in cands if not c["pack"]], key=_key, reverse=True)
@@ -386,7 +388,7 @@ async def _find(a, want: dict, source: str, client, label: str) -> dict:
     return {"ok": False, "why": why[:400], "found": found, "tried": len(refused)}
 
 
-async def replace(row: dict, reason: str = "") -> dict:
+async def replace(row: dict, reason: str = "", exclude: str = "") -> dict:
     """For refetch: the file row that was just deleted. Resolves the item and searches."""
     from .gate import get_toggle
     if not get_toggle("arrs.prowlarr_search"):
@@ -416,6 +418,7 @@ async def replace(row: dict, reason: str = "") -> dict:
                     "profileId": m["qualityProfileId"]}
     except Exception as e:                                       # noqa: BLE001
         return {"ok": False, "why": f"{type(e).__name__}: {e}"[:200]}
+    want["exclude"] = exclude
     return await find(a, want, source=f"refetch: {reason}"[:120] if reason else "refetch")
 
 

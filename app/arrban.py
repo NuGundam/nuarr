@@ -61,7 +61,8 @@ GROUP_STRIKES = 3           # rejections from one group before the group is bann
 # rejection reasons that describe the copy that arrived, not the group's work -
 # these ban the release and give the group no strike (see note_rejection)
 DOWNLOAD_FAULTS = ("decoded nothing", "interrupted download", "truncated", "no video stream",
-                   "could not be read", "corrupt", "incomplete", "zero bytes", "unreadable")
+                   "could not be read", "corrupt", "incomplete", "zero bytes", "unreadable",
+                   "same recording as")
 PER_FORMAT = 250            # release patterns per format before rolling over
 # WHERE THE BANS LIVE: A RELEASE PROFILE, NOT A CUSTOM FORMAT (2026-10-17).
 # A format scored -999,999 is judged against the files ALREADY IN THE LIBRARY

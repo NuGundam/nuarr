@@ -741,10 +741,11 @@ async def replace(file_id: int, kind: str, source: str = "", why: str = "",
             from . import samecheck
             out = await samecheck.reject_unaired(int(file_id), why or policy(kind)["why"])
         if out is None:
-            # NOT BANNED BY NAME when the fake wore the real release's name
+            # NOT BANNED BY NAME when it was posted before the episode aired:
+            # the real release will wear the same name
             out = await refetch.run(int(file_id),
                                     reason=why or policy(kind)["why"],
-                                    ban=kind != "file/same-episode")
+                                    ban=kind != "file/same-episode" or samecheck.ban_name(_row))
     except Exception as e:                                       # noqa: BLE001
         _note(file_id, kind, REPLACE, source, auto, False,
               f"{type(e).__name__}: {e}")

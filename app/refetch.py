@@ -495,7 +495,11 @@ async def run(file_id: int, delete_file: bool = True,
         # queue janitor's to settle (it keeps the higher score).
         try:
             from . import prowlsearch
-            ps = await prowlsearch.replace(row, reason=reason or str(p.get("explain") or ""))
+            # NOT THE ONE BEING REJECTED. The blocklist and the ban come after
+            # this, so without its name here the search handed Young Justice
+            # S03E25's wrong W4F straight back (2026-11-24).
+            ps = await prowlsearch.replace(row, reason=reason or str(p.get("explain") or ""),
+                                           exclude=_ban_name)
             if ps.get("ok"):
                 did.append(f"found {ps['pushed']!r} through Prowlarr and handed it to {cfg.name}")
             elif ps.get("found") is not None:

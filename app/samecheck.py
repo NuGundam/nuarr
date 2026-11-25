@@ -432,6 +432,14 @@ def _holds() -> list:
         return []
 
 
+_LATE: dict = {}                 # file id -> it arrived after its episode aired
+
+
+def ban_name(row: dict) -> bool:
+    """Was this posted after its episode aired? Only then is the name itself bad."""
+    return bool(_LATE.get(int(row.get("id") or 0)))
+
+
 async def reject_unaired(file_id: int, why: str) -> dict | None:
     """Delete the fake and leave the episode alone until it airs. None when
     the episode has aired - the caller then replaces it the usual way."""
@@ -444,6 +452,7 @@ async def reject_unaired(file_id: int, why: str) -> dict | None:
     ep = next((e for e in await _episodes(row["arr_name"], row["arr_parent_id"])
                if e.get("episodeFileId") == row["arr_file_id"]), None)
     air = _ts((ep or {}).get("airDateUtc"))
+    _LATE[int(file_id)] = bool(air) and float(row["first_seen"] or 0) >= air
     if not ep or air <= time.time():
         return None
     cl = shared_client(next(c for c in SETTINGS.arrs if c.name == row["arr_name"]))
