@@ -17546,6 +17546,35 @@ tr.actsub.genhead .wrap>div.ell{white-space:nowrap;overflow:hidden;
   .bar i.indet{animation:none;opacity:.75;
     background-image:linear-gradient(90deg,transparent,rgba(255,255,255,.18),transparent)}
 }
+/* A RUNNING BAR LOOKS LIKE IT IS RUNNING. The fill on a job card was a flat
+   block: between two measurements a ten-minute encode and a hung one looked
+   the same. Three things now, on every job card, whatever the lane:
+     - a soft light travels along the filled part, left to right;
+     - the leading edge is a bright line that breathes;
+     - the fill is lit from above rather than flat.
+   Both moving parts are pseudo-elements animated by transform and opacity
+   only, so the compositor moves them and nothing is repainted. Not on a held
+   bar (nothing is happening) and not on the no-percentage sweep (it already
+   moves). */
+.wk .bar.big{height:9px;border-radius:5px;background:#0a0d11;
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.05)}
+.wk .bar.big > i{position:relative;overflow:hidden;border-radius:5px;min-width:3px;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.28), inset 0 -2px 3px rgba(0,0,0,.28)}
+.wk .bar.big > i:not(.indet):not(.held)::after{content:"";position:absolute;inset:0;
+  background:linear-gradient(90deg,transparent 0,rgba(255,255,255,0) 30%,
+    rgba(255,255,255,.38) 50%,rgba(255,255,255,0) 70%,transparent 100%);
+  transform:translateX(-100%);will-change:transform;
+  animation:barshine 2.2s cubic-bezier(.4,0,.2,1) infinite}
+.wk .bar.big > i:not(.indet):not(.held)::before{content:"";position:absolute;top:0;bottom:0;right:0;
+  width:3px;border-radius:2px;background:#fff;z-index:1;
+  box-shadow:0 0 6px 1px rgba(255,255,255,.75);
+  animation:baredge 1.4s ease-in-out infinite}
+@keyframes barshine{0%{transform:translateX(-100%)}70%,100%{transform:translateX(100%)}}
+@keyframes baredge{0%,100%{opacity:.35}50%{opacity:.95}}
+@media (prefers-reduced-motion:reduce){
+  .wk .bar.big > i::after{animation:none;display:none}
+  .wk .bar.big > i::before{animation:none;opacity:.6}
+}
 /* Pinned summary above a scrollbox. Same padding and rule as the header it
    replaces, so nothing shifts - it simply stops scrolling away. */
 .pinhead{padding:9px 14px;border-bottom:1px solid var(--line);font-size:14px}
