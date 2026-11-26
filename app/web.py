@@ -54095,6 +54095,53 @@ html.mobile .setwrap:not(.rail) .setmain,html.mobile .setwrap:not(.rail) #worker
    a 300px window meant scrolling a scrollbox inside a page that also scrolled.
    The subtraction is the header, the stat cards and the filter strip. */
 .setwrap{min-height:calc(100vh - 175px)}
+/* ---- SETTINGS ON A FOLDING PHONE. Thirty-six panes written for a wide
+   window, surveyed at 408 px (closed) and 760 px (open) on 2026-11-26: two
+   thirds of them were wider than the screen, so the whole pane slid sideways.
+   Closed:
+     - the menu rail was a 54 px column down the left of a 408 px screen; it
+       is a strip of icons across the top now, which scrolls sideways and
+       stays put while the pane scrolls, and the pane has the full width;
+     - the nine dashboard tiles above the settings are not shown - they are
+       one tap away and were a screen and a half to scroll past;
+     - a table sizes its columns by what is in them, wraps its text, and if it
+       is still too wide scrolls by itself instead of dragging the pane;
+     - a row of controls wraps.
+   Both: inputs never wider than the pane, long paths break. */
+html.mobile .setwrap #workersPanel table{max-width:100%}
+html.mobile .setwrap #workersPanel td.mono,html.mobile .setwrap #workersPanel td.wrap,
+html.mobile .setwrap #workersPanel .mono{overflow-wrap:anywhere}
+html.mobile .setwrap #workersPanel input,html.mobile .setwrap #workersPanel select,
+html.mobile .setwrap #workersPanel textarea{max-width:100%;box-sizing:border-box}
+html.mobile .setwrap #workersPanel pre{white-space:pre-wrap;overflow-wrap:anywhere}
+html.mobile .setwrap #workersPanel [style*="display:flex"]{flex-wrap:wrap}
+html.mobile .setwrap #workersPanel [style*="flex:none"]{flex:0 1 auto !important;min-width:0}
+
+html.mobile:not(.wide) body:has(.setwrap) .cards{display:none}
+html.mobile:not(.wide) .setwrap{flex-direction:column;margin:6px 0;border-left:0;border-right:0;border-radius:0}
+html.mobile:not(.wide) .setwrap.rail .setside{width:auto;flex:0 0 auto;padding:0;border-right:0;
+  border-bottom:1px solid var(--line);position:sticky;top:0;z-index:15;background:var(--panel)}
+html.mobile:not(.wide) .setwrap.rail .setstick{position:static;display:flex;flex-direction:row;
+  align-items:center;overflow-x:auto;max-height:none;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+html.mobile:not(.wide) .setwrap.rail .setstick::-webkit-scrollbar{display:none}
+html.mobile:not(.wide) .setwrap.rail .setstick > *{flex:0 0 auto}
+html.mobile:not(.wide) .setwrap.rail .setlink{padding:11px 12px;border-left:0;border-bottom:2px solid transparent}
+html.mobile:not(.wide) .setwrap.rail .setlink.on{border-bottom-color:#58a6ff}
+html.mobile:not(.wide) .setwrap.rail .setgrp{display:none}
+html.mobile:not(.wide) .setwrap.rail .settitle{padding:0 6px}
+html.mobile:not(.wide) .setwrap.rail .setback{margin:0}
+html.mobile:not(.wide) .setwrap:not(.rail) .setmain,
+html.mobile:not(.wide) .setwrap:not(.rail) #workersPanel{margin-left:0}
+html.mobile:not(.wide) .setwrap #workersPanel{padding-left:10px;padding-right:10px}
+
+html.mobile:not(.wide) .setwrap #workersPanel table{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch}
+html.mobile:not(.wide) .setwrap #workersPanel table:not(.sktbl){table-layout:auto !important}
+html.mobile:not(.wide) .setwrap #workersPanel table:not(.sktbl) th,
+html.mobile:not(.wide) .setwrap #workersPanel table:not(.sktbl) col,
+html.mobile:not(.wide) .setwrap #workersPanel table:not(.sktbl) td{width:auto !important;min-width:0 !important}
+html.mobile:not(.wide) .setwrap #workersPanel td,
+html.mobile:not(.wide) .setwrap #workersPanel th{white-space:normal !important;padding-left:6px;padding-right:6px}
+html.mobile:not(.wide) .setwrap #workersPanel [style*="white-space:nowrap"]{white-space:normal !important}
 #logsPane{display:flex;flex-direction:column;height:calc(100vh - 190px)}
 #logsPane .logbox{flex:1;min-height:0;max-height:none}
 #jobsPane .jgrp{font-size:10px;text-transform:uppercase;letter-spacing:.08em;
