@@ -310,6 +310,7 @@ def render() -> bytes:
 # segments exist) or "air".
 WAVE_D = (4.0, 4.0, 4.0, 4.3)
 WAVE_L = sum(WAVE_D)
+WAVE_LOOPS = 220
 
 
 def _wave_dir() -> pathlib.Path:
@@ -330,20 +331,18 @@ def set_mode(m: str) -> str:
 
 
 def _wave_playlist() -> str:
-    t = time.time()
-    k, rem, acc = len(WAVE_D) * int(t // WAVE_L), t % WAVE_L, 0.0
-    for d in WAVE_D[:-1]:
-        acc += d
-        if rem >= acc:
-            k += 1
-    first = k - 1
+    # NOT LIVE. As a live playlist (a 16 s window that slides every 4 s) the
+    # TV's player raised a source error and started over every 18 seconds. A
+    # fixed playlist of the loop, WAVE_LOOPS times over (about an hour), has
+    # no window to fall behind; the player loops the whole thing when it ends.
     n = len(WAVE_D)
     lines = ["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{math.ceil(max(WAVE_D))}",
-             f"#EXT-X-MEDIA-SEQUENCE:{first}", f"#EXT-X-DISCONTINUITY-SEQUENCE:{(first + n - 1) // n}"]
-    for j in range(first, first + 4):
-        if j % n == 0:
+             "#EXT-X-PLAYLIST-TYPE:VOD", "#EXT-X-MEDIA-SEQUENCE:0"]
+    for j in range(n * WAVE_LOOPS):
+        if j and j % n == 0:
             lines.append("#EXT-X-DISCONTINUITY")
         lines += [f"#EXTINF:{WAVE_D[j % n]:.3f},", f"seg/{j}.ts"]
+    lines.append("#EXT-X-ENDLIST")
     return "\n".join(lines) + "\n"
 
 
