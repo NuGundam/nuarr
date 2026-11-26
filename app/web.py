@@ -1956,6 +1956,12 @@ async def _queue_blockers_impl():
         else:
             cls = "next"
             what = "next in line — a worker and its spindle are free"
+            try:                                   # low priority mode: say why nothing else starts
+                from . import gate as _g, jobs as _j
+                if _j.RUNNING and _g.get_toggle("gate.low_priority"):
+                    what = "low priority mode — one job at a time; these start one by one as the running job ends"
+            except Exception:                      # noqa: BLE001
+                pass
             short = ""
         out.append({"job_id": r["job_id"], "pool": pool, "title": r["title"],
                     "disk": disk, "state": cls, "why": what, "short": short})
