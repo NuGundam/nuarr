@@ -710,7 +710,8 @@ async def _one(file_id: int, overwrite: bool, by: str = "you", dub: bool = False
         # ACROSS DRIVES IS A COPY - the copy lands under a temporary name
         # and is renamed there.
         body = made_text if style == "plain" else substyle.to_ass(made_text, style, label,
-                                                                     override=sublearn.style_for(show))
+                                                                     override=sublearn.style_for(show),
+                                                                     top=_top(file_id))
         with open(side + ".part", "w", encoding="utf-8" if style == "plain" else "utf-8-sig") as f:
             f.write(body)
         os.replace(side + ".part", side)
@@ -857,7 +858,7 @@ def keep_pending(file_id: int, srt_text: str, style: str, label: str, dub: bool 
     if style != "plain":
         track = os.path.join(d, stem + ".ass")
         with open(track, "w", encoding="utf-8-sig") as f:
-            f.write(substyle.to_ass(srt_text, style, label))
+            f.write(substyle.to_ass(srt_text, style, label, top=_top(file_id)))
     man = os.path.join(d, "manifest.json")
     try:
         with open(man, encoding="utf-8") as f:
@@ -931,8 +932,17 @@ def embed_pending(file_id: int, dub: bool | None = None) -> dict:
     return res
 
 
+def _top(file_id) -> bool:
+    """Subtitles for a file with foreign captions burned in go at the top."""
+    try:
+        from . import foreignburn
+        return foreignburn.burned(int(file_id))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def restyle_one(file_id: int, style: str = "", srt_text: str = "", add: bool = False,
-                track: str = TRACK_NAME, default: bool = True) -> dict:
+                track: str = TRACK_NAME, default: bool = True, force: bool = False) -> dict:
     """Rewrite one made subtitle in the style its group has now. With
     srt_text, the track inside the file is REPLACED by that text - a remake
     with overwrite, which the sidecar embed would otherwise throw away as a
@@ -954,11 +964,11 @@ def restyle_one(file_id: int, style: str = "", srt_text: str = "", add: bool = F
         if os.path.exists(side):
             text = open(side, encoding="utf-8-sig", errors="replace").read()
             was = "plain" if ext == ".srt" else (substyle.preset_of_ass(side) or "?")
-            if was == style:
+            if was == style and not force:
                 return {"ok": True, "same": True, "why": "already in that style"}
             srt = text if ext == ".srt" else substyle.ass_to_srt(text)
             new = _sidecar(path, ".srt" if style == "plain" else ".ass")
-            body = srt if style == "plain" else substyle.to_ass(srt, style, label)
+            body = srt if style == "plain" else substyle.to_ass(srt, style, label, top=_top(file_id))
             with open(new + ".part", "w", encoding="utf-8" if style == "plain" else "utf-8-sig") as f:
                 f.write(body)
             os.replace(new + ".part", new)
@@ -985,7 +995,7 @@ def restyle_one(file_id: int, style: str = "", srt_text: str = "", add: bool = F
     if pick:
         ordn, t = pick
         was = _style_of_track(path, t, ordn)
-        if was == style and not srt_text:
+        if was == style and not srt_text and not force:
             return {"ok": True, "same": True, "why": "already in that style"}
         fmt = "srt" if "SubRip" in (t.get("codec") or "") else "ass"
         raw = quiet_run([_ffmpeg_exe(), "-v", "error", "-i", path, "-map", f"0:s:{ordn}", "-f", fmt, "-"],
@@ -998,7 +1008,7 @@ def restyle_one(file_id: int, style: str = "", srt_text: str = "", add: bool = F
         return {"ok": False, "why": "could not read the track back out"}
     work = os.path.join(str(DATA_DIR), f"restyle.{file_id}" + (".srt" if style == "plain" else ".ass"))
     with open(work, "w", encoding="utf-8" if style == "plain" else "utf-8-sig") as f:
-        f.write(srt if style == "plain" else substyle.to_ass(srt, style, label))
+        f.write(srt if style == "plain" else substyle.to_ass(srt, style, label, top=_top(file_id)))
     ok_room, why_room = fileops.cache_room(os.path.getsize(path))
     if not ok_room:
         return {"ok": False, "why": why_room}

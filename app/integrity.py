@@ -908,7 +908,7 @@ def findings(limit: int = 200) -> list[dict]:
         init()
     kinds = {CORRUPT: "file/corrupt", UNREADABLE: "file/unreadable",
              SHORT: "file/short", ENCRYPTED: "audio/encrypted"}
-    from . import runtimecheck, samecheck
+    from . import foreignburn, runtimecheck, samecheck
     try:
         with cursor() as cur:
             return [{"file_id": r["file_id"],
@@ -921,7 +921,7 @@ def findings(limit: int = 200) -> list[dict]:
                         "   AND f.state NOT IN ('deleted','duplicate') "
                         " ORDER BY i.at DESC LIMIT ?",
                         (CORRUPT, UNREADABLE, SHORT, ENCRYPTED, int(limit)))
-                    ] + runtimecheck.findings(limit) + samecheck.findings(limit)
+                    ] + runtimecheck.findings(limit) + samecheck.findings(limit) + foreignburn.findings(limit)
     except Exception:                                            # noqa: BLE001
         return []
 

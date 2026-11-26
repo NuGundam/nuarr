@@ -325,6 +325,10 @@ DEFAULTS = {
     "gate.disk_busy": "1",
     "gate.arrs": "1",
     "gate.manual_pause": "0",
+    # LOW PRIORITY: one job at a time. Not a hold - the queue keeps moving,
+    # one file after another, and whatever a job runs inside itself (its
+    # quality search, its subtitle OCR, its checks) still runs with it.
+    "gate.low_priority": "0",
 }
 
 # Pool disks the current Plex sessions are streaming from. Read by the claim
@@ -3678,6 +3682,17 @@ def check_manual() -> Reason:
     return Reason(False, "manual", "Not paused")
 
 
+def check_low() -> Reason:
+    """Low priority mode. Never blocks: it narrows the queue to one job."""
+    if get_toggle("gate.low_priority"):
+        return Reason(False, "low priority", "On - one job at a time",
+                      extra=["The next job starts when the running one ends; the work a job does "
+                             "inside itself (quality search, subtitle OCR, checks) runs with it",
+                             "Background checks wait while a job runs"],
+                      clears="When you press Normal, in the Job gate heading")
+    return Reason(False, "low priority", "Off - every lane runs up to its count")
+
+
 def check_nurse() -> Reason:
     """The services nurse holds new jobs while Docker stops answering on a
     busy machine (svcnurse._relieve_and_probe), so nuarr's own load is not
@@ -3818,6 +3833,7 @@ async def status() -> GateStatus:
     # see - and it steers around the busy disks instead of holding everything.
     reasons = [
         check_manual(),
+        check_low(),
         check_nurse(),
         # A stalling viewer outranks everything below it, and holds every
         # pool - the one reason here with no scope.

@@ -275,6 +275,13 @@ async def busy(disk: str = "") -> dict:
         pass
     # 2. the encoders are full
     try:
+        from . import gate, jobs
+        if jobs.RUNNING and gate.get_toggle("gate.low_priority"):
+            return {"busy": True, "why": "low priority mode - a job is running",
+                    "detail": "one thing at a time; this waits for the job to end"}
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
         from . import jobs
         live = jobs.live_snapshot() or {}
         n = len([w for w in (live.get("workers") or [])

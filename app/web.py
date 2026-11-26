@@ -1021,6 +1021,8 @@ async def _startup() -> None:
     asyncio.create_task(_runtimecheck.watch())
     from . import samecheck as _samecheck
     asyncio.create_task(_samecheck.watch())
+    from . import foreignburn as _foreignburn
+    asyncio.create_task(_foreignburn.watch())
     asyncio.create_task(_remuxlabel.watch())
     asyncio.create_task(ffmpeg_update.watch())
     # Notices a GPU driver swap, re-measures NVENC, and hands in-flight encodes
@@ -9987,10 +9989,29 @@ def api_integrity():
 def api_integrity_keep(file_id: int):
     """This film's length, or this episode's sound, is right. Holds until the
     file changes."""
-    from . import runtimecheck, samecheck, userinput
-    ok = runtimecheck.keep(file_id) | samecheck.keep(file_id)
+    from . import foreignburn, runtimecheck, samecheck, userinput
+    ok = runtimecheck.keep(file_id) | samecheck.keep(file_id) | foreignburn.keep(file_id)
     userinput.rows(fresh=True)
     return {"ok": ok}
+
+
+@app.get("/api/foreignburn")
+def api_foreignburn():
+    from . import foreignburn
+    return foreignburn.stats()
+
+
+@app.post("/api/foreignburn/run")
+def api_foreignburn_run():
+    from . import foreignburn
+    return foreignburn.look_now()
+
+
+@app.post("/api/foreignburn/on")
+def api_foreignburn_on(on: bool):
+    from . import foreignburn
+    foreignburn.set_enabled(on)
+    return foreignburn.stats()
 
 
 @app.get("/api/samecheck")
@@ -14920,6 +14941,13 @@ def _outside_live() -> list:
         out.append(groupscore.worker_row())
     except Exception:                                    # noqa: BLE001
         pass
+    # THE TWO LIBRARY CHECKS THAT LISTEN AND LOOK: lanes like the rest, so
+    # what they are doing and what they have left is where everything else is.
+    for _m in ("samecheck", "foreignburn"):
+        try:
+            out.append(getattr(__import__("app." + _m, fromlist=[_m]), "worker_row")())
+        except Exception:                                # noqa: BLE001
+            pass
     return out
 
 
@@ -14949,7 +14977,8 @@ def api_outside_pause(key: str, on: int = 1):
     from . import submake, qwenjudge, subverify, vmaftarget, qwenvl, subtiming
     names = {"submake": "Subtitle maker", "qwen": "Qwen judge", "verify": "Second opinion",
              "quality": "Quality searches", "qwenvl": "Qwen-VL reader", "subtiming": "Subtitle timing",
-             "groups": "Group scorecard"}
+             "groups": "Group scorecard", "samecheck": "Same episode twice",
+             "foreignburn": "Foreign subtitles burned in"}
     if key not in names:
         raise HTTPException(400, "unknown key")
     if key == "quality":
@@ -14959,6 +14988,9 @@ def api_outside_pause(key: str, on: int = 1):
     elif key == "groups":
         from . import groupscore
         groupscore.set_paused(bool(on))
+    elif key in ("samecheck", "foreignburn"):
+        from . import samecheck, foreignburn
+        {"samecheck": samecheck, "foreignburn": foreignburn}[key].set_enabled(not bool(on))
     else:
         {"submake": submake, "qwen": qwenjudge, "verify": subverify, "subtiming": subtiming}[key].set_paused(bool(on))
     joblog.log(f"{names[key]} {'paused' if on else 'running again'}", "info")
@@ -26184,6 +26216,8 @@ function poolColor(pool){
        : pool==='qwenvl'      ? '#ff9e64'         // orange - the Qwen-VL reader
        : pool==='subtiming'   ? '#6ee7f7'         // cyan - subtitle timing
        : pool==='groups'      ? '#d4b8ff'         // soft violet - the group measurer
+       : pool==='same'        ? '#f778ba'         // pink - the same-episode listener
+       : pool==='burned'      ? '#e3b341'         // gold - the burned-in foreign subtitle reader
        : 'var(--ok)';
 }
 // LETTERED DRIVES GET THEIR OWN COLOURS, none of them in DISK_COLORS: the
@@ -30423,6 +30457,11 @@ const GATE_META={
     on:'An extra track of the same language and kind is removed with a remux - nothing is re-encoded. The copy with the most lines stays, and the rebuilt file is read back before it replaces the original. An SDH track beside a full one, or signs beside dialogue, is not a duplicate.',
     off:'Duplicate tracks are left in the file. They are harmless, but the player lists the same subtitle twice.',
     note:'This one removes something from a file, which is why it waited to be switched on.'},
+  'gate.low_priority':{
+    label:'Low priority mode',
+    what:'One job at a time, for when the machine is wanted for something else. Not a pause: the queue keeps moving.',
+    on:'Only one job runs at once, whatever the lane counts say. The work a job does inside itself (its quality search, its subtitle OCR, its checks) still runs with it. Background checks wait while a job runs. Jobs already running when this is turned on finish.',
+    off:'Normal operation - every lane runs up to its own count.'},
   'gate.manual_pause':{
     label:'Manual pause',
     what:'The stop switch. Nothing to do with what Plex or the arrs are doing.',
@@ -30727,7 +30766,7 @@ function paintGateCfg(toggles){
   // in a hurry; the rest are policy you set once. It also has nothing to do
   // with Plex or the arrs, so leading with it avoids implying it belongs to
   // the automatic checks below.
-  const order=['gate.manual_pause',
+  const order=['gate.manual_pause','gate.low_priority',
                'gate.plex','gate.plex_transcodes_only','gate.plex_encode_only',
                'gate.plex_ignore_throttled','gate.plex_io_throttle',
                'gate.disk_busy','gate.arrs'];
@@ -30778,11 +30817,15 @@ let _quickKey='';
 function paintGateQuick(toggles){
   const el=document.getElementById('gateQuick');
   if(!el) return;
-  const on=!!toggles['gate.manual_pause'];
-  const key=on?'1':'0';
+  const on=!!toggles['gate.manual_pause'], low=!!toggles['gate.low_priority'];
+  const key=(on?'1':'0')+(low?'1':'0');
   if(key===_quickKey) return;          // same no-repaint discipline as above
   _quickKey=key;
   el.innerHTML=
+    `<span class="gqlabel">${low?'Low priority · one job at a time':'Priority'}</span>`+
+    `<button class="gqbtn${low?' on':''}" style="margin-right:12px" onclick="setGate('gate.low_priority',${low?'false':'true'})"
+       title="${low?'Back to normal: every lane runs up to its count':'Low priority mode: only one job at a time. The work a job does inside itself still runs with it. Running jobs finish.'}"
+     >${low?'Normal':'Low'}</button>`+
     `<span class="gqlabel">${on?'Queue paused':'Manual pause'}</span>`+
     `<button class="gqbtn${on?' on':''}" onclick="setGate('gate.manual_pause',${on?'false':'true'})"
        title="${on?'Let jobs start again':'Stop new jobs starting. Running jobs finish.'}"
@@ -50873,6 +50916,7 @@ async function loadArrsTab(refresh){
     prowlarr_search:{need:'', changed:((d.prowlarr_search||{}).active||[]).length?'searching now':(recent((d.prowlarr_search||{}).stats)&&(+((d.prowlarr_search||{}).stats||{}).pushed||0)>0?'pushed releases lately':'')},
     samBox:{need:((_sam&&_sam.rows)||[]).some(r=>r.state==='yours')?'decide':'',
             changed:((_sam&&_sam.rows)||[]).some(r=>r.state==='removed'&&now-r.at<6*3600)?'removed':''},
+    fbBox:{need:'', changed:((_fb&&_fb.rows)||[]).some(r=>now-r.at<6*3600)?'found':''},
     bcBox:{need:bcOpen?`${bcOpen} cut upgrade${bcOpen===1?'':'s'} to decide`:'', changed:''},
   };
   const chip=k=>{ const a=attn[k]||{}; return a.need?`<span class="pill" style="color:#e2b341;border-color:#e2b341;margin-left:8px;font-size:10.5px">needs you · ${esc(a.need)}</span>`
@@ -50945,8 +50989,11 @@ async function loadArrsTab(refresh){
         d.toggles.prowlarr_search, (d.prowlarr_search||{}).stats||{},
         {label:'', kind:'prowlarr_search', names:{}, empty:'', adder:psList(d.prowlarr_search||{})})],
   ];
-  const order=['profile_guard','trash_anime','release_ban','queue_janitor','prowlarr_search','samBox','bcBox'];
-  const rank=k=>{ const a=attn[k]||{}, on=(k==='bcBox'||k==='samBox')?true:!!d.toggles[k];
+  const order=['profile_guard','trash_anime','release_ban','queue_janitor','prowlarr_search','samBox','fbBox','bcBox'];
+  const rank=k=>{ const a=attn[k]||{}, on=(k==='bcBox'||k==='samBox'||k==='fbBox')?true:!!d.toggles[k];
+    // samBox and fbBox do not move: their state changes by itself, as a pass finds things,
+    // and a card that changes places while it is being read is worse than one out of order
+    if(k==='samBox'||k==='fbBox') return 20+order.indexOf(k);
     return (a.need?0:a.changed?1:on?2:3)*10+order.indexOf(k); };
   const parts=[['running', (d.stats.running?`<div class="dim" style="margin-bottom:8px">running: ${esc(d.stats.running)}…</div>`:'')], ['hooks', `<div style="border:1px solid var(--line);border-radius:8px;padding:10px 14px">
         <div style="display:flex;align-items:center;gap:10px">
@@ -50970,6 +51017,7 @@ async function loadArrsTab(refresh){
       </div>`]];
   const scripts=[...cards.map(([k,h])=>[k, h.replace('</b>', '</b>'+chip(k))]),
     ['samBox', '<div id="samBox"></div>'],
+    ['fbBox', '<div id="fbBox"></div>'],
     ['bcBox', `${chip('bcBox')?`<div style="margin:2px 0 4px">${chip('bcBox')}</div>`:''}<div id="bcBox" style="margin-top:12px"></div>`]]
     .sort((x,y)=>rank(x[0])-rank(y[0]));
   // TWO PAGES FROM ONE LOAD (2026-11-20): the Arrs page keeps what is about the
@@ -51012,7 +51060,84 @@ async function loadArrsTab(refresh){
   bcLoad();
   dlLoad();
   samLoad();
+  fbLoad();
 }
+
+// ---- another language's subtitles burned into the picture - foreignburn.py ----
+let _fb=null, _fbT=null, _fbKey='';
+async function fbLoad(){
+  const el=document.getElementById('fbBox'); if(!el) return;
+  clearTimeout(_fbT);
+  try{ const r=await fetch('/api/foreignburn'); if(!r.ok) throw 0; _fb=await r.json(); await rmPolicy(); fbPaint(); }
+  catch(e){ if(!el.firstElementChild) el.innerHTML='<span class="dim">could not load</span>'; }
+  clearTimeout(_fbT);
+  _fbT=setTimeout(()=>shownPoll('fbBox', fbLoad), _fb&&_fb.run.running?5000:20000);
+}
+async function fbOn(on){ try{ _fb=await (await fetch('/api/foreignburn/on?on='+(on?'true':'false'),{method:'POST'})).json(); }catch(e){} fbPaint(); }
+async function fbRun(btn){
+  btn.disabled=true; btn.textContent='looking…';
+  try{ _fb=await (await fetch('/api/foreignburn/run',{method:'POST'})).json(); }catch(e){}
+  _fbKey=''; fbLoad();
+}
+async function fbKeep(id){ try{ await fetch('/api/integrity/keep?file_id='+id,{method:'POST'}); }catch(e){} _fbKey=''; fbLoad(); }
+function fbPaint(){
+  const el=document.getElementById('fbBox'); if(!el||!_fb) return;
+  const d=_fb, r=d.run||{}, rows=d.rows||[];
+  const n=s=>rows.filter(x=>x.state===s).length;
+  const ST={replaced:['#3fb950','replaced'],ok:['#8b949e','kept - yours'],kept:['#e3b341','kept - nothing better'],
+    replacing:['#79c0ff','being replaced'],open:['#e3b341',d.mode==='auto'?'waiting for the remedy':'yours to replace']};
+  const name=p=>String(p||'').split(String.fromCharCode(92)).pop();
+  const state=!d.on?'<span class="dim">off</span>'
+    :r.running?`<span class="dlspin"></span><span style="color:var(--acc)">reading</span> ${esc((r.flight||[]).join(' · ')||r.now||'')}`
+    :r.paused?`<span class="dim">waiting: ${esc(r.paused_why||'')}</span>`:'<span class="dim">idle</span>';
+  const found=rows.map(x=>{
+    const s=ST[x.state]||['#8b949e',x.state], open=x.state==='open'||x.state==='kept';
+    return `<tr>
+      <td class="l" style="white-space:normal"><b>${esc(x.title)}</b> <span class="dim">· ${ago(x.at)}</span>
+        <div class="dim mono" style="font-size:10px;word-break:break-word">${esc(name(x.path))}</div></td>
+      <td class="l" style="white-space:normal">${esc(x.script)} <span class="dim">in ${x.hits} of ${x.samples} frames${x.source||x.grp?` · ${esc([x.source,x.grp].filter(Boolean).join(' / '))}`:''}</span>
+        <div class="dim" style="font-size:10.5px;word-break:break-word">${esc(x.sample)}</div></td>
+      <td class="l" style="white-space:normal"><span style="color:${s[0]}">${esc(s[1])}</span>
+        ${x.note?`<div class="dim" style="font-size:10.5px">${esc(x.note)}</div>`:''}
+        ${x.again?`<div class="dim" style="font-size:10.5px">looked for again ${esc(new Date(x.again*1000).toLocaleDateString([], {month:'short',day:'numeric'}))}</div>`:''}
+        ${open&&x.failed?`<div class="err" style="font-size:10.5px">${esc(x.failed)}</div>`:''}
+        ${open?`<div style="margin-top:3px">${remedyBtns(x.file_id,'file/foreign-burn',{source:'foreignburn'})}
+          <button class="rmb" onclick="fbKeep(${x.file_id})" title="Leave this file alone. Asked again only if the file changes.">Keep</button></div>`:''}</td></tr>`; }).join('');
+  const html=`<div style="border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin-bottom:10px">
+    <div style="display:flex;align-items:center;gap:10px">
+      <b>Foreign subtitles burned in</b>
+      <span class="pill ${d.on?'p-ok':'p-dim'}" style="cursor:pointer" title="click to turn ${d.on?'off':'on'}" onclick="fbOn(${d.on?0:1})">${d.on?'ON':'off'}</span>
+      <button style="margin-left:auto" onclick="fbRun(this)">Run now</button>
+    </div>
+    <div class="dim" style="font-size:11px;margin:6px 0 4px">Reads a dozen frames of each file that has no English audio and finds
+      captions in another language painted into the picture (Chinese, Korean, Cyrillic, Thai, Arabic) - they can never be taken off.
+      When the arr has something else to download, the file is
+      ${d.mode==='auto'?'replaced without asking (the integrity check is on auto)':'listed here to replace (the integrity check is on manual)'}.
+      When it has nothing, the file stays, the subtitles nuarr made for it move to the top of the picture so the two do not overlap,
+      and it is looked for again a week later. A source and group seen burned twice and never clean is banned in the arrs.</div>
+    <div class="mono" style="font-size:11px;display:flex;gap:14px;flex-wrap:wrap">
+      <span>${state}</span>
+      <span>${fmt(d.read)} <span class="dim">files read</span></span>
+      <span>${fmt(d.left)} <span class="dim">to go</span></span>
+      <span>${fmt(d.found)} <span class="dim">burned</span></span>
+      <span>${fmt(n('replaced'))} <span class="dim">replaced</span></span>
+      <span>${fmt(n('kept'))} <span class="dim">kept, subtitles at the top</span></span>
+    </div>
+    ${r.last_error?`<div class="warn" style="font-size:11px">${esc(r.last_error)}</div>`:''}
+    ${(d.bans||[]).length?`<div style="font-size:11px;margin-top:5px"><span class="dim">banned in the arrs:</span> ${d.bans.map(b=>`<span class="pill" style="font-size:10.5px">${esc(b.source)} by ${esc(b.grp)} · ${b.burned} burned</span>`).join(' ')}</div>`:''}
+    <div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px;font-size:11px;font-weight:600">Found${rows.length?` (${rows.length})`:''}</div>
+    ${rows.length?`<div class="rowbox scrollbox" style="height:auto;max-height:300px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <colgroup><col style="width:auto"><col style="width:32%"><col style="width:290px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px"><th class="l">FILE</th><th class="l">WHAT IS IN THE PICTURE</th><th class="l">RESULT</th></tr></thead>
+      <tbody>${found}</tbody></table></div>`:'<div class="dim" style="font-size:11px">nothing yet</div>'}
+  </div>`;
+  if(html===_fbKey && el.firstElementChild) return;
+  if(el.querySelector('[data-asking="1"]')) return;
+  const box=el.querySelector('.rowbox'), top=box?box.scrollTop:0;
+  _fbKey=html; el.innerHTML=html;
+  const nb=el.querySelector('.rowbox'); if(nb) nb.scrollTop=top;
+}
+
 
 // ---- an episode that is its neighbour under a new name - samecheck.py ------
 let _sam=null, _samT=null, _samKey='', _samLast=false;

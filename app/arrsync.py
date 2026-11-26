@@ -107,7 +107,7 @@ def _probe_rows() -> dict:
     with cursor() as c:
         for r in c.execute(
                 "SELECT f.arr_name, f.arr_file_id, f.arr_parent_id, f.path, "
-                "       f.audio_langs, f.size, f.video_codec, f.height, p.json "
+                "       f.audio_langs, f.orig_lang, f.size, f.video_codec, f.height, p.json "
                 "  FROM files f LEFT JOIN file_probes p ON p.file_id = f.id "
                 " WHERE f.arr_file_id IS NOT NULL "
                 "   AND f.state NOT IN ('deleted','duplicate')"):
@@ -198,7 +198,7 @@ async def scan() -> dict:
                 actual = arrlang._canon(arrlang._iso_set(
                     mine.get("audio_langs") or ""))
                 claimed = arrlang._canon(arrlang._claimed_iso(rec))
-                if actual and claimed and claimed > actual:
+                if arrlang.wrong(claimed, actual, mine.get("audio_langs") or "", mine.get("orig_lang") or ""):
                     found["languages"].append(
                         dict(row, claimed=sorted(claimed),
                              actual=sorted(actual)))

@@ -112,16 +112,42 @@ def _canon(isos: set) -> set:
     return {n for n in (_ISO2NAME.get(i) for i in isos) if n}
 
 
+def wrong(claimed: set, actual: set, raw: str = "", orig: str = "") -> bool:
+    """Does the arr claim a language the file does not have?
+
+    MORE THAN THE FILE HAS, OR NONE OF WHAT IT HAS. The second case is an
+    indexer's mistake rather than nuarr's: Please Excuse My Younger Brothers
+    S01E19 "Baha WEB-DL -MWeb" was listed as English by one indexer, the arr
+    believed it, and a Japanese-only file with Chinese burned into the picture
+    held the +10000 "has English audio" score - so the Crunchyroll release
+    with real subtitles (864) never counted as an upgrade.
+
+    ONLY THAT CASE: the arr says English, and the file is the show's original
+    language and nothing else, every track tagged. Track tags lie too (50
+    files claimed English whose tracks are tagged Spanish, 38 Japanese shows
+    tagged Chinese), and taking English away on a tag's word is how files
+    with English get replaced.
+    """
+    if not claimed or not actual:
+        return False
+    if claimed > actual:
+        return True
+    untagged = any(x.strip() == "-" for x in (raw or "").split(","))
+    o = str(orig or "").strip().lower()
+    return ("english" in claimed and claimed.isdisjoint(actual) and not untagged
+            and bool(o) and o != "english" and actual == {o})
+
+
 async def scan(limit: int = 0) -> dict:
     r"""Every arr record whose languages disagree with the file. Read-only."""
     with cursor() as c:
         probe = {}
         for r in c.execute(
-                "SELECT arr_name, arr_file_id, audio_langs, path FROM files "
+                "SELECT arr_name, arr_file_id, audio_langs, path, orig_lang FROM files "
                 " WHERE arr_file_id IS NOT NULL AND audio_langs IS NOT NULL "
                 "   AND state NOT IN ('deleted','duplicate')"):
             probe[(r["arr_name"], r["arr_file_id"])] = (r["audio_langs"],
-                                                        r["path"])
+                                                        r["path"], r["orig_lang"])
     rows, checked = [], 0
     from .arr import shared_client
     for cfg in (SETTINGS.arrs or []):
@@ -166,7 +192,7 @@ async def scan(limit: int = 0) -> dict:
                 # ONLY WHERE THE ARR CLAIMS MORE. The other direction means the
                 # file has a language the arr never knew about, which is a
                 # different situation and not one to "fix" by guessing.
-                if a and c2 > a:
+                if wrong(c2, a, hit[0], hit[2]):
                     rows.append({"arr": cfg.name, "kind": cfg.kind,
                                  "file_id": rec.get("id"),
                                  "path": rec.get("path") or hit[1],
@@ -192,7 +218,7 @@ async def fix_one(cfg, arr_file_id: int, file_id: int) -> bool:
     if not arr_file_id or not file_id:
         return False
     with cursor() as c:
-        row = c.execute("SELECT audio_langs FROM files WHERE id=?",
+        row = c.execute("SELECT audio_langs, orig_lang FROM files WHERE id=?",
                         (file_id,)).fetchone()
     actual = _canon(_iso_set(row["audio_langs"] if row else ""))
     if not actual:
@@ -208,7 +234,7 @@ async def fix_one(cfg, arr_file_id: int, file_id: int) -> bool:
     claimed = _canon(_claimed_iso(rec))
     # Only narrow, and only when there is something to narrow - the same rule
     # the sweep follows, for the same reason.
-    if not claimed or not claimed > actual:
+    if not wrong(claimed, actual, row["audio_langs"] if row else "", row["orig_lang"] if row else ""):
         return False
     table = await _lang_table(client)
     langs = [{"id": table[n]["id"], "name": table[n]["name"]}

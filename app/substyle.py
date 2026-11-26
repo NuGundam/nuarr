@@ -158,7 +158,10 @@ def srt_cues(text: str) -> list:
     return out
 
 
-def to_ass(srt_text: str, preset: str, title: str = "", override: dict | None = None) -> str:
+def to_ass(srt_text: str, preset: str, title: str = "", override: dict | None = None,
+           top: bool = False) -> str:
+    """top: the picture has another language's captions burned in along the bottom
+    (foreignburn.py), so dialogue is placed at the top where the two cannot overlap."""
     p = dict(PRESETS[preset])
     # THE SHOW'S OWN LOOK, when sublearn has read enough of its tracks: font,
     # size and placement follow the fansub's dialogue style; the preset keeps
@@ -171,10 +174,11 @@ def to_ass(srt_text: str, preset: str, title: str = "", override: dict | None = 
             p["primary"] = override["primary"]
         if override.get("outline_c"):
             p["outline_c"] = override["outline_c"]
-    align = int(p.get("align") or 2)
+    align = 8 if top else int(p.get("align") or 2)
     head = [
         "[Script Info]",
         f"; nuarr style: {preset}",
+    ] + (["; nuarr placement: top"] if top else []) + [
         f"Title: {title or 'English'}",
         "ScriptType: v4.00+",
         "WrapStyle: 0",

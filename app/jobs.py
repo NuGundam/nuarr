@@ -3447,6 +3447,11 @@ async def pump() -> None:
                             if not st.open_for(pool):
                                 continue
                             while _in_pool(pool) < _capacity(pool):
+                                # LOW PRIORITY MODE: one job at a time, any
+                                # lane. What that job runs inside itself is
+                                # not a second job and is not held.
+                                if RUNNING and gate.get_toggle("gate.low_priority"):
+                                    break
                                 if pool in HEAVY_POOLS and \
                                         time.time() - _LAST_START["heavy"] < START_GAP_S:
                                     break                    # next tick

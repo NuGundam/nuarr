@@ -532,3 +532,17 @@ async def watch() -> None:
                    disk_of=lambda p: p[0].get("pool_disk") or "",
                    note_of=lambda p: f"listening for the same episode twice ({_tag(p[0])} / {_tag(p[1])})",
                    system_name=TITLE, goto="/settings#janitor@samBox")
+
+
+def worker_row() -> dict:
+    """This check as a lane in the Processing system: running, waiting, its switch."""
+    from . import idle
+    p = idle.progress(KEY)
+    run = bool(p.get("running"))
+    try:
+        left = len(_pending(10 ** 9)) if time.time() - _LEFT["at"] > 60 else _LEFT["n"]
+    except Exception:                                            # noqa: BLE001
+        left = 0
+    return {"key": KEY, "pool": "same", "label": TITLE, "running": 1 if run else 0, "cap": 1,
+            "paused": not enabled(), "now": ("listening" if run else ""), "queued": int(left),
+            "hint": "Listens to each new episode next to its neighbours and finds one that is really the episode beside it under a new name. One pair at a time, only while the machine is quiet. Its results are on Settings - Janitor."}

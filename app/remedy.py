@@ -135,6 +135,11 @@ _kind("file/runtime", False, True, False,
 #    prove which of the two is wrong reach the unattended pass; see samecheck.
 _kind("file/same-episode", False, True, True,
       "this is another episode's recording under this episode's name")
+# -- another language's subtitles painted into the picture. Replaced only when
+#    the arr has something else to offer; otherwise kept, with nuarr's own
+#    subtitles moved clear of them. See foreignburn.settle.
+_kind("file/foreign-burn", False, True, True,
+      "another language's subtitles are burned into the picture and cannot be removed")
 # -- DRM left on a track. Not file/unreadable's limit of this toolchain: the
 #    file says so itself, with an enca/encv tag, and no player has the key.
 _kind("audio/encrypted", False, True, True,
@@ -740,6 +745,9 @@ async def replace(file_id: int, kind: str, source: str = "", why: str = "",
         if kind == "file/same-episode":
             from . import samecheck
             out = await samecheck.reject_unaired(int(file_id), why or policy(kind)["why"])
+        if kind == "file/foreign-burn":
+            from . import foreignburn
+            out = await foreignburn.settle(int(file_id), why or policy(kind)["why"])
         if out is None:
             # NOT BANNED BY NAME when it was posted before the episode aired:
             # the real release will wear the same name
