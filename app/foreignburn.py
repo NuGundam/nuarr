@@ -465,10 +465,26 @@ def look_now() -> dict:
     return stats()
 
 
+async def _act_loop() -> None:
+    """Open findings go to the remedy every few minutes, whether or not a file is being read:
+    the reading waits for a quiet machine (and, in low priority mode, for the queue), and a
+    finding should not wait with it. Episode 19 sat open for an hour that way."""
+    while True:
+        try:
+            _due()
+            if findings(1):
+                _KICK["on"] = True
+            await _act()
+        except Exception:                                        # noqa: BLE001
+            pass
+        await asyncio.sleep(300)
+
+
 async def watch() -> None:
     from . import idle
     await asyncio.to_thread(init)
     await asyncio.sleep(260)
+    asyncio.create_task(_act_loop())
     await idle.run(KEY, TITLE, _pending, _do_one, label=lambda r: _label(r)[:120],
                    disk_of=lambda r: r.get("pool_disk") or "", lanes=1,
                    note_of=lambda r: "reading the picture for burned-in foreign subtitles",
