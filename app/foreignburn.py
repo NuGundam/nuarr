@@ -162,8 +162,9 @@ def _due() -> None:
     """A file kept for want of anything better is a finding again after a week."""
     try:
         with cursor() as cur:
-            cur.execute("UPDATE foreign_burn SET state='', state_at=? WHERE state='kept' AND kept=0 "
-                        " AND state_at < ?", (time.time(), time.time() - RETRY_S))
+            if cur.execute("UPDATE foreign_burn SET state='', state_at=? WHERE state='kept' AND kept=0 "
+                           " AND state_at < ?", (time.time(), time.time() - RETRY_S)).rowcount:
+                _KICK["on"] = True
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -237,7 +238,27 @@ async def _do_one(r: dict, report=None) -> dict:
         joblog.log(f"foreign subtitles burned in: {_label(r)} has {res['script']} captions in the picture "
                    f"({res['hits']} of {res['samples']} frames) - {os.path.basename(r['path'])}", "warn")
         await asyncio.to_thread(_maybe_ban, src, grp, res["script"])
+        _KICK["on"] = True
+    await _act()
     return {"ok": True}
+
+
+_KICK = {"on": True}             # true at start: a finding left open by a restart is acted on
+
+
+async def _act() -> None:
+    """Hand what is open to the remedy. The integrity check only does this when IT finds
+    something, so a finding of this check would otherwise wait for a corrupt file."""
+    if not _KICK["on"]:
+        return
+    _KICK["on"] = False
+    try:
+        from . import integrity, remedy
+        mine = [f for f in integrity.auto_findings(200) if f["kind"] == KIND]
+        if mine:
+            await remedy.auto(mine, KEY, integrity.mode() == "auto")
+    except Exception as e:                                       # noqa: BLE001
+        joblog.log(f"foreign subtitles burned in: the remedy pass failed - {type(e).__name__}: {e}", "warn")
 
 
 def _pairs() -> dict:
