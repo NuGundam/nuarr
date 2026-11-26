@@ -712,6 +712,156 @@ def _import_by_runtime(queues: list) -> tuple[list, set, set]:
     return out, gone, keep
 
 
+# --------------------------------------- files named by the episode's title --
+# HALO LEGENDS (2026-11-26): a season pack whose files are named for the
+# episode and nothing else - "[tribute]_halo_legends_the_duel_[bd_...].mkv".
+# No S01E03 anywhere, so Sonarr says "Invalid season or episode" for every
+# file and the finished pack sits in the queue. A person reads the titles.
+# So does this:
+#   - each video's name, without brackets, the series' own name and the
+#     release group, is compared with every episode title of the series
+#     (specials included), the series' name taken out of those too, and a
+#     trailing I/II/III read as 1/2/3 - "origins1" is "Origins I";
+#   - a file is taken only when exactly one episode matches it and no other
+#     file matches that episode, and it runs between half and twice as long
+#     as that episode is listed;
+#   - nothing is imported unless EVERY episode the arr grabbed the download
+#     for found its file this way. Extras that match a special are imported
+#     with them when the special has no file yet; anything unmatched (an
+#     opening, credits, rough cuts) stays in the download.
+# Each download is tried once.
+TITLE_SAYS = ("invalid season or episode", "unable to parse file",
+              "were not imported or missing from the release")
+KV_TITLE = "arrqueue.title_tried"
+_ROMAN = {"i": "1", "ii": "2", "iii": "3", "iv": "4", "v": "5", "vi": "6", "vii": "7", "viii": "8", "ix": "9", "x": "10"}
+
+
+def _title_key(text: str, drop: list) -> str:
+    """A name or a title as bare words: no brackets, no series name, no group."""
+    import re
+    t = re.sub(r"\[[^\]]*\]|\([^)]*\)|\{[^}]*\}", " ", str(text or ""))
+    t = t.lower().replace("&", " and ").replace("'", "").replace("\u2019", "")
+    t = re.sub(r"(?<=[a-z])(?=\d)|(?<=\d)(?=[a-z])", " ", t)
+    words = re.sub(r"[^a-z0-9]+", " ", t).split()
+    for d in drop:                                   # the series' name, the group: as word runs
+        d = d.split()
+        n = len(d)
+        if not n:
+            continue
+        i = 0
+        while i + n <= len(words):
+            if words[i:i + n] == d:
+                del words[i:i + n]
+            else:
+                i += 1
+    if words and words[-1] in _ROMAN:
+        words[-1] = _ROMAN[words[-1]]
+    return "".join(words)
+
+
+def _import_by_title(queues: list) -> tuple[list, set, set]:
+    """(rows for the log, queue ids dealt with, download ids to keep tracked)."""
+    import re
+    from .db import kv_get, kv_set
+    out, gone, keep = [], set(), set()
+    try:
+        tried = set(json.loads(kv_get(KV_TITLE) or "[]"))
+    except Exception:                                            # noqa: BLE001
+        tried = set()
+    for a, rows in queues:
+        if a.kind != "sonarr":
+            continue
+        by: dict = {}
+        for r in rows:
+            if (r.get("status") or "") != "completed" or (r.get("sizeleft") or 0) > 0:
+                continue
+            if not (r.get("seriesId") and r.get("episodeId") and r.get("downloadId")):
+                continue
+            low = " | ".join([str(st.get("title") or "") for st in (r.get("statusMessages") or [])]
+                             + [m for st in (r.get("statusMessages") or [])
+                                for m in list(st.get("messages") or [])]).lower()
+            if any(k in low for k in TITLE_SAYS):
+                by.setdefault(str(r["downloadId"]), []).append(r)
+        for did, grp in by.items():
+            if did in tried:
+                continue
+            row0 = grp[0]
+            name = row0.get("title") or ""
+            try:
+                cands = [c for c in _video_cands(a, row0) if not (c.get("episodes") or [])]
+                if len(cands) < 2:
+                    continue                       # one video is the length rule's case
+                tried.add(did)
+                series = _call(a, f"/api/v3/series/{int(row0['seriesId'])}") or {}
+                eps = _call(a, f"/api/v3/episode?seriesId={int(row0['seriesId'])}") or []
+                plain = lambda x: " ".join(re.sub(r"[^a-z0-9]+", " ", str(x or "").lower().replace("'", "")).split())  # noqa: E731
+                drop = [plain(series.get("title")), plain(re.sub(r"\(\d{4}\)", "", series.get("title") or ""))]
+                drop += [plain(t.get("title")) for t in (series.get("alternateTitles") or [])]
+                drop = sorted({d for d in drop if d}, key=len, reverse=True)
+                keys: dict = {}
+                for e in eps:
+                    k = _title_key(e.get("title"), drop)
+                    if len(k) >= 3:
+                        keys.setdefault(k, []).append(e)
+                pairs, used = [], {}
+                for c in cands:
+                    stem = os.path.splitext(os.path.basename(c.get("path") or ""))[0]
+                    grp_name = plain(c.get("releaseGroup"))
+                    k = _title_key(stem, drop + ([grp_name] if grp_name else []))
+                    hit = keys.get(k) or []
+                    if len(hit) != 1:
+                        continue
+                    used.setdefault(hit[0]["id"], []).append(c)
+                for eid, cs in used.items():
+                    if len(cs) != 1:
+                        continue                   # two files claim one episode: neither
+                    e = next(x for x in eps if x["id"] == eid)
+                    want, mins = float(e.get("runtime") or 0), _minutes(cs[0]["path"])
+                    if want and mins and not (want * 0.5 <= mins <= want * 2.0):
+                        continue
+                    pairs.append((cs[0], e))
+                got = {e["id"] for _, e in pairs}
+                wanted = {r["episodeId"] for r in grp}
+                if not wanted <= got:
+                    STATS["detail"].append(f"{a.name}: {name[:60]} - {len(wanted & got)} of {len(wanted)} episodes "
+                                           "found by their titles in the file names - left for you")
+                    continue
+                files = []
+                for c, e in pairs:
+                    if e["id"] not in wanted and e.get("hasFile"):
+                        continue                   # an extra for a special that already has a file
+                    qual = c.get("quality") or row0.get("quality")
+                    if not (qual and (qual.get("quality") or {}).get("id") is not None):
+                        files = []
+                        break
+                    files.append({"path": c["path"], "quality": qual,
+                                  "languages": c.get("languages") or row0.get("languages") or [],
+                                  "releaseGroup": c.get("releaseGroup") or "", "downloadId": row0.get("downloadId") or "",
+                                  "seriesId": row0["seriesId"], "seasonNumber": e.get("seasonNumber"),
+                                  "episodeIds": [e["id"]]})
+                if not files:
+                    STATS["detail"].append(f"{a.name}: {name[:60]} - no quality to import it as, left for you")
+                    continue
+                _call(a, "/api/v3/command", "POST", {"name": "ManualImport", "files": files, "importMode": "auto"})
+                for r in grp:
+                    gone.add(r.get("id"))
+                keep.add(did)
+                extra = len(files) - len(wanted)
+                out.append({"at": time.time(), "arr": a.name, "title": name, "client": row0.get("downloadClient") or "",
+                            "kind": "parsed",
+                            "why": f"the files are named by episode title, not number; all {len(wanted)} episodes the arr "
+                                   "grabbed it for were matched to a file by title"
+                                   + (f", and {extra} more to specials" if extra > 0 else "") + " - imported"})
+                STATS["detail"].append(f"{a.name}: imported {name[:60]} by episode titles ({len(files)} files)")
+            except Exception as e:                               # noqa: BLE001
+                STATS["detail"].append(f"{a.name}: {name[:60]} - by title: {type(e).__name__}: {e}"[:160])
+    try:
+        kv_set(KV_TITLE, json.dumps(sorted(tried)[-500:]))
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out, gone, keep
+
+
 # ------------------------------------- refused for its shape, not its worth --
 # "Episode file on disk contains more episodes than this file contains": a
 # 2160p single refused because a 1080p DOUBLE (E09-E10) sits on disk. "Episode
@@ -1129,6 +1279,18 @@ def _pass() -> str:
         tracked.add(str(d_))
     if rt_gone:
         queues = [(a, [r for r in rows if r.get("id") not in rt_gone]) for a, rows in queues]
+    # FILES NAMED BY EPISODE TITLE - see _import_by_title.
+    try:
+        tt_rows, tt_gone, tt_keep = _import_by_title(queues)
+    except Exception as e:                                       # noqa: BLE001
+        tt_rows, tt_gone, tt_keep = [], set(), set()
+        STATS["detail"].append(f"imports by title: {type(e).__name__}: {e}"[:160])
+    for d_ in tt_keep:
+        tracked.add(str(d_).upper())
+        tracked.add(str(d_))
+    if tt_gone:
+        queues = [(a, [r for r in rows if r.get("id") not in tt_gone]) for a, rows in queues]
+    rt_rows = rt_rows + tt_rows
     unread = [(a, r) for a, rows in queues for r in rows if _unread(a, r)]
     if unread:
         new_parsed = _import_known(unread)
