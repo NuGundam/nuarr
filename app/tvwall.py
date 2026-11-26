@@ -300,8 +300,57 @@ def render() -> bytes:
         return _IMG["jpg"]
 
 
+# ---------------------------------------------------------------- wave ---
+# THE PS3 WAVE (Erik, 2026-11-25): the blue XMB wave instead of the readings.
+# A 16.3 s loop, upscaled once to 4K60 HEVC 10-bit and cut into four segments
+# kept in DATA_DIR/tvwave (w0..w3.ts). The same live playlist the TV already
+# plays hands them out over and over, with a discontinuity where the loop
+# starts again - so nothing is encoded while the TV is on, and the TV's
+# wallpaper setting does not change. kv tvwall.mode: "wave" (default while the
+# segments exist) or "air".
+WAVE_D = (4.0, 4.0, 4.0, 4.3)
+WAVE_L = sum(WAVE_D)
+
+
+def _wave_dir() -> pathlib.Path:
+    from .config import DATA_DIR
+    return pathlib.Path(str(DATA_DIR)) / "tvwave"
+
+
+def mode() -> str:
+    from .db import kv_get
+    m = str(kv_get("tvwall.mode") or "wave")
+    return "wave" if m == "wave" and all((_wave_dir() / f"w{i}.ts").exists() for i in range(len(WAVE_D))) else "air"
+
+
+def set_mode(m: str) -> str:
+    from .db import kv_set
+    kv_set("tvwall.mode", "air" if m == "air" else "wave")
+    return mode()
+
+
+def _wave_playlist() -> str:
+    t = time.time()
+    k, rem, acc = len(WAVE_D) * int(t // WAVE_L), t % WAVE_L, 0.0
+    for d in WAVE_D[:-1]:
+        acc += d
+        if rem >= acc:
+            k += 1
+    first = k - 1
+    n = len(WAVE_D)
+    lines = ["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{math.ceil(max(WAVE_D))}",
+             f"#EXT-X-MEDIA-SEQUENCE:{first}", f"#EXT-X-DISCONTINUITY-SEQUENCE:{(first + n - 1) // n}"]
+    for j in range(first, first + 4):
+        if j % n == 0:
+            lines.append("#EXT-X-DISCONTINUITY")
+        lines += [f"#EXTINF:{WAVE_D[j % n]:.3f},", f"seg/{j}.ts"]
+    return "\n".join(lines) + "\n"
+
+
 # ----------------------------------------------------------------- HLS ---
 def playlist() -> str:
+    if mode() == "wave":
+        return _wave_playlist()
     n = int(time.time() // SEG)
     lines = ["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{SEG}", f"#EXT-X-MEDIA-SEQUENCE:{n - 2}"]
     for k in range(n - 2, n + 1):
@@ -312,6 +361,8 @@ def playlist() -> str:
 def segment(n: int) -> bytes:
     """Segment n = the current picture, SEG seconds at FPS, with timestamps
     continuous across segments (wrapping with MPEG-TS's 33-bit clock)."""
+    if mode() == "wave":
+        return (_wave_dir() / f"w{n % len(WAVE_D)}.ts").read_bytes()
     with _SEG_LOCK:
         if n in _SEGS:
             return _SEGS[n]
