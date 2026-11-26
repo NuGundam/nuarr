@@ -15128,7 +15128,9 @@ INDEX = r"""
     // /settings), which read as a desktop. clientWidth stays at the device
     // width under the viewport meta - and is ~980 under "Desktop site".
     var w=(document.documentElement&&document.documentElement.clientWidth)||window.innerWidth||9999;
-    return mob && w<=820;
+    // 960, not 820: an unfolded Fold held sideways is ~900 CSS px and was
+    // handed the desktop page. "Desktop site" is ~980 and still gets desktop.
+    return mob && w<=960;
   }
   function apply(){
     var on=want();
@@ -18229,6 +18231,83 @@ html.mobile .balhead .balbar span{white-space:nowrap}
 html.mobile .setwrap{margin:8px;min-height:0}
 html.mobile .setmain{padding:10px}
 html.mobile #logsPane{height:auto;min-height:60vh}
+/* ---- A FOLDING PHONE, BOTH WAYS. Closed, a Galaxy Z Fold is a tall narrow
+   phone (~400 CSS px); open it is a small square tablet (~750-900). The
+   mobile block above made the page fit; these are the places where it fitted
+   and still could not be read. Each was seen on the phone, 2026-11-26:
+     - the Libraries table gave the name a 40px column, one letter a line;
+     - the arr event's pill was wider than its column and lay over the result;
+     - a queue row's fixed cells left the TITLE zero pixels;
+     - the Activity list was wider than its panel and cut off on the right;
+     - the transfer caption under a disk name drew over the chips below it;
+     - a job card's side task wrapped its sentence three words wide.
+   Narrow gets stacked rows - a name on its own line, the figures under it.
+   Wide keeps the tables and drops the columns that crowd them. */
+html.mobile .xmvs{height:auto;margin:2px 0 4px}
+html.mobile .xmv{white-space:normal;flex-wrap:wrap}
+
+/* job cards */
+html.mobile .socr{flex-wrap:wrap;gap:4px 8px}
+html.mobile .socr .socrbar{flex:1 1 90px}
+html.mobile .socr > .dim{flex:1 1 100%}
+html.mobile .socr.vmafrow > .dim{flex:1 1 0;min-width:0}
+html.mobile .acts{padding-left:0}
+html.mobile .acts li{margin:4px 0}
+html.mobile .wk .wkplan,html.mobile .wk .whypool{overflow-wrap:anywhere}
+
+/* live arr events: when, arr and the event on one line, the result under them */
+html.mobile:not(.wide) #hooks table,html.mobile:not(.wide) #hooks tbody{display:block;width:100%}
+html.mobile:not(.wide) #hooks tr{display:grid;grid-template-columns:auto auto minmax(0,1fr);
+  align-items:center;gap:3px 10px;padding:8px 12px;border-top:1px solid var(--line)}
+html.mobile:not(.wide) #hooks tr:has(> th){display:none}
+html.mobile:not(.wide) #hooks td{display:block;padding:0;border:0;width:auto}
+html.mobile:not(.wide) #hooks td:nth-child(3){justify-self:end;max-width:100%;overflow:hidden}
+html.mobile:not(.wide) #hooks td:nth-child(3) .pill{display:block;overflow:hidden;text-overflow:ellipsis}
+html.mobile:not(.wide) #hooks td:nth-child(4){grid-column:1 / -1;overflow-wrap:anywhere;font-size:12px}
+html.mobile.wide #hooks th:nth-child(3){width:200px !important}
+
+/* libraries: the name and its path across the top, files, size and buttons beneath */
+html.mobile:not(.wide) table:has(tr[data-lib]),html.mobile:not(.wide) table:has(tr[data-lib]) tbody{display:block;width:100%}
+html.mobile:not(.wide) table:has(tr[data-lib]) tr:has(> th){display:none}
+html.mobile:not(.wide) tr[data-lib]{display:grid;grid-template-columns:auto auto minmax(0,1fr);
+  align-items:center;gap:6px 12px;padding:10px 12px;border-top:1px solid var(--line)}
+html.mobile:not(.wide) tr[data-lib] td{display:block;padding:0;border:0;width:auto;text-align:left}
+html.mobile:not(.wide) tr[data-lib] td:first-child{grid-column:1 / -1;font-size:14px}
+html.mobile:not(.wide) tr[data-lib] td:nth-child(2):after{content:" files";color:var(--dim)}
+html.mobile:not(.wide) tr[data-lib] td:nth-child(4){justify-self:end}
+
+/* the queue list. #queueList, because the grid it replaces is set by id.
+   One stacked row for both widths: the title gets a line to itself; open,
+   there is room for the move buttons beside it, closed there is not. */
+html.mobile #queueList .qrow.qhead{display:none}
+html.mobile #queueList .qrow{display:grid;grid-template-columns:30px minmax(0,1fr) auto auto;
+  grid-template-areas:"n t t pool" ". work disk sz" ". why why why";
+  gap:2px 10px;padding:8px 12px;align-items:center;border-top:1px solid var(--line)}
+html.mobile.wide #queueList .qrow{grid-template-columns:36px minmax(0,1fr) auto auto auto;
+  grid-template-areas:"n t t pool mv" ". work disk sz mv" ". why why why why";gap:2px 14px}
+html.mobile #queueList .qrow .qn{grid-area:n;align-self:start}
+html.mobile #queueList .qrow .qt{grid-area:t;white-space:normal;font-size:13px;overflow-wrap:anywhere}
+html.mobile #queueList .qrow .qpool{grid-area:pool;align-self:start;justify-self:end}
+html.mobile #queueList .qrow .qwork{grid-area:work;text-align:left;white-space:normal}
+html.mobile #queueList .qrow .qdisk{grid-area:disk;font-size:11px;text-align:right}
+html.mobile #queueList .qrow .qsz{grid-area:sz;text-align:right;white-space:nowrap}
+html.mobile #queueList .qrow .qwhy{grid-area:why;text-align:left;white-space:normal}
+html.mobile #queueList .qrow .qwhy:empty{display:none}
+html.mobile #queueList .qrow .qsrc,html.mobile #queueList .qrow .qlib{display:none}
+html.mobile:not(.wide) #queueList .qrow .qmv{display:none}
+html.mobile.wide #queueList .qrow .qmv{grid-area:mv;opacity:1}
+
+/* activity: three columns that add up to the panel, no sideways scroll */
+html.mobile #doneBox table.fixed{table-layout:fixed;width:100%}
+html.mobile #doneBox th:nth-child(1){width:auto !important}
+html.mobile #doneBox th:nth-child(2){width:34% !important}
+html.mobile #doneBox .actwords.oneline{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+html.mobile.wide #doneBox th:nth-child(3),html.mobile.wide #doneBox td:nth-child(3),
+html.mobile.wide #doneBox th:nth-child(5),html.mobile.wide #doneBox td:nth-child(5){display:table-cell}
+html.mobile.wide #doneBox th:nth-child(1){width:auto !important}
+html.mobile.wide #doneBox th:nth-child(2){width:24% !important}
+html.mobile.wide #doneBox th:nth-child(3){width:112px !important}
+html.mobile.wide #doneBox th:nth-child(5){width:190px !important}
 </style></head><body>
 <header>
   <!-- The mark is a link home, which is what every other web app trains you to
