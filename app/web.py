@@ -4343,6 +4343,17 @@ def _dispatch_order(rows: list, want: int) -> list:
     become claimable keep their queue position at the end rather than being
     dropped.
     """
+    # LOW PRIORITY MODE: one job at a time, so there are no waves to replay.
+    # The list is the queue as it stands and the dispatcher walks it from the
+    # top (jobs._low_order); only the first row is "starting next".
+    try:
+        if gate.get_toggle("gate.low_priority"):
+            out = list(rows)[:want]
+            if out:
+                out[0]["next_up"] = True
+            return out
+    except Exception:                                        # noqa: BLE001
+        pass
     pending = list(rows)
     ordered: list = []
     running = list(jobs.RUNNING.values())

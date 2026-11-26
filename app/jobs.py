@@ -2901,6 +2901,23 @@ def _outside_files() -> set:
     return out
 
 
+def _low_order(pools: tuple) -> tuple:
+    """The lanes in the order of their first queued job - the queue as the page lists it."""
+    try:
+        with cursor() as cur:
+            # the queue panel's own order: priority, then FRESH_TIEBREAK
+            cur.execute("SELECT j.pool FROM jobs j LEFT JOIN files f ON f.id = j.file_id "
+                        "WHERE j.state='queued' AND COALESCE(j.not_before, 0) <= ? "
+                        f"ORDER BY j.priority, {FRESH_TIEBREAK} LIMIT 400", (time.time(),))
+            seen = []
+            for r in cur.fetchall():
+                if r[0] in pools and r[0] not in seen:
+                    seen.append(r[0])
+        return tuple(seen) + tuple(p for p in pools if p not in seen)
+    except Exception:                                            # noqa: BLE001
+        return pools
+
+
 def _claim(pool: str) -> Job | None:
     """Atomically take the next queued job for a pool.
 
@@ -3435,10 +3452,19 @@ async def pump() -> None:
                         # a second live job for a file, so a transcode that is
                         # already queued simply keeps the subtitle row waiting
                         # for the next top-up.
-                        for pool in ("handler", "subs", "audio", "encode",
-                                     "passthrough", "subocr", "decode",
-                                     "listen", "subread", "submake", "subtiming",
-                                     "verify", "qwen"):
+                        order = ("handler", "subs", "audio", "encode",
+                                 "passthrough", "subocr", "decode",
+                                 "listen", "subread", "submake", "subtiming",
+                                 "verify", "qwen")
+                        # LOW PRIORITY MODE RUNS THE LIST AS IT IS SHOWN. With
+                        # one job at a time, the lane order above decided
+                        # everything: encode came before decode, so the encodes
+                        # ran one after another while spot 1 on the page, a
+                        # decode, never started. The lanes are now tried in the
+                        # order their first queued job stands in the queue.
+                        if not RUNNING and gate.get_toggle("gate.low_priority"):
+                            order = await asyncio.to_thread(_low_order, order)
+                        for pool in order:
                             if pool not in ("handler", "subs", "audio",
                                             "subocr", "decode", "listen",
                                             "subread", "submake", "subtiming",
