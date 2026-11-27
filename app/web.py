@@ -17633,6 +17633,14 @@ tr.actsub.genhead .wrap>div.ell{white-space:nowrap;overflow:hidden;
            letter-spacing:.4px;margin-right:4px}
 .capbar .v{font-variant-numeric:tabular-nums;font-weight:600}
 .capbar .grp{display:flex;align-items:baseline;gap:3px}
+/* THE STRIP IN THE SAME GROUPS as the Workers tiles and the Concurrency page
+   (WGROUPS): each kind of work is one box with its name in front, so the
+   lanes that belong together sit together and wrap together. */
+.capbar .capgrp{display:flex;flex-wrap:wrap;align-items:center;gap:4px 14px;
+        padding:3px 10px;border:1px solid var(--line);border-radius:8px;
+        background:rgba(255,255,255,.014)}
+.capbar .capgh{font-size:9.5px;letter-spacing:.09em;text-transform:uppercase;
+        color:var(--dim);opacity:.8;white-space:nowrap}
 /* The dashboard's Workers panel - see workersCompact(). ONE SHAPE, TEN TIMES.
    It was a row of chips sized to their own text, so nothing lined up with
    anything and the sub OCR one carried an extra clause that made it twice the
@@ -17646,7 +17654,27 @@ tr.actsub.genhead .wrap>div.ell{white-space:nowrap;overflow:hidden;
    identical widths; the row simply does not stretch to the edges any more,
    which is what being centred means. */
 .wcgrid{display:flex;flex-wrap:wrap;justify-content:center;
-        gap:7px;padding:10px 14px 2px}
+        gap:9px 16px;padding:10px 14px 2px}
+/* LIKE WITH LIKE (2026-11-27). Twenty-three tiles in reading order of when
+   each was written said nothing at a glance: encodes sat four rows from the
+   quality search that feeds them. Each kind of work is a group with its name
+   over it - see WGROUPS - and the Concurrency page uses the same groups in
+   the same order. A group asks for the width of its tiles, so two short
+   groups share a line, and grows to fill the line it is on, so every heading
+   starts at a left edge and its rule runs to the right one. The tiles keep
+   to the columns (auto-fill, not auto-fit): two tiles on a full line are two
+   ordinary tiles at the left, not two stretched ones. Narrower than its
+   tiles, a group folds them into as many columns as fit. */
+.wcgrp{flex:var(--n) 1 calc(var(--n)*132px + (var(--n) - 1)*7px);min-width:0}
+.wcgh{display:flex;align-items:center;gap:8px;font-size:9.5px;letter-spacing:.09em;
+      text-transform:uppercase;color:var(--dim);padding:0 2px 4px;white-space:nowrap}
+.wcgh::after{content:"";flex:1;height:1px;background:var(--line)}
+.wcgc{display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:7px}
+tr.wghead td{padding:13px 14px 5px !important;font-size:10.5px;letter-spacing:.09em;
+      text-transform:uppercase;color:var(--dim);border-top:1px solid var(--line);
+      background:rgba(255,255,255,.02)}
+tr.wghead td b{color:var(--fg,#c9d1d9);font-weight:600;margin-right:8px}
+tr.wghead td span{text-transform:none;letter-spacing:0;font-size:11px}
 .wcell{flex:0 1 176px;border:1px solid var(--line);border-radius:8px;
        padding:6px 9px 7px;cursor:pointer;background:rgba(255,255,255,.014)}
 .wcell:hover{border-color:var(--acc)}
@@ -27853,40 +27881,36 @@ async function loadJobs(){
                        >inline</span>`:'')
           +`${ioTag(pool)}</span>`;
   };
-  document.getElementById('jobCap').innerHTML =
-    capCell('encode', j.in_use.encode, j.capacity.encode, 'encode')
-    + capCell('passthrough', j.in_use.passthrough, j.capacity.passthrough, 'passthrough')
-    // AND THE SUBTITLE POOL, for exactly the reason the subocr comment below
-    // gives. It has its own two workers so it can never take a slot a
-    // transcode was waiting for, and a pool with its own workers that does not
-    // appear here is a pool nobody can tell is running.
-    + capCell('subs', (j.in_use||{}).subs||0, (j.capacity||{}).subs||0, 'subs')
-    // subocr sat invisible here while running four workers - the header said
-    // "encode 0/4 passthrough 0/6" over a machine grinding at full tilt.
-    + capCell('subocr', (j.in_use||{}).subocr||0, (j.capacity||{}).subocr||0, 'subocr',
-              // An OCR running inside a transcode spends the same budget, so
-              // it is counted - but it has no card of its own in this pool,
-              // and a number that moves with nothing to point at is worse than
-              // no number. Name the inline ones.
+  // LIKE WITH LIKE, as on the Workers tiles and the Concurrency page: the lanes
+  // are built first, keyed the way WGROUPS names them, then laid out group by
+  // group. A lane no group names goes on the end rather than vanishing.
+  // Every queue pool with workers of its own is here, and everything outside
+  // the queue - a lane that does not appear is one nobody can tell is running.
+  const _lanes = {};
+  ['encode','passthrough','subs','audio','decode','listen','subread','submake','subtiming','verify','qwen'].forEach(p=>{
+    _lanes[p+'_workers'] = capCell(p, (j.in_use||{})[p]||0, (j.capacity||{})[p]||0, p); });
+  // An OCR running inside a transcode spends the same budget, so it is
+  // counted - but it has no card of its own in this pool, and a number that
+  // moves with nothing to point at is worse than no number. Name the inline ones.
+  _lanes['subocr_workers'] = capCell('subocr', (j.in_use||{}).subocr||0, (j.capacity||{}).subocr||0, 'subocr',
               (j.subocr_inline||0)
                 ? `${j.subocr_inline} of these run inside a transcode or `
                   + `passthrough job (one rewrite carrying both changes); `
                   + `they use the same OCR budget as a standalone subtitle job`
-                : '')
-    // AND THE FOUR POOLS THAT JOINED THE QUEUE SINCE. Same rule the subs and
-    // subocr lines above were added under: a pool with its own workers that
-    // does not appear here is a pool nobody can tell is running. Erik's
-    // words for this strip were "missing the new integrated systems". The
-    // name wears its pool colour, so the strip and the card pills agree.
-    + ['audio','decode','listen','subread','submake','subtiming','verify','qwen'].map(p=>
-        capCell(p, (j.in_use||{})[p]||0, (j.capacity||{})[p]||0, p)).join('')
-    // AND EVERYTHING OUTSIDE THE QUEUE, each in its own colour - the quality
-    // search, the Subtitle maker, the Qwen judge, the second opinion, Qwen-VL.
-    + (j.outside||[]).map(v=>`<span class="grp${v.running?' lanebusy':''}" style="--c:${poolColor(v.pool)};--bd:-${Date.now()%1600}ms" title="${esc(v.hint||'')}">`
+                : '');
+  (j.outside||[]).forEach(v=>{ _lanes['out:'+v.key] =
+        `<span class="grp${v.running?' lanebusy':''}" style="--c:${poolColor(v.pool)};--bd:-${Date.now()%1600}ms" title="${esc(v.hint||'')}">`
         + `<span class="k" style="color:${poolColor(v.pool)};opacity:${v.paused?'.45':'.9'}">${esc(v.pool)}</span>`
         + `<span class="v" style="color:${v.running?(v.running>=(v.cap||1)?'var(--ok)':'var(--acc)'):'var(--dim)'}">${v.running||0}</span>`
         + (v.paused?`<span class="dim" style="font-size:10px;margin-left:3px">⏸ paused</span>`:`<span class="dim">/${v.cap||1}</span>`)
-        + `</span>`).join('')
+        + `</span>`; });
+  const _laneUsed = new Set();
+  let _strip = WGROUPS.map(([name,sub,keys,short])=>{
+    const got = keys.filter(k=>_lanes[k]); got.forEach(k=>_laneUsed.add(k));
+    return got.length ? `<span class="capgrp" title="${esc(name+' — '+sub)}"><span class="capgh">${esc(short||name)}</span>${
+      got.map(k=>_lanes[k]).join('')}</span>` : ''; }).join('');
+  _strip += Object.keys(_lanes).filter(k=>!_laneUsed.has(k)).map(k=>_lanes[k]).join('');
+  document.getElementById('jobCap').innerHTML = _strip
     // THE ONE queued figure. It used to appear here AND six lines below in the
     // run-progress line, computed a moment apart so the two disagreed by a
     // handful - two different numbers for the same thing. The other one is
@@ -31241,16 +31265,41 @@ function costStrip(c){
 // OUTSIDE THE QUEUE - the Subtitle maker and the Qwen judge. Same row shape as
 // a pool, but no count: each is one at a time on the heavy lane, which it
 // shares with installs and engine tests, so a second one could only wait.
-function outsideRows(list){
-  if(!list.length) return '';
-  return `<div style="padding:10px 14px 4px"><b style="font-size:12px">Outside the queue</b>
-      <div class="dim" style="font-size:11px">Work that is not a queue pool: the quality search runs inside an encode slot
-      before the encode proper, the Qwen-VL reader is asked by the OCR only when it doubts a picture, and the group
-      scorecard measures one file at a time on the CPU. The Subtitle
-      maker, the Qwen judge, the second opinion and the timing check are queue pools now - their counts are above.</div></div>
-    <table>${list.map(v=>{
-      const pc=poolColor(v.pool), off=!!v.paused;
-      return `<tr class="${off?'wpaused':''}">
+// LIKE WITH LIKE. One list, used by the dashboard's Workers panel and by this
+// page, so the two cannot drift: what the work is ON, not whether it happens
+// to be a queue pool. A key starting out: is a lane outside the queue (see
+// _outside_live). Anything not named here lands in "Other" rather than
+// vanishing, so a new worker shows up before anybody files it.
+const WGROUPS = [
+  ['Video', 'encoding, and what an encode needs first',
+     ['encode_workers','out:quality','passthrough_workers','decode_workers','out:groups'], 'video'],
+  ['Reading subtitles', 'OCR and the models that check it',
+     ['subocr_workers','out:qwenvl','verify_workers','qwen_workers','subread_workers'], 'sub reading'],
+  ['Making and fixing subtitles', 'new tracks, repairs, timing',
+     ['submake_workers','subs_workers','subtiming_workers'], 'sub making'],
+  ['Audio', 'tags and languages',
+     ['audio_workers','listen_workers'], 'audio'],
+  ['Quiet library checks', 'one at a time, only while the machine is quiet',
+     ['out:samecheck','out:foreignburn','out:hardsub','out:subdupe','out:subembed','out:subtitletitle'], 'quiet checks'],
+  ['Library and arr', 'scans and Sonarr/Radarr',
+     ['probe_workers','arr_concurrency'], 'library'],
+];
+function workerGroups(w, outs, keep){
+  const have = {};
+  Object.entries(w||{}).forEach(([k,v])=>{ if(k[0]!=='_' && v && v.label && (!keep || keep(k,v))) have[k]={k,v}; });
+  (outs||[]).forEach(v=>{ have['out:'+v.key]={k:'out:'+v.key, v, out:true}; });
+  const used = new Set();
+  const groups = WGROUPS.map(([name,sub,keys])=>({name, sub,
+    items: keys.filter(k=>have[k]).map(k=>{ used.add(k); return have[k]; })}));
+  const rest = Object.keys(have).filter(k=>!used.has(k)).map(k=>have[k]);
+  if(rest.length) groups.push({name:'Other', sub:'', items:rest});
+  return groups.filter(g=>g.items.length);
+}
+// A LANE OUTSIDE THE QUEUE - the quality search, the Qwen-VL reader, the
+// quiet library checks. Same row shape as a pool; a count only where it has one.
+function outsideRow(v){
+  const pc=poolColor(v.pool), off=!!v.paused;
+  return `<tr class="${off?'wpaused':''}">
         <td><div><span class="pill" style="color:${pc};border-color:${pc};margin-right:7px;font-size:10.5px">${esc(v.pool)}</span>${esc(v.label)}
             ${off?`<span class="dim" style="font-size:10.5px;margin-left:8px">⏸ paused — what is running finishes, nothing new starts</span>`
                  :(v.now?`<span style="font-size:10.5px;margin-left:8px;color:${pc}">${esc(v.now)}</span>`:'')}</div>
@@ -31267,7 +31316,7 @@ function outsideRows(list){
           ${v.noswitch?'<span class="dim" style="font-size:10.5px">no switch here — it follows its own rules</span>':''}
           <button class="wsw ${off?'off':'on'}" ${v.noswitch?'style="display:none"':''} onclick="outsidePause('${v.key}',${off?0:1},this)"
             title="${off?'Paused. Click to let it run.':'Running. Click to pause: what is running finishes, nothing new starts.'}"
-            ><span class="knob"></span>${off?'paused':'running'}</button></td></tr>`;}).join('')}</table>`;
+            ><span class="knob"></span>${off?'paused':'running'}</button></td></tr>`;
 }
 async function outsideCount(key, n){
   try{ await fetch('/api/outside/count?key='+key+'&n='+n,{method:'POST'}); }catch(e){}
@@ -53436,7 +53485,10 @@ function workersCompact(w){
                   : `<span class="wcsub">${v.running?`${v.running} running now`:(v.adjust?'at once':'at a time')}</span>`)
       + `</div></div>`;
   };
-  return `<div class="wcgrid">${KEYS.map(cell).join('')}${outs.map(ocell).join('')}</div>
+  const groups = workerGroups(w, outs, k=>KEYS.includes(k));
+  return `<div class="wcgrid">${groups.map(g=>`<div class="wcgrp" style="--n:${g.items.length}"
+        title="${esc(g.sub)}"><div class="wcgh">${esc(g.name)}</div>
+        <div class="wcgc">${g.items.map(i=>i.out?ocell(i.v):cell(i.k)).join('')}</div></div>`).join('')}</div>
       <div class="wcfoot">${off
         ? `<span class="warn">${off} of ${pools.length} pools paused \u2014 what is running finishes, nothing new starts</span>`
         : 'how many of each may run at once \u2014 hover one for what it costs the box'}</div>
@@ -53494,8 +53546,13 @@ function paintWorkers(){
   document.getElementById('workers').innerHTML=
     `<div class="dim" style="padding:9px 14px ${enc||box?'4px':'9px'};font-size:11px">${blurb}</div>`+enc+box
     + masterSwitch(w)
-    +'<table>'+rows.map(([k,v])=>workerRow(k,v,extraOf(k))).join('')+'</table>'
-    + (_wtab!=='timing' ? outsideRows(w._outside||[]) : '');
+    + (_wtab==='timing'
+        ? '<table>'+rows.map(([k,v])=>workerRow(k,v,extraOf(k))).join('')+'</table>'
+        : '<table>'+workerGroups(Object.fromEntries(rows), w._outside||[]).map(g=>
+            `<tr class="wghead"><td colspan="3"><b>${esc(g.name)}</b><span>${esc(g.sub)}</span></td></tr>`
+            + g.items.map(i=>i.out?outsideRow(i.v):workerRow(i.k,i.v,extraOf(i.k))).join('')).join('')+'</table>'
+          + `<div class="dim" style="padding:8px 14px 10px;font-size:11px">A row with no count to set is not a queue
+             pool: it runs one at a time by its own rules, and is listed with the work it belongs to.</div>`);
   const hint=document.getElementById('wtabhint');
   if(hint) hint.textContent = _wtab==='timing' ? '· holds & timing' : '· concurrency';
   if(_wtab!=='timing' && !_encLine) encLineFetch();
