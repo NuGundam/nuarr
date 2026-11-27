@@ -1011,6 +1011,27 @@ def merge_stats(key: str, out: dict, *, live_keys=()) -> dict:
     return out
 
 
+def lane_row(key: str, pool: str, label: str, hint: str, *, paused: bool = False,
+             noswitch: bool = True) -> dict:
+    """A quiet fixer as a lane in the Processing system - the shape
+    _outside_live hands the strip, the Workers tiles and the Concurrency page.
+    Read from the runner's own state: nothing is queried, so it costs nothing
+    on a feed that is asked for twice a second."""
+    d = STATES.get(key) or {}
+    fl = d.get("flight") or []
+    run = len(fl) if d.get("running") else 0
+    if d.get("running") and not run:
+        run = 1
+    cap = max(1, int(d.get("lanes") or LANES), run)
+    left = max(0, int(d.get("total") or 0) - int(d.get("done") or 0) - run) if d.get("running") else 0
+    now = ""
+    if run:
+        now = str((fl[0].get("now") if fl else d.get("now")) or "working")[:80]
+    return {"key": key, "pool": pool, "label": label, "running": run, "cap": cap,
+            "paused": bool(paused), "now": now, "queued": left, "hint": hint,
+            "noswitch": bool(noswitch)}
+
+
 def progress(key: str) -> dict:
     r"""The shape every panel draws. Same keys for every system that adopts it."""
     d = dict(STATES.get(key) or {})

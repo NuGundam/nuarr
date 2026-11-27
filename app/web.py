@@ -14965,6 +14965,30 @@ def _outside_live() -> list:
             out.append(getattr(__import__("app." + _m, fromlist=[_m]), "worker_row")())
         except Exception:                                # noqa: BLE001
             pass
+    # AND THE OTHER FOUR QUIET FIXERS (2026-11-27). Each drew a "background"
+    # job card while it worked and had no lane in the strip or the tiles - a
+    # card with nowhere to belong. Their state is the idle runner's own.
+    try:
+        from . import idle, subdupe
+        out.append(idle.lane_row(
+            "subdupe", "dupes", "Duplicate subtitle tracks",
+            "Finds a subtitle track that is in the file twice and takes the copy out. Off until it is "
+            "switched on, because it is the one sweep that removes a track. Only while the machine is quiet.",
+            paused=not subdupe.enabled(), noswitch=False))
+        out.append(idle.lane_row(
+            "subembed", "sidecar", "Subtitle files beside the video",
+            "Takes the subtitle files lying beside a video into the file itself, in the libraries where "
+            "that rule is on (Settings - Subtitles). Only while the machine is quiet."))
+        out.append(idle.lane_row(
+            "hardsub", "picture", "Subtitles burned into the picture",
+            "Samples frames of each file that reports no subtitle track and shows the best few to the OCR, "
+            "to find subtitles painted into the picture. Only while the machine is quiet."))
+        out.append(idle.lane_row(
+            "subtitletitle", "titles", "Subtitle titles against what the track carries",
+            "Reads the events of a subtitle track whose title looks wrong - signs called dialogue, "
+            "karaoke called full - and corrects the title. Only while the machine is quiet."))
+    except Exception:                                    # noqa: BLE001
+        pass
     return out
 
 
@@ -14995,7 +15019,8 @@ def api_outside_pause(key: str, on: int = 1):
     names = {"submake": "Subtitle maker", "qwen": "Qwen judge", "verify": "Second opinion",
              "quality": "Quality searches", "qwenvl": "Qwen-VL reader", "subtiming": "Subtitle timing",
              "groups": "Group scorecard", "samecheck": "Same episode twice",
-             "foreignburn": "Foreign subtitles burned in"}
+             "foreignburn": "Foreign subtitles burned in",
+             "subdupe": "Duplicate subtitle tracks"}
     if key not in names:
         raise HTTPException(400, "unknown key")
     if key == "quality":
@@ -15005,6 +15030,9 @@ def api_outside_pause(key: str, on: int = 1):
     elif key == "groups":
         from . import groupscore
         groupscore.set_paused(bool(on))
+    elif key == "subdupe":
+        from . import subdupe
+        gate.set_toggle(subdupe.ENABLED_KEY, not bool(on))
     elif key in ("samecheck", "foreignburn"):
         from . import samecheck, foreignburn
         {"samecheck": samecheck, "foreignburn": foreignburn}[key].set_enabled(not bool(on))
@@ -26373,6 +26401,10 @@ function poolColor(pool){
        : pool==='groups'      ? '#d4b8ff'         // soft violet - the group measurer
        : pool==='same'        ? '#f778ba'         // pink - the same-episode listener
        : pool==='burned'      ? '#e3b341'         // gold - the burned-in foreign subtitle reader
+       : pool==='dupes'       ? '#9aa7ff'         // periwinkle - duplicate subtitle tracks
+       : pool==='sidecar'     ? '#7ee0a8'         // mint - subtitle files beside the video
+       : pool==='picture'     ? '#ff8fab'         // rose - subtitles burned into the picture
+       : pool==='titles'      ? '#d9c08f'         // sand - subtitle titles
        : 'var(--ok)';
 }
 // LETTERED DRIVES GET THEIR OWN COLOURS, none of them in DISK_COLORS: the
@@ -31224,7 +31256,8 @@ function outsideRows(list){
             :`<b>${v.cap||1}</b> <span class="dim" style="font-size:11px">at a time</span>`}
           <div class="dim" style="font-size:11px">${v.running?`<span style="color:${pc}">${v.running} running</span> · `:''}${v.queued?fmt(v.queued)+' waiting':'nothing waiting'}</div></td>
         <td style="width:96px;text-align:right;vertical-align:middle">
-          <button class="wsw ${off?'off':'on'}" onclick="outsidePause('${v.key}',${off?0:1},this)"
+          ${v.noswitch?'<span class="dim" style="font-size:10.5px">no switch here — it follows its own rules</span>':''}
+          <button class="wsw ${off?'off':'on'}" ${v.noswitch?'style="display:none"':''} onclick="outsidePause('${v.key}',${off?0:1},this)"
             title="${off?'Paused. Click to let it run.':'Running. Click to pause: what is running finishes, nothing new starts.'}"
             ><span class="knob"></span>${off?'paused':'running'}</button></td></tr>`;}).join('')}</table>`;
 }
