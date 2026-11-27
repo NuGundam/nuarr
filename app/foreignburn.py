@@ -497,7 +497,10 @@ def worker_row() -> dict:
     p = idle.progress(KEY)
     run = bool(p.get("running"))
     try:
-        left = len(_all_pending()) if time.time() - _LEFT["at"] > 60 else _LEFT["n"]
+        # once a minute, remembered - see samecheck.worker_row
+        if time.time() - _LEFT["at"] > 60:
+            _LEFT.update(n=len(_all_pending()), at=time.time())
+        left = _LEFT["n"]
     except Exception:                                            # noqa: BLE001
         left = 0
     return {"key": KEY, "pool": "burned", "label": TITLE, "running": 1 if run else 0, "cap": 1,

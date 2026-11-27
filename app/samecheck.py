@@ -540,7 +540,13 @@ def worker_row() -> dict:
     p = idle.progress(KEY)
     run = bool(p.get("running"))
     try:
-        left = len(_pending(10 ** 9)) if time.time() - _LEFT["at"] > 60 else _LEFT["n"]
+        # COUNTED ONCE A MINUTE, AND THE MINUTE IS REMEMBERED. This row is in
+        # the jobs feed every page asks for every 2 s; it compared against
+        # _LEFT["at"] and never set it, so the whole list was counted on every
+        # poll (0.36 s of database each, measured 2026-11-27).
+        if time.time() - _LEFT["at"] > 60:
+            _LEFT.update(n=len(_pending(10 ** 9)), at=time.time())
+        left = _LEFT["n"]
     except Exception:                                            # noqa: BLE001
         left = 0
     return {"key": KEY, "pool": "same", "label": TITLE, "running": 1 if run else 0, "cap": 1,

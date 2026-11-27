@@ -17656,15 +17656,21 @@ tr.actsub.genhead .wrap>div.ell{white-space:nowrap;overflow:hidden;
    the bottom of it. These are repainted from scratch several times a second,
    which would restart a CSS animation every time, so each is drawn with a
    negative delay taken from the clock (--bd) and picks up where it was. Not
-   switched off for reduced motion - see the job card bars. */
+   switched off for reduced motion - see the job card bars.
+   MOVED BY TRANSFORM, so the compositor slides it and nothing is repainted;
+   the first version animated background-position, which repaints every lane
+   on every frame. The lane clips it: clip-path on the strip (which may draw
+   below its box), overflow on the tile. */
 .grp.lanebusy,.wcell.lanebusy{position:relative}
+.grp.lanebusy{clip-path:inset(0 0 -4px 0)}
 .wcell.lanebusy{overflow:hidden;border-color:color-mix(in srgb,var(--c) 40%,var(--line))}
-.grp.lanebusy::after,.wcell.lanebusy::after{content:"";position:absolute;left:0;right:0;bottom:-2px;
-  height:2px;border-radius:2px;pointer-events:none;
-  background:linear-gradient(90deg,transparent,var(--c),transparent) no-repeat;
-  background-size:50% 100%;animation:lanerun 1.6s linear infinite;animation-delay:var(--bd,0s)}
+.grp.lanebusy::after,.wcell.lanebusy::after{content:"";position:absolute;left:0;bottom:-2px;
+  width:50%;height:2px;border-radius:2px;pointer-events:none;
+  background:linear-gradient(90deg,transparent,var(--c),transparent);
+  transform:translateX(-100%);will-change:transform;
+  animation:lanerun 1.6s linear infinite;animation-delay:var(--bd,0s)}
 .wcell.lanebusy::after{bottom:0}
-@keyframes lanerun{from{background-position:-100% 0}to{background-position:200% 0}}
+@keyframes lanerun{from{transform:translateX(-100%)}to{transform:translateX(200%)}}
 .wcname{font-size:11px;letter-spacing:.2px;white-space:nowrap;overflow:hidden;
         text-overflow:ellipsis;text-align:center}
 .wcval{display:flex;align-items:baseline;justify-content:center;gap:6px;
@@ -20166,7 +20172,7 @@ function jpopHtml(disk){
     <div class="tpop-n"><b>reading</b> <span class="m-read">${mbps(e.read_bps)}</span> · <b>writing</b> <span class="m-write">${mbps(e.write_bps)}</span>${
       jd.some(held)?` · <b style="color:var(--warn)">${jd.filter(held).length} held</b>`:''}</div>`;
   const blocks=jd.map(w=>{
-    const pc=poolColor(w.pool);
+    const pc=poolColor(w.lane||w.pool);
     const isHeld=held(w);
     const commit=w.stage==='committing'&&w.commit_total;
     const pct=commit?Math.min(100,w.commit_bytes/w.commit_total*100):(w.progress||0)*100;
@@ -28162,7 +28168,9 @@ function paintRunning(j){
     html+=j.running.map(w=>{
       // subocr gets its own colour (purple) so four background OCR jobs are
       // never mistaken for four passthrough copies at a glance.
-      const poolCol = poolColor(w.pool);
+      // A quiet fixer wears its LANE's name and colour (w.lane), so its card
+      // matches its entry in the strip; w.pool stays "background" for the code.
+      const poolCol = poolColor(w.lane||w.pool);
       // THE BAR FOLLOWS THE ACTIVE PHASE, not just ffmpeg.
       //
       // w.progress is the ENCODE's progress and stops updating the moment
@@ -28187,7 +28195,7 @@ function paintRunning(j){
         <div class="wkhead">
           <span class="spin"><i></i><i></i><i></i></span>
           <span class="pill" style="color:${poolCol};border-color:${poolCol}"
-            >${esc(w.pool)}</span>
+            ${w.lane?'title="a quiet fixer outside the queue"':''}>${esc(w.lane||w.pool)}</span>
           <b class="wrap">${esc(w.title||w.file)}</b>
           <span class="right2">${w.pool==='qwen'
             ? `<button onclick="qjStop(this)" title="Stop judging. What was judged is kept; the rest waits for the next run.">Cancel</button>`
@@ -28538,7 +28546,7 @@ function tryPatchCards(j){
       return false;
   for(const w of j.running){
     const card = host.querySelector(`.wk[data-job="${CSS.escape(w.job_id)}"]`);
-    const poolCol = poolColor(w.pool);
+    const poolCol = poolColor(w.lane||w.pool);
     const bs = barState(w, poolCol);
     const bar = card.querySelector('.bar.big > i');
     if(bar){

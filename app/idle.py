@@ -865,6 +865,16 @@ def _nice(name: str) -> str:
     return n
 
 
+# WHICH LANE A QUIET FIXER'S CARD BELONGS TO, by the name it claims its work
+# under. The card's pill and colour are the lane's, so a card can be matched
+# to its entry in the Processing strip; anything not listed stays "background".
+LANE_OF = {
+    "Same episode twice": "same", "Foreign subtitles burned in": "burned",
+    "Duplicate subtitles": "dupes", "Sidecar subtitles": "sidecar",
+    "Subtitles in the picture": "picture", "Subtitle titles": "titles",
+}
+
+
 def tasks() -> list[dict]:
     """The same shape a worker reports itself in, so one renderer draws both."""
     out = []
@@ -872,7 +882,8 @@ def tasks() -> list[dict]:
         out.append({
             "job_id": f"bg{t.id}", "background": True,
             "system": t.system, "title": _nice(t.title or t.now), "file": t.now,
-            "pool": "background", "stage": t.note or t.system,
+            "pool": "background", "lane": LANE_OF.get(t.system, ""),
+            "stage": t.note or t.system,
             "stage_s": round(time.time() - t.since),
             "elapsed_s": round(time.time() - t.since),
             "progress": round(max(0.0, min(1.0, (t.pct or 0.0) / 100.0)), 3),
