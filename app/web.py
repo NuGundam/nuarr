@@ -17573,10 +17573,26 @@ tr.actsub.genhead .wrap>div.ell{white-space:nowrap;overflow:hidden;
   animation:baredge 1.4s ease-in-out infinite}
 @keyframes barshine{0%{transform:translateX(-100%)}70%,100%{transform:translateX(100%)}}
 @keyframes baredge{0%,100%{opacity:.35}50%{opacity:.95}}
-@media (prefers-reduced-motion:reduce){
-  .wk .bar.big > i::after{animation:none;display:none}
-  .wk .bar.big > i::before{animation:none;opacity:.6}
-}
+/* 2026-11-27, TWO THINGS THAT LEFT A CARD WITH NO MOTION AT ALL.
+   - The server has "show animations in Windows" off, which a browser reports
+     as prefers-reduced-motion, and the block that was here switched the bar's
+     motion off for it. So on the one screen nuarr is watched from, nothing
+     moved. These bars are the thing asked for; they run regardless.
+   - A job with no percentage (the quiet fixers outside the queue - same
+     episode twice, burned-in subtitles, group scorecard - and any job while it
+     probes or verifies) kept the old sweep: a 28% white stripe over a full
+     bright bar, which reads as a finished bar. Now the bar dims to a track of
+     its own colour and a bright band of that colour runs along it. */
+.wk .bar.big > i.indet:not(.held){background-image:none !important;animation:none;opacity:1}
+.wk .bar.big > i.indet:not(.held)::before{content:"";position:absolute;inset:0;
+  background:rgba(10,13,17,.72)}
+.wk .bar.big > i.indet:not(.held)::after{content:"";position:absolute;top:0;bottom:0;left:0;
+  width:34%;border-radius:5px;background:inherit;background-image:
+    linear-gradient(90deg,rgba(255,255,255,0),rgba(255,255,255,.55) 70%,rgba(255,255,255,.9));
+  box-shadow:0 0 8px 1px rgba(255,255,255,.35);
+  transform:translateX(-110%);will-change:transform;
+  animation:barrun 1.6s cubic-bezier(.45,0,.55,1) infinite}
+@keyframes barrun{0%{transform:translateX(-110%)}100%{transform:translateX(305%)}}
 /* Pinned summary above a scrollbox. Same padding and rule as the header it
    replaces, so nothing shifts - it simply stops scrolling away. */
 .pinhead{padding:9px 14px;border-bottom:1px solid var(--line);font-size:14px}
