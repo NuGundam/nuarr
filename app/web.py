@@ -17623,6 +17623,20 @@ tr.actsub.genhead .wrap>div.ell{white-space:nowrap;overflow:hidden;
        padding:6px 9px 7px;cursor:pointer;background:rgba(255,255,255,.014)}
 .wcell:hover{border-color:var(--acc)}
 .wcell.off{opacity:.5}
+/* A LANE THAT IS RUNNING SOMETHING MOVES, in the strip and in these tiles as
+   on the job cards (2026-11-27): a line of the lane's own colour runs along
+   the bottom of it. These are repainted from scratch several times a second,
+   which would restart a CSS animation every time, so each is drawn with a
+   negative delay taken from the clock (--bd) and picks up where it was. Not
+   switched off for reduced motion - see the job card bars. */
+.grp.lanebusy,.wcell.lanebusy{position:relative}
+.wcell.lanebusy{overflow:hidden;border-color:color-mix(in srgb,var(--c) 40%,var(--line))}
+.grp.lanebusy::after,.wcell.lanebusy::after{content:"";position:absolute;left:0;right:0;bottom:-2px;
+  height:2px;border-radius:2px;pointer-events:none;
+  background:linear-gradient(90deg,transparent,var(--c),transparent) no-repeat;
+  background-size:50% 100%;animation:lanerun 1.6s linear infinite;animation-delay:var(--bd,0s)}
+.wcell.lanebusy::after{bottom:0}
+@keyframes lanerun{from{background-position:-100% 0}to{background-position:200% 0}}
 .wcname{font-size:11px;letter-spacing:.2px;white-space:nowrap;overflow:hidden;
         text-overflow:ellipsis;text-align:center}
 .wcval{display:flex;align-items:baseline;justify-content:center;gap:6px;
@@ -27792,7 +27806,7 @@ async function loadJobs(){
     const full = cap>0 && used>=cap;
     const off = (j.paused||[]).includes(pool);
     const col = full ? 'var(--ok)' : (used>0 ? 'var(--acc)' : 'var(--dim)');
-    return `<span class="grp"${note?` title="${esc(note)}"`:(off?` title="paused from the Workers panel — running jobs finish, nothing new starts"`:'')}>`
+    return `<span class="grp${used>0?' lanebusy':''}" style="--c:${poolColor(pool)};--bd:-${Date.now()%1600}ms"${note?` title="${esc(note)}"`:(off?` title="paused from the Workers panel — running jobs finish, nothing new starts"`:'')}>`
           +`<span class="k" style="color:${poolColor(pool)};opacity:${off?'.45':'.9'}">${esc(name)}</span>`
           +`<span class="v" style="color:${col}">${used}</span>`
           +(off?`<span class="dim" style="font-size:10px;margin-left:3px">⏸ paused</span>`
@@ -27830,7 +27844,7 @@ async function loadJobs(){
         capCell(p, (j.in_use||{})[p]||0, (j.capacity||{})[p]||0, p)).join('')
     // AND EVERYTHING OUTSIDE THE QUEUE, each in its own colour - the quality
     // search, the Subtitle maker, the Qwen judge, the second opinion, Qwen-VL.
-    + (j.outside||[]).map(v=>`<span class="grp" title="${esc(v.hint||'')}">`
+    + (j.outside||[]).map(v=>`<span class="grp${v.running?' lanebusy':''}" style="--c:${poolColor(v.pool)};--bd:-${Date.now()%1600}ms" title="${esc(v.hint||'')}">`
         + `<span class="k" style="color:${poolColor(v.pool)};opacity:${v.paused?'.45':'.9'}">${esc(v.pool)}</span>`
         + `<span class="v" style="color:${v.running?(v.running>=(v.cap||1)?'var(--ok)':'var(--acc)'):'var(--dim)'}">${v.running||0}</span>`
         + (v.paused?`<span class="dim" style="font-size:10px;margin-left:3px">⏸ paused</span>`:`<span class="dim">/${v.cap||1}</span>`)
@@ -53358,8 +53372,8 @@ function workersCompact(w){
     const v = w[k]; if(!v) return '';
     const col = v.pool ? poolColor(v.pool) : 'var(--dim)';
     const used = v.pool ? (_poolUse[v.pool]||0) : null;
-    return `<div class="wcell${v.paused?' off':''}" data-wpop="${esc(k)}"
-         onclick="location.href='/settings#counts'">
+    return `<div class="wcell${v.paused?' off':''}${used?' lanebusy':''}" data-wpop="${esc(k)}"
+         style="--c:${col};--bd:-${Date.now()%1600}ms" onclick="location.href='/settings#counts'">
          <div class="wcname" style="color:${col}">${esc(v.label||k)}</div>
          <div class="wcval"><b style="color:${v.value?'var(--fg,#c9d1d9)':'var(--dim)'}">${v.value}</b>`
       + (v.paused
@@ -53373,8 +53387,8 @@ function workersCompact(w){
   const outs = (_outLive && _outLive.length ? _outLive : (w._outside||[]));
   const ocell = (v)=>{
     const col = poolColor(v.pool);
-    return `<div class="wcell${v.paused?' off':''}" data-wpop="out:${esc(v.key)}"
-         onclick="location.href='/settings#counts'">
+    return `<div class="wcell${v.paused?' off':''}${v.running?' lanebusy':''}" data-wpop="out:${esc(v.key)}"
+         style="--c:${col};--bd:-${Date.now()%1600}ms" onclick="location.href='/settings#counts'">
          <div class="wcname" style="color:${col}">${esc(v.label)}</div>
          <div class="wcval"><b style="color:${v.running?col:'var(--dim)'}">${v.cap||1}</b>`
       + (v.paused ? `<span class="wcsub" style="color:var(--warn)">\u23f8 paused</span>`
