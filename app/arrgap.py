@@ -580,11 +580,13 @@ async def watch() -> None:
              "touched, because none of them is nuarr's to fix.")
     # Let the first scan of a cold start finish before adding API traffic - and
     # give it a chance to make this check unnecessary in the first place.
-    await asyncio.sleep(300)
+    from . import lastrun
+    await asyncio.sleep(lastrun.first_wait("arrgap", _every_h() * 3600.0, 300))
     while True:
         try:
             with joblog.section("Arr gap check") as sec:
                 await scan()
+                lastrun.mark("arrgap")
                 d = _CACHE.get("data") or {}
                 n, fixable = int(d.get("total") or 0), int(d.get("fixable") or 0)
                 if fixable:

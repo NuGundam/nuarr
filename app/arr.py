@@ -10,6 +10,7 @@ Two jobs:
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -97,6 +98,109 @@ def _series_sig(s: dict) -> str:
             f"{s.get('path') or ''}")
 
 
+# WHO IS ASKING THE ARRS, AND WHAT (2026-11-28). Sonarr sat at three and a
+# half cores with nuarr the only program connected to it and nothing here
+# could say which of nuarr's thirty tasks was doing the asking. Every request
+# any ArrClient makes is counted now: which arr, which call (ids folded out of
+# the path), which nuarr module and function asked, how many times and for how
+# long. In memory only, since the process started; see /api/arr/calls.
+CALLS: dict = {}
+CALLS_SINCE = [0.0]
+_FILES_CACHE: dict = {}          # arr name -> (at, [ArrFile]) - see ArrClient.list_files
+_FILES_LOCKS: dict = {}
+FILES_TTL_S = 900.0
+# WHO STARTED IT. A fan-out runs each call in a task of its own, whose stack
+# holds only this file - the asker is carried into those tasks by this.
+import contextvars as _cv
+_ASKER = _cv.ContextVar("nuarr_arr_asker", default="")
+
+
+def _asker_from_stack(skip: int = 2) -> str:
+    import sys as _sys
+    try:
+        f = _sys._getframe(skip)
+        here = __file__.lower()
+        root = os.path.dirname(here)
+        while f is not None:
+            fn = (f.f_code.co_filename or "").lower()
+            if fn.startswith(root) and fn != here:
+                return os.path.splitext(os.path.basename(fn))[0] + "." + f.f_code.co_name
+            f = f.f_back
+    except Exception:                                    # noqa: BLE001
+        pass
+    return ""
+_CALL_RX = None
+
+
+def _call_key(request) -> tuple:
+    global _CALL_RX
+    import re as _re
+    import sys as _sys
+    if _CALL_RX is None:
+        _CALL_RX = _re.compile(r"/\d+(?=/|$)")
+    path = _CALL_RX.sub("/N", request.url.path)
+    path = path.split("/api/v3", 1)[-1] or path
+    who = "?"
+    try:
+        f = _sys._getframe(2)
+        here = __file__.lower()
+        root = os.path.dirname(here)
+        while f is not None:
+            fn = (f.f_code.co_filename or "").lower()
+            if fn.startswith(root) and fn != here:
+                who = os.path.splitext(os.path.basename(fn))[0] + "." + f.f_code.co_name
+                break
+            f = f.f_back
+    except Exception:                                    # noqa: BLE001
+        pass
+    if who == "?":
+        who = _ASKER.get() or "?"
+    return (request.url.host + ":" + str(request.url.port or ""), request.method, path, who)
+
+
+async def _call_start(request) -> None:
+    try:
+        if not CALLS_SINCE[0]:
+            CALLS_SINCE[0] = time.time()
+        request.extensions["nuarr_key"] = _call_key(request)
+        request.extensions["nuarr_t0"] = time.perf_counter()
+    except Exception:                                    # noqa: BLE001
+        pass
+
+
+async def _call_end(response) -> None:
+    try:
+        ext = response.request.extensions
+        k = ext.get("nuarr_key")
+        if not k:
+            return
+        e = CALLS.setdefault(k, [0, 0.0, 0.0])
+        e[0] += 1
+        e[1] += time.perf_counter() - ext.get("nuarr_t0", time.perf_counter())
+        e[2] = time.time()
+        if len(CALLS) > 4000:
+            for kk in sorted(CALLS, key=lambda x: CALLS[x][2])[:1000]:
+                CALLS.pop(kk, None)
+    except Exception:                                    # noqa: BLE001
+        pass
+
+
+def calls_report(top: int = 40) -> dict:
+    now = time.time()
+    mins = max(1e-9, (now - (CALLS_SINCE[0] or now)) / 60.0)
+    rows = [{"arr": k[0], "method": k[1], "path": k[2], "who": k[3], "n": v[0], "secs": round(v[1], 1),
+             "per_min": round(v[0] / mins, 1), "last_s": int(now - v[2])} for k, v in CALLS.items()]
+    by_who: dict = {}
+    for r in rows:
+        w = by_who.setdefault((r["arr"], r["who"]), {"arr": r["arr"], "who": r["who"], "n": 0, "secs": 0.0})
+        w["n"] += r["n"]
+        w["secs"] += r["secs"]
+    return {"minutes": round(mins, 1), "total": sum(r["n"] for r in rows),
+            "by_who": sorted(({**w, "secs": round(w["secs"], 1), "per_min": round(w["n"] / mins, 1)}
+                              for w in by_who.values()), key=lambda x: -x["secs"])[:top],
+            "calls": sorted(rows, key=lambda x: -x["secs"])[:top]}
+
+
 class ArrClient:
     def __init__(self, cfg: ArrConfig, timeout: float = 60.0):
         self.cfg = cfg
@@ -104,6 +208,7 @@ class ArrClient:
             base_url=cfg.api,
             headers={"X-Api-Key": cfg.api_key or ""},
             timeout=timeout,
+            event_hooks={"request": [_call_start], "response": [_call_end]},
         )
         # Signatures from the caller's PREVIOUS fetch, {series_id: sig}. Any
         # series whose signature still matches is left out of the /episodefile
@@ -272,13 +377,37 @@ class ArrClient:
 
     # -------------------------------------------------------------- files --
     async def list_files(self) -> list[ArrFile]:
-        """Every media file the arr knows about, with its durable id."""
-        if self.cfg.kind == "sonarr":
-            return await self._sonarr_files()
-        return await self._radarr_files()
+        """Every media file the arr knows about, with its durable id.
+
+        ONE SWEEP, SHARED FOR FIFTEEN MINUTES (2026-11-28). On Sonarr this is
+        a call per series - 1,152 of them - and four different tasks each ran
+        their own after every start (arrtotals, arrsync, the audio-language
+        page, arrgap): 3,605 /episodefile calls in the first four and a half
+        minutes, with Sonarr at three and a half cores for it. The second
+        asker now waits for the first and takes its answer. Not for the
+        scanner's signature-skipping read (prev_series_sig set): that one is
+        deliberately partial and is never kept or served."""
+        _ASKER.set(_asker_from_stack(1) or "list_files")
+        if self.prev_series_sig:
+            if self.cfg.kind == "sonarr":
+                return await self._sonarr_files()
+            return await self._radarr_files()
+        name = self.cfg.name
+        lock = _FILES_LOCKS.get(name)
+        if lock is None:
+            import asyncio as _aio
+            lock = _FILES_LOCKS[name] = _aio.Lock()
+        async with lock:
+            hit = _FILES_CACHE.get(name)
+            if hit and time.time() - hit[0] < FILES_TTL_S:
+                return list(hit[1])
+            got = await (self._sonarr_files() if self.cfg.kind == "sonarr" else self._radarr_files())
+            _FILES_CACHE[name] = (time.time(), got)
+            return list(got)
 
     async def _sonarr_files(self) -> list[ArrFile]:
         """One /episodefile call per series, run concurrently.
+        (_ASKER: the tasks below inherit who asked, for /api/arr/calls.)
 
         Sonarr does NOT honour repeated seriesId params - verified on v4.0.19:
         `?seriesId=2&seriesId=3` returns exactly the same 142 rows as

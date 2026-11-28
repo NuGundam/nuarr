@@ -504,12 +504,15 @@ async def watch() -> None:
              "corrects what it finds; in manual mode it waits for Put right.")
     # Not on boot. A start-up already has a scan, the arr clients and the
     # probe cache to get through, and this walks every title in the library.
-    await asyncio.sleep(600)
+    from . import lastrun
+    await asyncio.sleep(lastrun.first_wait(
+        "arrsync", max(1.0, float(getattr(SETTINGS, "arrsync_every_h", 12))) * 3600.0, 600))
     while True:
         try:
             every = max(1.0, float(getattr(SETTINGS, "arrsync_every_h", 12)))
             with joblog.section("Arr agreement check", eager=True) as sec:
                 await refresh()
+                lastrun.mark("arrsync")
                 d = _CACHE.get("data") or {}
                 n = int(d.get("total") or 0)
                 sec.result = f"{n} record(s) disagree" if n else "all agreed"

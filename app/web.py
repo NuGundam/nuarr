@@ -940,6 +940,7 @@ async def _startup() -> None:
     asyncio.create_task(system.sampler())
     from . import autoprio as _autoprio          # the priority tier follows the rest of the machine
     from . import plexmarkers as _plexmarkers    # does anything fall through Plex's intro/credits detection
+    asyncio.get_running_loop().call_later(60, lambda: asyncio.create_task(_attn_refresh()))
     asyncio.create_task(_plexmarkers.watch())
     asyncio.create_task(_autoprio.watch())
     # Reports only - never installs on its own. See ffmpeg_update.watch().
@@ -11022,9 +11023,16 @@ async def _renames_refresh(arr: str | None = None) -> None:
 async def _slow_pages_warm() -> None:
     """Build the two slow read-only pages once after boot, off the request."""
     await asyncio.sleep(150)
+    from . import lastrun as _lr
     for fn in (lambda: asyncio.to_thread(_act_index),
                lambda: api_audiolang(400), lambda: api_arrlang(400)):
         try:
+            # the arr-language page reads every series from Sonarr: warmed
+            # once in six hours, not once per start (see lastrun)
+            if fn.__code__.co_names[-1:] == ("api_arrlang",):
+                if _lr.age("arrlang.warm") < 6 * 3600:
+                    continue
+                _lr.mark("arrlang.warm")
             await fn()
         except Exception as e:                               # noqa: BLE001
             joblog.log(f"warming a page: {type(e).__name__}: {e}", "debug")
@@ -11033,6 +11041,18 @@ async def _slow_pages_warm() -> None:
 
 async def _renames_warm() -> None:
     """Build the first rename plan after boot so nobody pays for it in a page."""
+    # NOT AFTER EVERY START (2026-11-28). The plan is a rename preview per
+    # series and per film - 1,153 calls to Sonarr and 2,156 to Radarr, half an
+    # hour of their time between them - and it was rebuilt two minutes after
+    # every start, wanted or not. The last whole plan is kept across restarts
+    # now; a start within six hours of it takes that and asks nobody.
+    try:
+        kept = json.loads(kv_get("renames.plan") or "{}")
+        if kept.get("rows") is not None and time.time() - float(kept.get("at") or 0) < 6 * 3600:
+            _RENAMES_CACHE.update(rows=kept["rows"], at=float(kept["at"]), arr=None)
+            return
+    except Exception:                                        # noqa: BLE001
+        pass
     await asyncio.sleep(120)
     _RENAMES_CACHE["busy"] = True
     await _renames_refresh(None)
@@ -11106,6 +11126,11 @@ async def api_renames(arr: str | None = None, limit: int | None = None,
     # and must not be served back as the answer to the general one.
     if limit is None:
         _RENAMES_CACHE.update(rows=out, at=time.time(), arr=arr)
+        if arr is None:
+            try:                                             # kept across restarts - see _renames_warm
+                kv_set("renames.plan", json.dumps({"at": time.time(), "rows": out}))
+            except Exception:                                # noqa: BLE001
+                pass
     return {"count": len(out), "rows": out, "cached": False, "age_s": 0,
             "ttl_s": int(_RENAMES_TTL)}
 
@@ -11433,6 +11458,13 @@ async def api_subneed(limit: int = 200, library: str = ""):
 def api_submake():
     from . import submake
     return submake.snapshot()
+
+
+@app.get("/api/arr/calls")
+def api_arr_calls(top: int = 40):
+    """Which nuarr task is asking Sonarr and Radarr what, and how much."""
+    from . import arr as _arr
+    return _arr.calls_report(top)
 
 
 @app.get("/api/plex/markers")
@@ -13288,9 +13320,44 @@ def api_activity(q: str = "", page: int = 1, page_size: int = 50):
             "pages": pages, "page_size": page_size, "q": q}
 
 
+# THE LAST ANSWER, AT ONCE (2026-11-28). The list was rebuilt on every
+# request - 0.1 s warm, 1.6 s with fresh=1, 3.7 s the first time after a
+# start - and the tile that opens the panel always asked for fresh, so every
+# open was a second and a half of grey bars. The last answer is kept: a plain
+# request gets it immediately and, when it is older than twenty seconds, a
+# rebuild runs behind it; fresh=1 (Refresh, and after an action) still builds
+# now. A minute after start it is built once so the first open has something.
+_ATTN_LAST: dict = {"at": 0.0, "d": None, "busy": False}
+
+
+def _attn_build(limit: int, fresh: bool) -> dict:
+    d = _attention(limit, fresh)
+    _ATTN_LAST.update(at=time.time(), d=d)
+    return d
+
+
+async def _attn_refresh(limit: int = 400) -> None:
+    if _ATTN_LAST["busy"]:
+        return
+    _ATTN_LAST["busy"] = True
+    try:
+        await asyncio.to_thread(_attn_build, limit, False)
+    except Exception:                                        # noqa: BLE001
+        pass
+    finally:
+        _ATTN_LAST["busy"] = False
+
+
 @app.get("/api/attention")
 async def api_attention(limit: int = 400, fresh: int = 0):
-    return await asyncio.to_thread(_attention, limit, bool(fresh))
+    d = _ATTN_LAST["d"]
+    if fresh or d is None:
+        d = await asyncio.to_thread(_attn_build, limit, bool(fresh))
+        return d | {"age_s": 0}
+    age = time.time() - _ATTN_LAST["at"]
+    if age > 20:
+        asyncio.create_task(_attn_refresh(limit))
+    return d | {"age_s": round(age)}
 
 
 def _attention(limit: int = 400, fresh: bool = False):
@@ -21201,7 +21268,11 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
             const sys = ext>0
               ? gp('io-sys','system', `<b class="m-other io-v">${mbps(ext)}</b>`,
                    ptip('sys', 'Everything on the array that is not one of Nuarr\'s jobs, added up over every disk: a DrivePool balance, a Plex scan, a backup, a copy. It is the half the job gate reacts to.',
-                     [['total', `<b class="m-other">${mbps(eps(m.bps)).join(', ')||null]]))
+                     [['total', `<b class="m-other">${mbps(ext)}</b>`],
+                      ['disk read', `<span class="m-read">${mbps(L.reduce((a,x)=>a+(x.ext_read_bps||0),0))}</span> <span class="dim">· whole-disk counters, Nuarr included</span>`],
+                      ['disk write', `<span class="m-write">${mbps(L.reduce((a,x)=>a+(x.ext_write_bps||0),0))}</span>`],
+                      ['where', sysDisks.map(x=>`${diskTag(x.disk||x.pool_disk||'?')} <span class="dim">${mbps(x.ext_bps)}</span>`).join(' · ')||null],
+                      ['moves', moves.filter(m=>!m.mine).slice(0,4).map(m=>(m.from||'elsewhere')+' → '+(m.to||'elsewhere')+' '+mbps(m.bps)).join(', ')||null]]))
               : '';
             // EVERY VIEWER ON THE ARRAY, added up. The per-disk groups answer
             // "is this spindle spoken for"; this answers "how much of the pool
@@ -21581,16 +21652,36 @@ async function attnOpen(q){
   const p=document.getElementById('attnPanel');
   if(p) p.scrollIntoView({behavior:'smooth',block:'nearest'});
 }
+// WHAT IS KNOWN FIRST, THE FRESH ANSWER BEHIND IT. Opening the panel used to
+// blank it and wait a second and a half for a fresh build every time. It
+// paints what this page already has at once, then the server's last answer
+// (instant), and only then - when that answer was not new - the fresh one,
+// which replaces the list in place. Grey bars only when there is nothing at
+// all to show. `force` (Refresh, and after an action) still asks for fresh,
+// but no longer hides the list while it waits.
+let _attnSeq=0;
 async function loadAttention(force){
   const p=document.getElementById('attnPanel');
   if(p) p.style.display='';
   const b=document.getElementById('attnBody');
-  if(b && (force || !_attn.items.length))
+  const have = !!(_attn && _attn.items && (_attn.items.length || _attn._seen));
+  if(b && !have)
     b.innerHTML='<div class="skel" style="padding:12px"><i style="width:60%"></i>'
                +'<i style="width:44%"></i><i style="width:52%"></i></div>';
-  try{ _attn=await (await fetch('/api/attention'+(force?'?fresh=1':''))).json(); }
-  catch(e){ if(b) b.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; return; }
-  attnPaint();
+  else if(have) attnPaint();
+  const seq=++_attnSeq;
+  const get=async(q)=>{ const d=await (await fetch('/api/attention'+q)).json(); d._seen=true; return d; };
+  try{
+    // the last answer first - it is there at once
+    const d=await get('');
+    if(seq!==_attnSeq) return;
+    _attn=d; attnPaint();
+    if(force || d.age_s>20){
+      const f=await get('?fresh=1');
+      if(seq!==_attnSeq) return;
+      _attn=f; attnPaint();
+    }
+  }catch(e){ if(b && !have) b.innerHTML='<div class="dim" style="padding:14px">could not load</div>'; }
 }
 
 const ATTN_STYLE={
@@ -31393,6 +31484,7 @@ async function setLowTier(tier){
   await fetch('/api/gate/low?tier='+encodeURIComponent(tier),{method:'POST'});
   loadGate();
   if(typeof loadJobs==='function') loadJobs();     // the strip's counts change with the tier
+  if(typeof loadWorkers==='function') loadWorkers(); // and so do the Workers tiles
 }
 async function setGate(key,on){
   await fetch('/api/gate/toggle?key='+encodeURIComponent(key)+'&on='+(on?'true':'false'),{method:'POST'});
@@ -51727,6 +51819,7 @@ async function fbLoad(){
   clearTimeout(_fbT);
   _fbT=setTimeout(()=>shownPoll('fbBox', fbLoad), _fb&&_fb.run.running?5000:20000);
 }
+let _fbDone=false;
 async function fbOn(on){ try{ _fb=await (await fetch('/api/foreignburn/on?on='+(on?'true':'false'),{method:'POST'})).json(); }catch(e){} fbPaint(); }
 async function fbRun(btn){
   btn.disabled=true; btn.textContent='looking…';
@@ -51744,7 +51837,12 @@ function fbPaint(){
   const state=!d.on?'<span class="dim">off</span>'
     :r.running?`<span class="dlspin"></span><span style="color:var(--acc)">reading</span> ${esc((r.flight||[]).join(' · ')||r.now||'')}`
     :r.paused?`<span class="dim">waiting: ${esc(r.paused_why||'')}</span>`:'<span class="dim">idle</span>';
-  const found=rows.map(x=>{
+  // WAITING, AND SETTLED - as on Same episode twice. Waiting is a file with
+  // a replacement owed or under way; replaced, kept by you, and kept because
+  // nothing better exists (looked for again in a week) fold away under it.
+  const fbWaiting=x=>x.state==='open'||x.state==='replacing';
+  const openRows=rows.filter(fbWaiting), doneRows=rows.filter(x=>!fbWaiting(x));
+  const rowHtml=x=>{
     const s=ST[x.state]||['#8b949e',x.state], open=x.state==='open'||x.state==='kept';
     return `<tr>
       <td class="l" style="white-space:normal"><b>${esc(x.title)}</b> <span class="dim">· ${ago(x.at)}</span>
@@ -51756,7 +51854,11 @@ function fbPaint(){
         ${x.again?`<div class="dim" style="font-size:10.5px">looked for again ${esc(new Date(x.again*1000).toLocaleDateString([], {month:'short',day:'numeric'}))}</div>`:''}
         ${open&&x.failed?`<div class="err" style="font-size:10.5px">${esc(x.failed)}</div>`:''}
         ${open?`<div style="margin-top:3px">${remedyBtns(x.file_id,'file/foreign-burn',{source:'foreignburn'})}
-          <button class="rmb" onclick="fbKeep(${x.file_id})" title="Leave this file alone. Asked again only if the file changes.">Keep</button></div>`:''}</td></tr>`; }).join('');
+          <button class="rmb" onclick="fbKeep(${x.file_id})" title="Leave this file alone. Asked again only if the file changes.">Keep</button></div>`:''}</td></tr>`; };
+  const tbl=(list,h)=>`<div class="rowbox scrollbox" style="height:auto;max-height:${h}px;overflow-y:auto"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <colgroup><col style="width:auto"><col style="width:32%"><col style="width:290px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px"><th class="l">FILE</th><th class="l">WHAT IS IN THE PICTURE</th><th class="l">RESULT</th></tr></thead>
+      <tbody>${list.map(rowHtml).join('')}</tbody></table></div>`;
   const html=`<div style="border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin-bottom:10px">
     <div style="display:flex;align-items:center;gap:10px">
       <b>Foreign subtitles burned in</b>
@@ -51779,11 +51881,11 @@ function fbPaint(){
     </div>
     ${r.last_error?`<div class="warn" style="font-size:11px">${esc(r.last_error)}</div>`:''}
     ${(d.bans||[]).length?`<div style="font-size:11px;margin-top:5px"><span class="dim">banned in the arrs:</span> ${d.bans.map(b=>`<span class="pill" style="font-size:10.5px">${esc(b.source)} by ${esc(b.grp)} · ${b.burned} burned</span>`).join(' ')}</div>`:''}
-    <div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px;font-size:11px;font-weight:600">Found${rows.length?` (${rows.length})`:''}</div>
-    ${rows.length?`<div class="rowbox scrollbox" style="height:auto;max-height:300px"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
-      <colgroup><col style="width:auto"><col style="width:32%"><col style="width:290px"></colgroup>
-      <thead><tr class="dim" style="font-size:10.5px"><th class="l">FILE</th><th class="l">WHAT IS IN THE PICTURE</th><th class="l">RESULT</th></tr></thead>
-      <tbody>${found}</tbody></table></div>`:'<div class="dim" style="font-size:11px">nothing yet</div>'}
+    <div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px;font-size:11px;font-weight:600">Waiting to be replaced${openRows.length?` (${openRows.length})`:''}</div>
+    ${openRows.length?tbl(openRows,300):`<div class="dim" style="font-size:11px">${rows.length?'nothing waiting':'nothing found yet'}</div>`}
+    ${doneRows.length?`<div style="margin-top:8px;font-size:11px"><span style="cursor:pointer;font-weight:600" onclick="_fbDone=!_fbDone;_fbKey='';fbPaint()"><span class="actcaret">${_fbDone?'\u25be':'\u25b8'}</span> Settled (${doneRows.length})</span>
+      <span class="dim"> \u00b7 ${['replaced','ok','kept'].map(k=>[k,doneRows.filter(x=>x.state===k).length]).filter(a=>a[1]).map(([k,n])=>`${n} ${ST[k][1]}`).join(' \u00b7 ')}</span>
+      ${_fbDone?`<div style="margin-top:4px">${tbl(doneRows,260)}</div>`:''}</div>`:''}
   </div>`;
   if(html===_fbKey && el.firstElementChild) return;
   if(el.querySelector('[data-asking="1"]')) return;
@@ -51803,6 +51905,7 @@ async function samLoad(){
   clearTimeout(_samT);
   _samT=setTimeout(()=>shownPoll('samBox', samLoad), _sam&&_sam.run.running?4000:20000);
 }
+let _samDone=false;
 async function samOn(on){ try{ _sam=await (await fetch('/api/samecheck/on?on='+(on?'true':'false'),{method:'POST'})).json(); }catch(e){} samPaint(); }
 async function samRun(btn){
   btn.disabled=true; btn.textContent='looking…';
@@ -51824,8 +51927,14 @@ function samPaint(){
   const state=!d.on?'<span class="dim">off</span>'
     :r.running?`<span class="dlspin"></span><span style="color:var(--acc)">listening</span> ${esc((r.flight||[]).join(' · ')||r.now||'')}`
     :r.paused?`<span class="dim">waiting: ${esc(r.paused_why||'')}</span>`:'<span class="dim">idle</span>';
-  const found=rows.map(x=>{
-    const s=ST[x.state]||['#8b949e',x.state], open=x.state==='yours'||x.state==='auto';
+  // WHAT STILL WANTS SOMETHING, AND WHAT IS SETTLED. The list mixed the rows
+  // waiting on a decision with the ones already dealt with - removed, kept,
+  // "file replaced since" - so four open rows sat among six finished ones.
+  // The open ones are the list; the settled ones fold away under it.
+  const isOpen=x=>x.state==='yours'||x.state==='auto';
+  const openRows=rows.filter(isOpen), doneRows=rows.filter(x=>!isOpen(x));
+  const rowHtml=x=>{
+    const s=ST[x.state]||['#8b949e',x.state], open=isOpen(x);
     return `<tr>
       <td class="l" style="white-space:normal"><b>${esc(x.title)}</b> <span class="dim">· ${ago(x.at)}</span>
         <div class="dim mono" style="font-size:10px;word-break:break-word">${esc(name(x.path))}</div>
@@ -51835,7 +51944,11 @@ function samPaint(){
         ${x.did?`<div class="dim" style="font-size:10.5px">${esc(x.did)}</div>`:''}
         ${open&&x.failed?`<div class="err" style="font-size:10.5px">${esc(x.failed)}</div>`:''}
         ${open?`<div style="margin-top:3px">${remedyBtns(x.file_id,'file/same-episode',{source:'samecheck'})}
-          <button class="rmb" onclick="samKeep(${x.file_id})" title="This is the right episode. Asked again only if the file changes.">Keep</button></div>`:''}</td></tr>`; }).join('');
+          <button class="rmb" onclick="samKeep(${x.file_id})" title="This is the right episode. Asked again only if the file changes.">Keep</button></div>`:''}</td></tr>`; };
+  const tbl=(list,h)=>`<div class="rowbox scrollbox" style="height:auto;max-height:${h}px;overflow-y:auto"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
+      <colgroup><col style="width:auto"><col style="width:32%"><col style="width:290px"></colgroup>
+      <thead><tr class="dim" style="font-size:10.5px"><th class="l">EPISODE</th><th class="l">WHY</th><th class="l">RESULT</th></tr></thead>
+      <tbody>${list.map(rowHtml).join('')}</tbody></table></div>`;
   const html=`<style>.dlspin{display:inline-block;width:9px;height:9px;border:2px solid #79c0ff;border-right-color:transparent;border-radius:50%;animation:dlrot .8s linear infinite;vertical-align:-1px;margin-right:4px}@keyframes dlrot{to{transform:rotate(360deg)}}</style>
   <div style="border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin-bottom:10px">
     <div style="display:flex;align-items:center;gap:10px">
@@ -51858,11 +51971,11 @@ function samPaint(){
       ${d.unknown?`<span>${fmt(d.unknown)} <span class="dim">could not be heard well enough</span></span>`:''}
     </div>
     ${r.last_error?`<div class="warn" style="font-size:11px">${esc(r.last_error)}</div>`:''}
-    <div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px;font-size:11px;font-weight:600">Found${rows.length?` (${rows.length})`:''}</div>
-    ${rows.length?`<div class="rowbox scrollbox" style="height:auto;max-height:300px;overflow-y:auto"><table class="sktbl" style="width:100%;font-size:11.5px;table-layout:fixed">
-      <colgroup><col style="width:auto"><col style="width:32%"><col style="width:290px"></colgroup>
-      <thead><tr class="dim" style="font-size:10.5px"><th class="l">EPISODE</th><th class="l">WHY</th><th class="l">RESULT</th></tr></thead>
-      <tbody>${found}</tbody></table></div>`:'<div class="dim" style="font-size:11px">nothing yet</div>'}
+    <div style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px;font-size:11px;font-weight:600">Waiting on a decision${openRows.length?` (${openRows.length})`:''}</div>
+    ${openRows.length?tbl(openRows,300):`<div class="dim" style="font-size:11px">${rows.length?'nothing waiting':'nothing found yet'}</div>`}
+    ${doneRows.length?`<div style="margin-top:8px;font-size:11px"><span style="cursor:pointer;font-weight:600" onclick="_samDone=!_samDone;_samKey='';samPaint()"><span class="actcaret">${_samDone?'\u25be':'\u25b8'}</span> Settled (${doneRows.length})</span>
+      <span class="dim"> \u00b7 ${['removed','kept','gone','othergone'].map(k=>[k,doneRows.filter(x=>x.state===k).length]).filter(a=>a[1]).map(([k,n])=>`${n} ${ST[k][1]}`).join(' \u00b7 ')}</span>
+      ${_samDone?`<div style="margin-top:4px">${tbl(doneRows,260)}</div>`:''}</div>`:''}
     ${holds.length?`<div style="margin-top:8px;font-size:11px;font-weight:600">Unmonitored until they air (${holds.length})</div>
       ${holds.map(h=>`<div style="font-size:11.5px;margin-top:3px"><b>${esc(h.title)}</b> <span class="dim">· airs ${esc(when(h.air))}</span>
         <button class="rmb" style="margin-left:6px" onclick="samUnhold(${+h.episode},this)" title="Monitor it in ${esc(h.arr)} again now">Monitor now</button></div>`).join('')}`:''}
@@ -53871,12 +53984,15 @@ function workersCompact(w){
     const v = w[k]; if(!v) return '';
     const col = v.pool ? poolColor(v.pool) : 'var(--dim)';
     const used = v.pool ? (_poolUse[v.pool]||0) : null;
+    // held under its dial by the priority tier: show what it is worth now
+    const low = v.now!=null && v.now < v.value && !v.paused;
     return `<div class="wcell${v.paused?' off':''}${used?' lanebusy':''}" data-wpop="${esc(k)}"
          style="--c:${col};--bd:-${Date.now()%1600}ms" onclick="location.href='/settings#counts'">
          <div class="wcname" style="color:${col}">${esc(v.label||k)}</div>
-         <div class="wcval"><b style="color:${v.value?'var(--fg,#c9d1d9)':'var(--dim)'}">${v.value}</b>`
+         <div class="wcval"><b style="color:${v.value?'var(--fg,#c9d1d9)':'var(--dim)'}">${low?v.now:v.value}</b>`
       + (v.paused
           ? `<span class="wcsub" style="color:var(--warn)">\u23f8 paused</span>`
+          : low ? `<span class="wcsub" style="color:#ffb84d" title="The dial is set to ${v.value}; the priority tier (${esc(w._tier||'')}) holds it to ${v.now}.">of ${v.value} \u00b7 priority</span>`
           : `<span class="wcsub">${used!=null ? `${used} running now` : 'at once'}</span>`)
       + `</div></div>`;
   };
@@ -53896,7 +54012,7 @@ function workersCompact(w){
   };
   const groups = workerGroups(w, outs, k=>KEYS.includes(k));
   return `<div class="wcgrid">${groups.map(g=>`<div class="wcgrp" style="--n:${g.items.length}"
-        title="${esc(g.sub)}"><div class="wcgh">${esc(g.name)}</div>
+        ><div class="wcgh" title="${esc(g.sub)}">${esc(g.name)}</div>
         <div class="wcgc">${g.items.map(i=>i.out?ocell(i.v):cell(i.k)).join('')}</div></div>`).join('')}</div>
       <div class="wcfoot">${off
         ? `<span class="warn">${off} of ${pools.length} pools paused \u2014 what is running finishes, nothing new starts</span>`
@@ -55396,4 +55512,3 @@ def settings_page(request: Request) -> Response:
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> Response:
     return _page("index", lambda: INDEX.replace(_PANES_MARKER, ""), request)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      
