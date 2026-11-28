@@ -169,7 +169,12 @@ async def scan(limit: int = 0) -> dict:
         # planner already does at 20. Twelve here, because the language
         # check runs behind a page rather than in front of a job.
         import asyncio as _a
-        sem = _a.Semaphore(12)
+        try:
+            from . import workers as _wk
+            _lanes = max(1, min(12, _wk.now("arr_concurrency")))   # the dial and the priority tier
+        except Exception:                                # noqa: BLE001
+            _lanes = 12
+        sem = _a.Semaphore(_lanes)
 
         async def one(pid):
             async with sem:

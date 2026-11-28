@@ -299,7 +299,14 @@ class ArrClient:
         # ~31 s for 1,085 series and that is a Sonarr limit, not a client one -
         # which is why the win had to come from ASKING FOR LESS (see
         # changed_series() and the skip list below), not from asking harder.
-        sem = asyncio.Semaphore(12)
+        # ...so twelve is the most it is worth asking, and the dial
+        # (Sonarr/Radarr calls at once) and the priority tier may ask for less.
+        try:
+            from . import workers as _wk
+            _lanes = max(1, min(12, _wk.now("arr_concurrency")))
+        except Exception:                                # noqa: BLE001
+            _lanes = 12
+        sem = asyncio.Semaphore(_lanes)
 
         # Current signatures, computed from the /series response we already
         # have. Anything matching the caller's previous run is left alone.

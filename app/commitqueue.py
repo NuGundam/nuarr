@@ -105,10 +105,7 @@ async def _attempt(row: dict) -> tuple[bool, str]:
     if not os.path.exists(cache):
         # Nothing to commit any more. Do not fail forever over it.
         return True, "cache output is gone - nothing left to commit"
-    if not os.path.exists(target):
-        # The original vanished (deleted, or an arr replaced it). Committing
-        # would resurrect a file the library no longer expects.
-        return True, "target no longer exists - dropping the pending commit"
+    # (a target that is gone is handled below: followed if it was only renamed)
     # SAME PATH, DIFFERENT FILE. A pending commit can wait hours behind a
     # lock - long enough for an arr upgrade to land a new release at this
     # exact path. The vanished-target check above cannot see that, and
@@ -116,6 +113,34 @@ async def _attempt(row: dict) -> tuple[bool, str]:
     # superseded. size_before is the source's size when the encode read it;
     # a target that no longer matches is no longer the file this output was
     # made from.
+    # THE ORIGINAL WAS RENAMED while its new version waited here: follow it,
+    # when the file's own record says where it went and the bytes there are
+    # still the ones this was made from. Otherwise the pending commit is
+    # dropped - written to the old name it would be a second copy of the
+    # episode (fileops.safe_replace refuses that now).
+    if not os.path.exists(target):
+        moved = ""
+        try:
+            with cursor() as cur:
+                cur.execute("SELECT path FROM files WHERE id = ?", (row.get("file_id"),))
+                r = cur.fetchone()
+            cand = (r["path"] if r else "") or ""
+            if cand and cand != target and os.path.exists(cand) and row.get("size_before") \
+                    and os.path.getsize(cand) == row["size_before"]:
+                moved = cand
+        except Exception:                                    # noqa: BLE001
+            moved = ""
+        if moved:
+            joblog.log(f"deferred commit: the file was renamed while it waited - following it to "
+                       f"{os.path.basename(moved)}", "info")
+            target = moved
+        else:
+            try:
+                os.remove(cache)
+            except OSError:
+                pass
+            return True, ("the original is no longer at that path (renamed or replaced) - "
+                          "dropping the pending commit; the file is planned afresh")
     try:
         if row.get("size_before") and \
                 os.path.getsize(target) != row["size_before"]:

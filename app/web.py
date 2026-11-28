@@ -15096,6 +15096,19 @@ def api_workers():
     # lane it shares with installs and engine tests. They have no count to
     # set, but they do cost the card, and this page is where cost is shown.
     out["_outside"] = _outside_live()
+    # WHAT EACH DIAL IS WORTH RIGHT NOW, under the priority tier: a lane at
+    # half its count, the scans and the arr calls at their share of it.
+    try:
+        for _k, _v in out.items():
+            if not isinstance(_v, dict) or _k.startswith("_"):
+                continue
+            if _v.get("pool"):
+                _v["now"] = jobs._capacity_now(_v["pool"])
+            elif _k in ("probe_workers", "arr_concurrency"):
+                _v["now"] = workers.now(_k)
+        out["_tier"] = gate.low_tier()
+    except Exception:                                    # noqa: BLE001
+        pass
     return out
 
 
@@ -21188,11 +21201,7 @@ guess.">looks like data moving</span>${other.slice(0,3).map(m=>pair(m,'')).join(
             const sys = ext>0
               ? gp('io-sys','system', `<b class="m-other io-v">${mbps(ext)}</b>`,
                    ptip('sys', 'Everything on the array that is not one of Nuarr\'s jobs, added up over every disk: a DrivePool balance, a Plex scan, a backup, a copy. It is the half the job gate reacts to.',
-                     [['total', `<b class="m-other">${mbps(ext)}</b>`],
-                      ['disk read', `<span class="m-read">${mbps(L.reduce((a,x)=>a+(x.ext_read_bps||0),0))}</span> <span class="dim">· whole-disk counters, Nuarr included</span>`],
-                      ['disk write', `<span class="m-write">${mbps(L.reduce((a,x)=>a+(x.ext_write_bps||0),0))}</span>`],
-                      ['where', sysDisks.map(x=>`${diskTag(x.disk||x.pool_disk||'?')} <span class="dim">${mbps(x.ext_bps)}</span>`).join(' · ')||null],
-                      ['moves', moves.filter(m=>!m.mine).slice(0,4).map(m=>(m.from||'elsewhere')+' → '+(m.to||'elsewhere')+' '+mbps(m.bps)).join(', ')||null]]))
+                     [['total', `<b class="m-other">${mbps(eps(m.bps)).join(', ')||null]]))
               : '';
             // EVERY VIEWER ON THE ARRAY, added up. The per-disk groups answer
             // "is this spindle spoken for"; this answers "how much of the pool
@@ -55387,3 +55396,4 @@ def settings_page(request: Request) -> Response:
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> Response:
     return _page("index", lambda: INDEX.replace(_PANES_MARKER, ""), request)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      

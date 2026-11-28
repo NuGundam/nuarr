@@ -723,7 +723,8 @@ REPLACED = None
 
 def safe_replace(target: str, replacement: str, *, attempts: int = 5,
                  base_delay: float = 3.0, lock_timeout: float = 600,
-                 keep_backup: bool = False, on_stage=None, pace=None) -> OpResult:
+                 keep_backup: bool = False, on_stage=None, pace=None,
+                 create: bool = False) -> OpResult:
     """Replace `target` with `replacement`, verifiably and reversibly.
 
     Sequence - the original is never at risk:
@@ -752,6 +753,18 @@ def safe_replace(target: str, replacement: str, *, attempts: int = 5,
         target = long_path(target)
         replacement = long_path(replacement)
 
+    # A REPLACE NEEDS SOMETHING TO REPLACE (2026-11-28). With the target gone
+    # this used to carry on and write the new file to the old name - and the
+    # target is gone exactly when Sonarr renamed the file while the job ran
+    # (an encode changes the codec in the name; a follow-up job still holds
+    # the name it was planned with). The library then had the episode twice:
+    # ten of them, 27.7 GB, each checked and listened to twice ever since
+    # (For All Mankind S03E07 - renamed 02:53:53, the old name rewritten by
+    # the subtitle job that finished at 02:54:09). Refused now, here and again
+    # just before the swap, because the copy onto the pool can take minutes.
+    # `create=True` is for a caller that really means to make a new file.
+    if not create and not os.path.exists(target):
+        return OpResult(False, "replace", "the original is no longer at this path - it was renamed or replaced while the job ran; nothing was written")
     new_sig_size = os.path.getsize(replacement)
     backup = target + ".nuarr-bak"
     original = replacement           # what the caller handed over
@@ -870,6 +883,12 @@ def safe_replace(target: str, replacement: str, *, attempts: int = 5,
             continue
 
         moved_backup = False
+        if not create and not os.path.exists(target):
+            # renamed away during the copy: do not leave a second file behind
+            for _p in (staged, phys):
+                if _p:
+                    _quiet_remove(_p)
+            return OpResult(False, "replace", "the original is no longer at this path - it was renamed or replaced while the job ran; nothing was written", attempt, waited, holders)
         try:
             if os.path.exists(target):
                 if os.path.exists(backup):

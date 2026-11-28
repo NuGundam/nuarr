@@ -571,7 +571,7 @@ async def _top_up_locked() -> int:
     # starves the jobs already running.
     try:
         from . import workers as _w
-        limit = max(1, int(_w.get().probe_workers))
+        limit = max(1, int(_w.now("probe_workers")))      # under the priority tier
     except Exception:
         limit = 4
     sem = asyncio.Semaphore(limit)

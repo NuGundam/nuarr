@@ -833,6 +833,30 @@ PAUSABLE = ("encode", "passthrough", "subocr", "subs", "audio", "decode",
             "listen", "subread", "submake")
 
 
+# THE TWO DIALS THAT ARE NOT QUEUE LANES follow the priority tier too
+# (2026-11-28). "Sonarr/Radarr calls at once" was a dial wired to nothing -
+# arr.py and arrlang asked twelve at a time whatever it said - and file scans
+# ran at their full count while low priority held the queue to one job; with
+# Sonarr at 27 % of the processor that was nuarr leaning on the very program
+# auto priority was giving way to. Share of the dial per tier:
+TIER_SHARE = {"": 1.0, "half": 0.5, "two": 0.25, "one": 0.1}
+
+
+def now(key: str) -> int:
+    """A light dial's value as it stands under the priority tier: probe_workers
+    or arr_concurrency. Never under 1."""
+    try:
+        v = int(getattr(get(), key))
+    except Exception:                                            # noqa: BLE001
+        v = int(LIMITS.get(key, (1, 1, 4))[2])
+    try:
+        from . import gate
+        share = TIER_SHARE.get(gate.low_tier(), 1.0)
+    except Exception:                                            # noqa: BLE001
+        share = 1.0
+    return max(1, int(round(v * share))) if v > 0 else 0
+
+
 def paused() -> set:
     raw = kv_get("worker.paused") or ""
     return {p for p in raw.split(",") if p in PAUSABLE}
