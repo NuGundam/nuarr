@@ -121,6 +121,17 @@ def backfill() -> int:
     return len(rows)
 
 
+def forget(file_id: int, dub: bool = False) -> None:
+    """The file no longer carries the track that was scored."""
+    try:
+        rows = json.loads(kv_get(KV) or "[]")
+    except Exception:                                            # noqa: BLE001
+        return
+    keep = [r for r in rows if not (r.get("file_id") == int(file_id) and bool(r.get("dub")) == bool(dub))]
+    if len(keep) != len(rows):
+        kv_set(KV, json.dumps(keep))
+
+
 def summary() -> dict:
     try:
         rows = json.loads(kv_get(KV) or "[]")

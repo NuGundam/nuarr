@@ -939,6 +939,8 @@ async def _startup() -> None:
     asyncio.create_task(commitqueue.watch())
     asyncio.create_task(system.sampler())
     from . import autoprio as _autoprio          # the priority tier follows the rest of the machine
+    from . import plexmarkers as _plexmarkers    # does anything fall through Plex's intro/credits detection
+    asyncio.create_task(_plexmarkers.watch())
     asyncio.create_task(_autoprio.watch())
     # Reports only - never installs on its own. See ffmpeg_update.watch().
     # THE LISTENER IS A JOB KIND NOW - see readers.py. audiolang.watch ran a
@@ -11433,6 +11435,19 @@ def api_submake():
     return submake.snapshot()
 
 
+@app.get("/api/plex/markers")
+def api_plex_markers():
+    """Plex's intro and credits coverage per library - see plexmarkers."""
+    from . import plexmarkers
+    return plexmarkers.last()
+
+
+@app.post("/api/plex/markers")
+async def api_plex_markers_run():
+    from . import plexmarkers
+    return await plexmarkers.run_once()
+
+
 @app.get("/api/submake/timing")
 def api_submake_timing():
     """Where the Subtitle maker's time goes, stage by stage."""
@@ -11443,8 +11458,18 @@ def api_submake_timing():
 @app.get("/api/submake/quality")
 def api_submake_quality():
     """How the made subtitles read - see subquality."""
-    from . import subquality
-    return subquality.summary()
+    from . import subquality, subfixlines
+    return subquality.summary() | {"fix": subfixlines.status()}
+
+
+@app.post("/api/submake/fix-untranslated")
+async def api_submake_fix_untranslated():
+    """Translate the lines still in another language, in tracks already made."""
+    from . import subfixlines
+    if subfixlines.STATE["running"]:
+        return {"ok": False, "why": "already running"}
+    asyncio.create_task(subfixlines.run())
+    return {"ok": True}
 
 
 # THEIR OWN WORKERS. A release search is a minute of waiting on the arr, and
@@ -24607,6 +24632,44 @@ function sortPb(col){
   else { _pbSort = col; _pbDir = (col==='title'||col==='kinds'||col==='codecs') ? 1 : -1; }
   renderPlayback();
 }
+// PLEX'S INTRO AND CREDITS MARKERS (2026-11-27): per library, on how many
+// episodes detection has run, how many have each marker, and the ones Plex
+// has never analysed - read from Plex's own database once a day
+// (plexmarkers.py). Sits above the playback table, folded.
+let _pmOpen=true;     // open: it is a table to be read, not a setting to be found
+async function loadPlexMarkers(run){
+  const el=document.getElementById('plexMarkers'); if(!el) return;
+  let d; try{ d=await (await fetch('/api/plex/markers',{method:run?'POST':'GET'})).json(); }catch(_){ return; }
+  if(!d.at && !run && !d.error){ return loadPlexMarkers(true); }      // first look
+  const pct=(a,b)=>b?Math.round(a/b*100)+'%':'\u2014';
+  const libs=d.libs||[];
+  const never=libs.reduce((n,x)=>n+(x.intro_never||0),0);
+  const credS=libs.filter(x=>x.kind==='shows').reduce((n,x)=>n+x.credits_missing,0);
+  const SRC={any:'both (online first, then local)', cloud:'only online \u2014 Plex never detects credits itself', local:'local detection only'};
+  const tr=(d.trail||[]).slice(-14);
+  const first=tr[0], lastT=tr[tr.length-1];
+  const trend = tr.length>1 ? `<div class="dim" style="font-size:11px;margin-top:4px">Episodes without a credits marker: ${
+      tr.map(t=>`<span title="${esc(t.day)}">${fmt(t.credits_missing)}</span>`).join(' \u2192 ')}
+      ${first&&lastT?` \u00b7 ${first.credits_missing-lastT.credits_missing>=0?'down':'up'} ${fmt(Math.abs(first.credits_missing-lastT.credits_missing))} since ${esc(first.day)}`:''}</div>` : '';
+  el.innerHTML=`<details${_pmOpen?' open':''} ontoggle="_pmOpen=this.open" style="padding:8px 14px;border-bottom:1px solid var(--line)">
+    <summary style="cursor:pointer;font-size:12px"><b>Intro and credits markers</b>
+      <span class="dim"> \u00b7 ${d.error?esc(d.error):d.at?`${never?`<span style="color:var(--warn)">${fmt(never)} episode(s) never analysed for an intro</span>`:'no episode missed by intro detection'} \u00b7 ${fmt(credS)} episode(s) without a credits marker`:'reading Plex\u2026'}</span></summary>
+    ${libs.length?`<table style="margin-top:6px;font-size:11.5px"><tr><th style="text-align:left">Library</th><th>Items</th><th>Intro detection ran</th><th>Intro found</th><th>Never analysed</th><th>Credits marker</th><th>No credits marker</th></tr>
+      ${libs.map(x=>`<tr><td>${esc(x.name)}</td><td style="text-align:right">${fmt(x.items)}</td>
+        <td style="text-align:right">${x.kind==='shows'?`${fmt(x.intro_tried)} <span class="dim">${pct(x.intro_tried,x.items)}</span>`:'<span class="dim">films have none</span>'}</td>
+        <td style="text-align:right">${x.kind==='shows'?`${fmt(x.intro)} <span class="dim">${pct(x.intro,x.items)}</span>`:''}</td>
+        <td style="text-align:right;${x.intro_never?'color:var(--warn)':''}">${x.kind==='shows'?fmt(x.intro_never):''}</td>
+        <td style="text-align:right">${fmt(x.credits)} <span class="dim">${pct(x.credits,x.items)}</span></td>
+        <td style="text-align:right">${fmt(x.credits_missing)}</td></tr>`).join('')}</table>`:''}
+    ${trend}
+    ${(d.missed||[]).length?`<div style="margin-top:6px;font-size:11.5px"><b>Never analysed</b> <span class="dim">\u2014 in the library more than three days, with no record that intro detection ran</span>
+      <div style="max-height:150px;overflow:auto;margin-top:2px">${d.missed.map(m=>`<div><span class="dim">${esc(m.library)}</span> \u00b7 ${esc(m.show)} ${esc(m.ep)} <span class="dim">${esc(m.title)}</span></div>`).join('')}</div></div>`:''}
+    <div class="dim" style="font-size:10.5px;margin-top:6px">Marker source in Plex: <b>${esc(SRC[d.source]||d.source||'unknown')}</b>.
+      Read from Plex's own database, read-only, once a day${d.at?` \u00b7 last ${esc(new Date(d.at*1000).toLocaleString())}`:''}.
+      An episode with no intro marker where detection ran simply has no intro Plex could find.
+      <a href="#" onclick="this.textContent='reading\u2026'; loadPlexMarkers(true); return false" style="color:#6fb0ff;text-decoration:none">Read again</a></div>
+  </details>`;
+}
 async function loadPlayback(){
   const el=document.getElementById('pb');
   if(!el) return;
@@ -31941,6 +32004,11 @@ function wtab(which){
       while(panel.firstChild) host.appendChild(panel.firstChild);
     }
     paneLoad('plexwork', loadPlayback);
+    if(host && !document.getElementById('plexMarkers')){
+      const box=document.createElement('div'); box.id='plexMarkers';
+      host.insertBefore(box, host.firstChild);
+    }
+    loadPlexMarkers(false);
     return;
   }
   if(which==='ruleschk'){
@@ -45423,6 +45491,9 @@ async function smStats(force){
       <div style="margin:5px 0 3px">${['good','check','poor'].map(g=>`<span style="color:${GC[g]};margin-right:12px"><b>${fmt(by[g]||0)}</b> ${g}</span>`).join('')}
         <span class="dim">of ${fmt(q.n)} made tracks${q.silent?` \u00b7 ${fmt(q.silent)} nearly silent (not a fault)`:''}</span></div>
       ${(q.kinds||[]).map(([k,n])=>`<div style="font-size:11px"><span class="dim">${fmt(n)} track${n===1?'':'s'}:</span> ${esc(k)}</div>`).join('')}
+      ${(()=>{ const f=q.fix||{}; if(f.running) return `<div style="font-size:11px;margin-top:4px;color:#79c0ff">Mending untranslated lines \u00b7 ${esc(f.phase||'')} \u00b7 ${fmt(f.done||0)} of ${fmt(f.total||0)} files \u00b7 ${fmt(f.lines||0)} lines</div>`;
+          const done = f.ended ? `<span class="dim" style="margin-left:8px">last run: ${fmt(f.mended||0)} line(s) translated${f.removed?`, ${fmt(f.removed)} removed`:''}${f.failed?`, ${fmt(f.failed)} file(s) left as they were`:''}${f.error?` \u00b7 ${esc(f.error)}`:''}</span>` : '';
+          return (f.waiting||done) ? `<div style="font-size:11px;margin-top:4px">${f.waiting?`<button class="rmb" onclick="smFixLines(this)" title="One run of the translator for every such line, then each track is swapped in place - same times, same placement. Anything you changed in a track is kept.">Translate the untranslated lines in ${fmt(f.waiting)} track${f.waiting===1?'':'s'}</button>`:''}${done}</div>` : ''; })()}
       ${(q.flagged||[]).length?`<div style="margin-top:5px;max-height:190px;overflow:auto">${q.flagged.map(r=>`
         <div style="font-size:11px;display:flex;gap:8px;margin:1px 0"><span style="flex:0 0 42px;color:${GC[r.grade]}">${esc(r.grade)}</span>
           <span style="flex:0 1 300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.label||'')}</span>
@@ -45440,8 +45511,14 @@ async function smStats(force){
         <span class="dim">${q.n?` \u00b7 ${fmt(by.good||0)} good \u00b7 ${fmt(by.check||0)} to check \u00b7 ${fmt(by.poor||0)} poor`:''}</span></summary>
       ${qualHtml}</details>`;
   if(html!==_smStatsKey){ _smStatsKey=html; el.innerHTML=html; }
+  if((q.fix||{}).running) setTimeout(()=>smStats(true), 5000);
 }
 const _smStatsOpen={time:false, qual:false};
+async function smFixLines(btn){
+  btn.disabled=true;
+  try{ await fetch('/api/submake/fix-untranslated',{method:'POST'}); }catch(e){}
+  setTimeout(()=>smStats(true), 800);
+}
 async function smLoad(){
   if(!document.getElementById('smPanel')) return;
   if(!_smSt) setTimeout(smStyles, 0);
@@ -55046,6 +55123,9 @@ span.askhost{display:inline-block}
 #plexworkBody, #ruleschkBody{flex:1;display:flex;flex-direction:column;
   min-height:0;padding-bottom:0}
 #plexworkBody > h2, #ruleschkBody > h2{flex:0 0 auto}
+#plexMarkers{flex:0 0 auto}
+#plexMarkers table th{font-weight:400;color:var(--dim);text-align:right;padding:2px 10px}
+#plexMarkers table td{padding:2px 10px}
 #plexworkPane .fullpane, #ruleschkPane .fullpane{
   flex:1 1 auto;min-height:220px;overflow:auto;overflow-x:hidden;
   /* THE VISIBLE FRAME. First cut used var(--line) on a background four RGB

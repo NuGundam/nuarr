@@ -689,6 +689,7 @@ def main():
     ap.add_argument("--learn", default="", help="json: the show's names and corrections (sublearn)")
     ap.add_argument("--audio", type=int, default=0, help="audio track ordinal (0:a:N) to listen to")
     ap.add_argument("--signs", default="", help="stream:N - the file's own English signs/songs track")
+    ap.add_argument("--retranslate", default="", help="json {groups:[{name, lines}]} - translate these lines only")
     ap.add_argument("--verify", default="", help="json file: {windows:[{t,len,a}]} - what is said there, in English")
     a = ap.parse_args()
     if a.learn:
@@ -699,6 +700,20 @@ def main():
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from app import audiolang
     audiolang._add_cuda_dirs()
+    if a.retranslate:
+        # LINES OF TRACKS ALREADY MADE that still carry the source language
+        # (subfixlines). Only the translator runs; the answer is the same
+        # lists in the same order, None where a line did not come back.
+        try:
+            spec = json.load(open(a.retranslate, encoding="utf-8"))
+            llm_dir = os.path.join(a.data, "llm", "qwen2.5-7b-instruct-ct2-int8")
+            got = [translate(g.get("lines") or [], g.get("title") or "an anime series", llm_dir,
+                             g.get("name") or "Japanese") if g.get("lines") else []
+                   for g in spec.get("groups") or []]
+            say(retranslated=got)
+        except Exception as e:                                   # noqa: BLE001
+            say(error=f"{type(e).__name__}: {e}"[:300])
+        return
     if a.verify:
         try:
             spec = json.load(open(a.verify, encoding="utf-8"))
