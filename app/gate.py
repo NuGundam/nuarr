@@ -825,6 +825,40 @@ def toggles() -> dict:
     return {k: get_toggle(k) for k in DEFAULTS}
 
 
+# LOW PRIORITY HAS TIERS (2026-11-27). It was one switch - one job at a time -
+# and that is the right answer for "I need the whole machine" and far too
+# much for "I am about to watch something". The switch (gate.low_priority)
+# still says whether a tier is on; which one is kept beside it, so turning
+# the switch on from Settings comes back to the tier used last.
+#   half  every lane at half its count          background checks carry on
+#   two   two jobs at once, whatever the lane   background checks wait
+#   one   one job at a time                     background checks wait
+LOW_TIERS = ("half", "two", "one")
+LOW_WORDS = {"half": "every lane at half its count", "two": "two jobs at a time",
+             "one": "one job at a time"}
+
+
+def low_tier() -> str:
+    """'' when low priority is off, else one of LOW_TIERS."""
+    if not get_toggle("gate.low_priority"):
+        return ""
+    t = str(kv_get("gate.low_tier") or "one")
+    return t if t in LOW_TIERS else "one"
+
+
+def set_low_tier(tier: str) -> None:
+    if tier in LOW_TIERS:
+        kv_set("gate.low_tier", tier)
+        set_toggle("gate.low_priority", True)
+    else:
+        set_toggle("gate.low_priority", False)
+
+
+def low_limit() -> int:
+    """How many jobs may run at once across every lane; 0 = no such limit."""
+    return {"two": 2, "one": 1}.get(low_tier(), 0)
+
+
 # --------------------------------------------------------------- checks ----
 def _cached(name: str, fn) -> Reason:
     """Cache a check result. Now runs on worker threads, so it must be locked.
@@ -3684,9 +3718,16 @@ def check_manual() -> Reason:
 
 def check_low() -> Reason:
     """Low priority mode. Never blocks: it narrows the queue to one job."""
-    if get_toggle("gate.low_priority"):
-        return Reason(False, "low priority", "On - one job at a time",
-                      extra=["The next job starts when the running one ends; the work a job does "
+    tier = low_tier()
+    if tier == "half":
+        return Reason(False, "low priority", "On - every lane at half its count",
+                      extra=["A lane set to 4 runs 2, a lane set to 1 still runs 1",
+                             "Background checks carry on while the machine is quiet"],
+                      clears="When you press Normal, in the Job gate heading")
+    if tier:
+        n = "two jobs" if tier == "two" else "one job"
+        return Reason(False, "low priority", f"On - {n} at a time",
+                      extra=["The next job starts when a running one ends; the work a job does "
                              "inside itself (quality search, subtitle OCR, checks) runs with it",
                              "Background checks wait while a job runs"],
                       clears="When you press Normal, in the Job gate heading")

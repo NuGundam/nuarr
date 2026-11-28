@@ -450,6 +450,29 @@ def kick() -> None:
 _W: list = [None]            # the queue Worker whose card mirrors STATE
 
 
+# THE STEPS A FILE GOES THROUGH, for the job card's step line: which one it
+# is on, which are behind it, which are still to come. A stage the worker
+# reports ("loading Whisper large-v3", "listening again in the gaps") belongs
+# to one of them.
+STEPS_MAKE = ["prepare", "listen", "read the picture", "translate", "write", "put inside the file"]
+STEPS_DUB = ["prepare", "listen", "write", "put inside the file"]
+
+
+def _step_of(stage: str) -> str:
+    s = (stage or "").lower()
+    if "inside the file" in s:
+        return "put inside the file"
+    if "translat" in s:
+        return "translate"
+    if "ocr" in s or "reading the picture" in s:
+        return "read the picture"
+    if "whisper" in s or "listening" in s or "reading the audio" in s:
+        return "listen"
+    if s.startswith("writing"):
+        return "write"
+    return "prepare"
+
+
 def _st(**kw) -> None:
     """STATE for the Subtitles page, and the same stage/progress on the job card."""
     STATE.update(**kw)
@@ -457,6 +480,11 @@ def _st(**kw) -> None:
     if w is not None:
         try:
             if "stage" in kw:
+                steps = getattr(w, "steps", None) or []
+                name = _step_of(str(kw["stage"]))
+                if name in steps:
+                    w.step = max(int(getattr(w, "step", 0) or 0), steps.index(name))
+                w.stage_note = str(kw.get("note") or "")[:120]
                 w.set_stage(str(kw["stage"])[:60])
             if "pct" in kw:
                 w.progress = max(0.0, min(1.0, float(kw["pct"] or 0) / 100.0))
@@ -470,8 +498,20 @@ async def make_job(w, file_id: int, overwrite: bool, by: str = "you", dub: bool 
     _W[0] = w
     t0 = time.time()
     try:
+        # what the card says is being done, in place of the transcode plan's
+        # "already set up correctly" - which is about a different question
+        w.sub_summary = ("English subtitles from the English audio track - what is said in the dub" if dub
+                         else "English subtitles from what is said and what is written on screen")
+        w.steps, w.step, w.stage_note = list(STEPS_DUB if dub else STEPS_MAKE), 0, ""
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
         it = pending_item(int(file_id), dub)
         if it:
+            try:
+                w.steps, w.step = ["put inside the file"], 0
+            except Exception:                                    # noqa: BLE001
+                pass
             # MADE ALREADY, NOT YET INSIDE: only the embed is owed.
             r = _row(int(file_id))
             label = display_label(r["title"], r["season"], r["episode"], r["path"]) if r else str(file_id)

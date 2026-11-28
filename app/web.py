@@ -1958,8 +1958,10 @@ async def _queue_blockers_impl():
             what = "next in line — a worker and its spindle are free"
             try:                                   # low priority mode: say why nothing else starts
                 from . import gate as _g, jobs as _j
-                if _j.RUNNING and _g.get_toggle("gate.low_priority"):
-                    what = "low priority mode — one job at a time; these start one by one as the running job ends"
+                _lim = _g.low_limit()
+                if _lim and len(_j.RUNNING) >= _lim:
+                    what = ("low priority mode — " + _g.LOW_WORDS[_g.low_tier()]
+                            + "; these start one by one as a running job ends")
             except Exception:                      # noqa: BLE001
                 pass
             short = ""
@@ -4347,17 +4349,18 @@ def _dispatch_order(rows: list, want: int) -> list:
     # The list is the queue as it stands and the dispatcher walks it from the
     # top (jobs._low_order); only the first row is "starting next".
     try:
-        if gate.get_toggle("gate.low_priority"):
+        _lim = gate.low_limit()
+        if _lim:
             out = list(rows)[:want]
-            if out:
-                out[0]["next_up"] = True
+            for _r in out[:max(1, _lim - len(jobs.RUNNING))]:
+                _r["next_up"] = True
             return out
     except Exception:                                        # noqa: BLE001
         pass
     pending = list(rows)
     ordered: list = []
     running = list(jobs.RUNNING.values())
-    cap = {p: jobs._capacity(p) for p in _QUEUE_POOLS}
+    cap = {p: jobs._capacity_now(p) for p in _QUEUE_POOLS}
     in_pool: dict = {}
     for w in running:
         in_pool[w.pool] = in_pool.get(w.pool, 0) + 1
@@ -14776,7 +14779,7 @@ async def api_gate():
         starving = jobs.starving_disks()
     except Exception:                                    # noqa: BLE001
         starving = {}
-    return st.as_dict() | {"toggles": gate.toggles(),
+    return st.as_dict() | {"toggles": gate.toggles(), "low_tier": gate.low_tier(),
                            "viewer_leads": leads,
                            "paused_for_viewer": sorted(paused),
                            # The two lines the session cards draw on their
@@ -14917,6 +14920,14 @@ async def api_gate_toggle(key: str, on: bool):
     gate.set_toggle(key, on)
     st = await gate.status()
     return {"ok": True, "gate": st.as_dict() | {"toggles": gate.toggles()}}
+
+
+@app.post("/api/gate/low")
+async def api_gate_low(tier: str = ""):
+    """Low priority mode's tier: half, two, one - anything else is normal."""
+    gate.set_low_tier(tier)
+    joblog.log("low priority mode: " + (gate.LOW_WORDS.get(gate.low_tier()) or "off - back to normal"), "info")
+    return {"ok": True, "tier": gate.low_tier()}
 
 
 def _outside_live() -> list:
@@ -18089,6 +18100,29 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
   border:1px solid var(--line);background:var(--panel);color:var(--fg)}
 .gqbtn:hover{border-color:var(--dim)}
 .gqbtn.on{color:#ffb84d;border-color:#5a4520;background:#2a2113}
+.gqbtn.cur{color:var(--ok);border-color:rgba(127,212,163,.45);background:rgba(127,212,163,.08)}
+.gqseg{display:inline-flex}
+/* closed phone: the heading wraps and the controls take a line of their own */
+html.mobile:not(.wide) #gatePanel h2{flex-wrap:wrap;gap:6px 8px}
+html.mobile:not(.wide) .gquick{margin-left:0;flex-wrap:wrap;width:100%}
+.gqseg .gqbtn{border-radius:0;margin-left:-1px;position:relative}
+.gqseg .gqbtn:first-child{border-radius:5px 0 0 5px;margin-left:0}
+.gqseg .gqbtn:last-child{border-radius:0 5px 5px 0}
+.gqseg .gqbtn.on,.gqseg .gqbtn.cur,.gqseg .gqbtn:hover{z-index:1}
+/* THE STEP LINE on a job card (2026-11-27): the steps this job goes through,
+   the ones behind it ticked, the one it is on in the lane's colour with what
+   it is doing and for how long. A card used to say a percentage and an ETA
+   and leave "of what" to be guessed. */
+.stepline{display:flex;flex-wrap:wrap;align-items:center;gap:4px 5px;font-size:11.5px;margin-top:7px}
+.stepline .stp{padding:1px 9px;border:1px solid var(--line);border-radius:10px;color:var(--dim);white-space:nowrap}
+.stepline .stp.done{color:var(--dim)}
+.stepline .stp.done b{color:var(--ok);font-weight:400;margin-right:4px}
+.stepline .stp.now{color:var(--fg,#c9d1d9);border-color:var(--c);font-weight:600;
+  background:color-mix(in srgb,var(--c) 10%,transparent)}
+.stepline .stp.now.held{border-color:var(--warn);color:var(--warn);background:none}
+.stepline .stpsep{color:var(--dim);opacity:.45}
+.stepline .stpnote{color:var(--dim);font-weight:400;margin-left:6px}
+html.mobile .stepline .stp{white-space:normal}
 #gateCfg{display:flex;flex-direction:column}
 /* No max-height any more. The 300px cap existed only so this column ended
    level with the Job gate panel beside it; on its own settings page there is
@@ -28248,6 +28282,7 @@ function paintRunning(j){
         <div class="bar big"><i class="${indet?'indet':''}${bs.held?' held':''}${reset?' nogrow':''}"
              style="width:${pct.toFixed(1)}%;background-color:${col}"></i></div>
         <div class="wkstats">${wkStatsHtml(w, pct, indet)}</div>
+        <div class="stepzone" style="--c:${poolCol}">${stepLine(w)}</div>
         <div class="socrzone">${vmafCell(w)}${subOcrCell(w)}${qwenVlCell(w)}${subFixCell(w)}</div>
         <div class="iozone">${ioCell(w)}</div>
         <div class="wlzone">${w.last_line?`<div class="dim mono wkline">${esc(w.last_line)}</div>`:''}</div>
@@ -28517,6 +28552,48 @@ function barState(w, poolCol){
   return {pct, col, indet, held};
 }
 
+// THE STEPS OF A JOB AND WHERE IT IS. A job that knows its steps sends them
+// (w.steps / w.step - the Subtitle maker); an encode or a remux walks the
+// same five or six every time, so they are read off its stage here. Anything
+// else gets no list, only its stage in words where the stats line above has
+// room for nothing but an ETA.
+function cardSteps(w){
+  if(w.steps && w.steps.length) return {names:w.steps, at:Math.max(0, w.step||0)};
+  if(w.pool!=='encode' && w.pool!=='passthrough') return null;
+  const vm = !!(w.vmaf_stage || (w.vmaf_result && Object.keys(w.vmaf_result).length));
+  const names = ['probe','prepare'].concat(vm?['find quality']:[],
+      [w.pool==='encode'?'encode':'copy','move into the library','update Sonarr/Radarr']);
+  const s = w.stage||'';
+  const work = names.indexOf(w.pool==='encode'?'encode':'copy');
+  const found = w.vmaf_result && Object.keys(w.vmaf_result).length;
+  const at = (s==='starting'||s==='probing') ? 0
+    : s==='handlers' ? 1
+    : s==='encoding' ? ((vm && !found && w.vmaf_stage) ? work-1 : work)
+    : (s==='committing'||s==='waiting to commit') ? work+1
+    : (s==='arr refresh / rename'||s==='done') ? work+2
+    : -1;
+  return at<0 ? null : {names, at};
+}
+function stepLine(w){
+  if(w.background) return '';
+  const cs = cardSteps(w);
+  const stage = (STAGE_LABEL[w.stage]!==undefined ? STAGE_LABEL[w.stage] : (w.stage||'')) || '';
+  const held = !!(w.paused_for_viewer || w.paused_for_load || /^waiting/i.test(w.stage||''));
+  const t = w.stage_s ? ` \u00b7 ${hms(w.stage_s)}` : '';
+  if(!cs){
+    if(!stage || w.eta_s==null) return '';         // the stats line already says it
+    return `<div class="stepline"><span class="stp now${held?' held':''}">${esc(stage)}<span class="stpnote">${
+      esc(w.stage_note||'')}${t}</span></span></div>`;
+  }
+  return `<div class="stepline">` + cs.names.map((n,i)=>{
+    if(i<cs.at) return `<span class="stp done"><b>\u2713</b>${esc(n)}</span>`;
+    if(i>cs.at) return `<span class="stp">${esc(n)}</span>`;
+    // the step it is on: its name, then what exactly, then for how long
+    const detail = [stage && stage.toLowerCase()!==n.toLowerCase() ? stage : '', w.stage_note||'']
+      .filter(Boolean).join(' \u00b7 ');
+    return `<span class="stp now${held?' held':''}">${esc(n)}<span class="stpnote">${esc(detail)}${t}</span></span>`;
+  }).join('<span class="stpsep">\u203a</span>') + `</div>`;
+}
 function wkStatsHtml(w, pct, indet){
   return `<span class="m-pct"${w.by_bytes&&w.stage==='encoding'
       ? ' title="estimated from bytes written — ffmpeg reports no usable output timeline for this file"'
@@ -28587,6 +28664,8 @@ function tryPatchCards(j){
     }
     const st = card.querySelector('.wkstats');
     if(st) st.innerHTML = wkStatsHtml(w, bs.pct, bs.indet);
+    const sl = card.querySelector('.stepzone');
+    if(sl){ const h = stepLine(w); if(sl._h !== h){ sl._h = h; sl.innerHTML = h; } }
     const sz = card.querySelector('.socrzone');
     if(sz) sz.innerHTML = vmafCell(w) + subOcrCell(w) + qwenVlCell(w) + subFixCell(w);
     const io = card.querySelector('.iozone');
@@ -30678,8 +30757,8 @@ const GATE_META={
     note:'This one removes something from a file, which is why it waited to be switched on.'},
   'gate.low_priority':{
     label:'Low priority mode',
-    what:'One job at a time, for when the machine is wanted for something else. Not a pause: the queue keeps moving.',
-    on:'Only one job runs at once, whatever the lane counts say. The work a job does inside itself (its quality search, its subtitle OCR, its checks) still runs with it. Background checks wait while a job runs. Jobs already running when this is turned on finish.',
+    what:'Less at once, for when the machine is wanted for something else. Not a pause: the queue keeps moving. Three tiers, picked in the Job gate heading on the dashboard: Half (every lane at half its count), Two (two jobs at a time), One (one job at a time).',
+    on:'The tier picked last is in force (One if none was). In Two and One only that many jobs run at once, whatever the lane counts say, and background checks wait while a job runs; in Half every lane runs half its count and background checks carry on. The work a job does inside itself (its quality search, its subtitle OCR, its checks) still runs with it. Jobs already running when this is turned on finish.',
     off:'Normal operation - every lane runs up to its own count.'},
   'gate.manual_pause':{
     label:'Manual pause',
@@ -30941,6 +31020,7 @@ async function loadGate(){
      `<div class="gbanner ${g.open?'open':'hold'}">${hdr}</div>
       <table class="gtab">${rows}</table>`);
   paintGateCfg(g.toggles||{});
+  _lowTier = g.low_tier||'';
   paintGateQuick(g.toggles||{});
   sizeGateCfg();
 }
@@ -31032,23 +31112,35 @@ function paintGateCfg(toggles){
 // Driven by the SAME toggles object as the settings list rather than by its own
 // fetch, so the two can never disagree about whether the queue is paused - a
 // second source of truth for a stop switch is worth avoiding.
-let _quickKey='';
+let _quickKey='', _lowTier='';
 function paintGateQuick(toggles){
   const el=document.getElementById('gateQuick');
   if(!el) return;
-  const on=!!toggles['gate.manual_pause'], low=!!toggles['gate.low_priority'];
-  const key=(on?'1':'0')+(low?'1':'0');
+  const on=!!toggles['gate.manual_pause'];
+  const tier=toggles['gate.low_priority'] ? (_lowTier||'one') : '';
+  const key=(on?'1':'0')+tier;
   if(key===_quickKey) return;          // same no-repaint discipline as above
   _quickKey=key;
+  // PRIORITY IS A CHOICE OF FOUR, not a switch: how much runs at once.
+  const TIERS=[['', 'Normal', 'Every lane runs up to its own count.'],
+    ['half', 'Half', 'Every lane at half its count - a lane set to 4 runs 2. Background checks carry on.'],
+    ['two', 'Two', 'Two jobs at a time, whatever the lane. Background checks wait while a job runs.'],
+    ['one', 'One', 'One job at a time. Background checks wait while a job runs.']];
+  const words={half:'every lane at half its count', two:'two jobs at a time', one:'one job at a time'};
   el.innerHTML=
-    `<span class="gqlabel">${low?'Low priority · one job at a time':'Priority'}</span>`+
-    `<button class="gqbtn${low?' on':''}" style="margin-right:12px" onclick="setGate('gate.low_priority',${low?'false':'true'})"
-       title="${low?'Back to normal: every lane runs up to its count':'Low priority mode: only one job at a time. The work a job does inside itself still runs with it. Running jobs finish.'}"
-     >${low?'Normal':'Low'}</button>`+
+    `<span class="gqlabel">${tier?'Low priority \u00b7 '+words[tier]:'Priority'}</span>`+
+    `<span class="gqseg" style="margin-right:12px">${TIERS.map(([k,name,tip])=>
+       `<button class="gqbtn${k===tier?(k?' on':' cur'):''}" onclick="setLowTier('${k}')"
+          title="${tip} Running jobs finish; what a job does inside itself still runs with it.">${name}</button>`).join('')}</span>`+
     `<span class="gqlabel">${on?'Queue paused':'Manual pause'}</span>`+
     `<button class="gqbtn${on?' on':''}" onclick="setGate('gate.manual_pause',${on?'false':'true'})"
        title="${on?'Let jobs start again':'Stop new jobs starting. Running jobs finish.'}"
      >${on?'Resume':'Pause'}</button>`;
+}
+async function setLowTier(tier){
+  await fetch('/api/gate/low?tier='+encodeURIComponent(tier),{method:'POST'});
+  loadGate();
+  if(typeof loadJobs==='function') loadJobs();     // the strip's counts change with the tier
 }
 async function setGate(key,on){
   await fetch('/api/gate/toggle?key='+encodeURIComponent(key)+'&on='+(on?'true':'false'),{method:'POST'});

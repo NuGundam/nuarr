@@ -1360,6 +1360,11 @@ class Worker:
             "cancelled": self.cancelled,
             "stage": self.stage,
             "stage_s": round(time.time() - self.stage_at) if self.stage_at else 0,
+            # THE JOB'S OWN LIST OF STEPS and where it is in it, for the card's
+            # step line - set by the kinds that know their steps (submake).
+            "steps": list(getattr(self, "steps", None) or []),
+            "step": int(getattr(self, "step", -1)),
+            "stage_note": getattr(self, "stage_note", "") or "",
             "out_bytes": self.out_bytes,
             "est_out_bytes": self.est_out_bytes,
             "src_bytes": self.src_bytes,
@@ -1715,6 +1720,19 @@ def refresh_track_langs(file_id: int, data: dict) -> None:
                          track_langs(data, "subtitle"), file_id))
     except Exception:                                    # noqa: BLE001
         pass
+
+
+def _capacity_now(pool: str) -> int:
+    """The lane's count as it stands this minute: halved (rounded up) in the
+    'half' tier of low priority mode. What the dispatcher fills and what the
+    strip shows, so the two agree."""
+    c = _capacity(pool)
+    try:
+        if c > 1 and gate.low_tier() == "half":
+            c = (c + 1) // 2
+    except Exception:                                            # noqa: BLE001
+        pass
+    return c
 
 
 def _capacity(pool: str) -> int:
@@ -3462,7 +3480,9 @@ async def pump() -> None:
                         # ran one after another while spot 1 on the page, a
                         # decode, never started. The lanes are now tried in the
                         # order their first queued job stands in the queue.
-                        if not RUNNING and gate.get_toggle("gate.low_priority"):
+                        # (and with two at a time, while there is room for one)
+                        _lim = gate.low_limit()
+                        if _lim and len(RUNNING) < _lim:
                             order = await asyncio.to_thread(_low_order, order)
                         for pool in order:
                             if pool not in ("handler", "subs", "audio",
@@ -3472,11 +3492,13 @@ async def pump() -> None:
                                 continue
                             if not st.open_for(pool):
                                 continue
-                            while _in_pool(pool) < _capacity(pool):
-                                # LOW PRIORITY MODE: one job at a time, any
-                                # lane. What that job runs inside itself is
-                                # not a second job and is not held.
-                                if RUNNING and gate.get_toggle("gate.low_priority"):
+                            while _in_pool(pool) < _capacity_now(pool):
+                                # LOW PRIORITY MODE: one job at a time (or
+                                # two), any lane. What a job runs inside
+                                # itself is not a second job and is not held.
+                                # The 'half' tier has no such limit - it is in
+                                # _capacity_now.
+                                if _lim and len(RUNNING) >= _lim:
                                     break
                                 if pool in HEAVY_POOLS and \
                                         time.time() - _LAST_START["heavy"] < START_GAP_S:
@@ -8732,18 +8754,18 @@ def live_snapshot() -> dict:
         # reads them.
         "disk_load": _disk_load_safe(),
         "paused_reason": PAUSED_REASON,
-        "capacity": {"encode": _capacity("encode"),
-                     "passthrough": _capacity("passthrough"),
-                     "subocr": _capacity("subocr"),
-                     "subs": _capacity("subs"),
-                     "audio": _capacity("audio"),
-                     "decode": _capacity("decode"),
-                     "listen": _capacity("listen"),
-                     "subread": _capacity("subread"),
-                     "submake": _capacity("submake"),
-                     "subtiming": _capacity("subtiming"),
-                     "verify": _capacity("verify"),
-                     "qwen": _capacity("qwen")},
+        "capacity": {"encode": _capacity_now("encode"),
+                     "passthrough": _capacity_now("passthrough"),
+                     "subocr": _capacity_now("subocr"),
+                     "subs": _capacity_now("subs"),
+                     "audio": _capacity_now("audio"),
+                     "decode": _capacity_now("decode"),
+                     "listen": _capacity_now("listen"),
+                     "subread": _capacity_now("subread"),
+                     "submake": _capacity_now("submake"),
+                     "subtiming": _capacity_now("subtiming"),
+                     "verify": _capacity_now("verify"),
+                     "qwen": _capacity_now("qwen")},
         "in_use": {"encode": _in_pool("encode"),
                    "passthrough": _in_pool("passthrough"),
                    "subocr": _in_pool("subocr"),
@@ -8918,18 +8940,18 @@ def snapshot(recent_limit: int = 60) -> dict:
         # column reading "idle" on twelve genuinely busy disks.
         "disk_load": _disk_load_safe(),
         "paused_reason": PAUSED_REASON,
-        "capacity": {"encode": _capacity("encode"),
-                     "passthrough": _capacity("passthrough"),
-                     "subocr": _capacity("subocr"),
-                     "subs": _capacity("subs"),
-                     "audio": _capacity("audio"),
-                     "decode": _capacity("decode"),
-                     "listen": _capacity("listen"),
-                     "subread": _capacity("subread"),
-                     "submake": _capacity("submake"),
-                     "subtiming": _capacity("subtiming"),
-                     "verify": _capacity("verify"),
-                     "qwen": _capacity("qwen")},
+        "capacity": {"encode": _capacity_now("encode"),
+                     "passthrough": _capacity_now("passthrough"),
+                     "subocr": _capacity_now("subocr"),
+                     "subs": _capacity_now("subs"),
+                     "audio": _capacity_now("audio"),
+                     "decode": _capacity_now("decode"),
+                     "listen": _capacity_now("listen"),
+                     "subread": _capacity_now("subread"),
+                     "submake": _capacity_now("submake"),
+                     "subtiming": _capacity_now("subtiming"),
+                     "verify": _capacity_now("verify"),
+                     "qwen": _capacity_now("qwen")},
         "in_use": {"encode": _in_pool("encode"),
                    "passthrough": _in_pool("passthrough"),
                    "subocr": _in_pool("subocr"),
