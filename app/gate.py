@@ -3717,6 +3717,28 @@ def check_manual() -> Reason:
 
 
 def check_low() -> Reason:
+    """Low priority mode, with what auto mode is doing about it when it is on."""
+    r = _check_low()
+    try:
+        from . import autoprio
+        if autoprio.enabled():
+            a = autoprio.STATE
+            head = "Auto - " + (r.detail[5:] if r.detail.startswith("On - ") else "every lane runs up to its count")
+            gpu = f"{a['gpu']:.0f} %" if a.get("gpu_seen") else "not measurable while nuarr is on the card"
+            lines = [f"Chosen by auto mode: {a['why'] or 'measuring'}",
+                     f"Outside nuarr right now: processor {a['cpu']:.0f} %, graphics card {gpu}, "
+                     f"memory free {a['ram_free']:.0f} %"]
+            if a.get("tier") and a.get("relax_in"):
+                lines.append(f"Takes a tier back after {int(autoprio.RELAX_S // 60)} quiet minutes"
+                             + (f" - {a['relax_in']} s to go" if a["relax_in"] < autoprio.RELAX_S else ""))
+            return Reason(False, "low priority", head, extra=lines,
+                          clears="It moves by itself; pick a tier in the Job gate heading to take over")
+    except Exception:                                            # noqa: BLE001
+        pass
+    return r
+
+
+def _check_low() -> Reason:
     """Low priority mode. Never blocks: it narrows the queue to one job."""
     tier = low_tier()
     if tier == "half":

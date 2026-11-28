@@ -938,6 +938,8 @@ async def _startup() -> None:
         pass
     asyncio.create_task(commitqueue.watch())
     asyncio.create_task(system.sampler())
+    from . import autoprio as _autoprio          # the priority tier follows the rest of the machine
+    asyncio.create_task(_autoprio.watch())
     # Reports only - never installs on its own. See ffmpeg_update.watch().
     # THE LISTENER IS A JOB KIND NOW - see readers.py. audiolang.watch ran a
     # pass of up to four hundred tracks every half hour on its own clock; the
@@ -14780,6 +14782,7 @@ async def api_gate():
     except Exception:                                    # noqa: BLE001
         starving = {}
     return st.as_dict() | {"toggles": gate.toggles(), "low_tier": gate.low_tier(),
+                           "low_auto": _low_auto(),
                            "viewer_leads": leads,
                            "paused_for_viewer": sorted(paused),
                            # The two lines the session cards draw on their
@@ -14918,16 +14921,34 @@ async def api_gate_toggle(key: str, on: bool):
     if key not in gate.DEFAULTS:
         raise HTTPException(400, f"unknown gate setting '{key}'")
     gate.set_toggle(key, on)
+    if key == "gate.low_priority":               # the switch by hand takes it off auto
+        from . import autoprio
+        autoprio.set_enabled(False)
     st = await gate.status()
     return {"ok": True, "gate": st.as_dict() | {"toggles": gate.toggles()}}
 
 
 @app.post("/api/gate/low")
 async def api_gate_low(tier: str = ""):
-    """Low priority mode's tier: half, two, one - anything else is normal."""
+    """Low priority mode's tier: half, two, one, or auto (autoprio picks and
+    keeps picking) - anything else is normal. A tier by hand ends auto."""
+    from . import autoprio
+    if tier == "auto":
+        autoprio.set_enabled(True)
+        joblog.log("low priority mode: auto - the tier follows what the rest of the machine is using", "info")
+        return {"ok": True, "tier": gate.low_tier(), "auto": True}
+    autoprio.set_enabled(False)
     gate.set_low_tier(tier)
     joblog.log("low priority mode: " + (gate.LOW_WORDS.get(gate.low_tier()) or "off - back to normal"), "info")
-    return {"ok": True, "tier": gate.low_tier()}
+    return {"ok": True, "tier": gate.low_tier(), "auto": False}
+
+
+def _low_auto() -> dict:
+    try:
+        from . import autoprio
+        return autoprio.status() | {"on": autoprio.enabled()}
+    except Exception:                                    # noqa: BLE001
+        return {}
 
 
 def _outside_live() -> list:
@@ -16557,6 +16578,11 @@ button[disabled]{opacity:.5;cursor:default}
 .selfuse .procbtn b{display:inline-block;text-align:right;
   font-variant-numeric:tabular-nums}
 .selfuse .procbtn .caret{margin-left:auto;padding-left:5px}
+.selfuse .procbtn .subox{white-space:pre;font-variant-numeric:tabular-nums}
+#suCpuBox{display:inline-block;min-width:62px}
+#suGpuBox{display:inline-block;min-width:66px}
+#suRamBox{display:inline-block;min-width:104px}
+html.mobile:not(.wide) .selfuse .procbtn .subox{display:none}
 #suCpuBtn{min-width:82px}
 #suCpuBtn b{min-width:38px}
 #suRamBtn{min-width:92px}
@@ -18102,6 +18128,9 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
 .gqbtn.on{color:#ffb84d;border-color:#5a4520;background:#2a2113}
 .gqbtn.cur{color:var(--ok);border-color:rgba(127,212,163,.45);background:rgba(127,212,163,.08)}
 .gqseg{display:inline-flex}
+/* the tier Auto has picked: marked, but not as a button somebody pressed */
+.gqbtn.pick{color:#ffb84d;border-color:#5a4520;border-style:dashed}
+.gqseg .gqbtn.pick{z-index:1}
 /* closed phone: the heading wraps and the controls take a line of their own */
 html.mobile:not(.wide) #gatePanel h2{flex-wrap:wrap;gap:6px 8px}
 html.mobile:not(.wide) .gquick{margin-left:0;flex-wrap:wrap;width:100%}
@@ -23421,7 +23450,7 @@ function renderSelfUse(s){
     el.innerHTML =
       '<span class="suwrap">'
     +   '<button class="procbtn" id="suCpuBtn" title="nuarr\'s CPU against the whole machine"'
-    +           ' onclick="toggleSu(event,\'cpu\')"><b>—</b> cpu'
+    +           ' onclick="toggleSu(event,\'cpu\')"><b>—</b> cpu<span class="mult subox" id="suCpuBox">\u00a0</span>'
     +           '<span class="caret" id="suCpuCaret">▸</span></button>'
     +   '<div class="procpop" id="suCpuPop" onclick="event.stopPropagation()"></div>'
     + '</span>'
@@ -23431,13 +23460,13 @@ function renderSelfUse(s){
     // a row that otherwise answers one question: what is Nuarr costing me.
     + '<span class="suwrap" id="suGpuWrap">'
     +   '<button class="procbtn" id="suGpuBtn" title="nuarr\'s GPU use, and what else is on the card"'
-    +           ' onclick="toggleSu(event,\'gpu\')"><b>—</b> gpu'
+    +           ' onclick="toggleSu(event,\'gpu\')"><b>—</b> gpu<span class="mult subox" id="suGpuBox">\u00a0</span>'
     +           '<span class="caret" id="suGpuCaret">▸</span></button>'
     +   '<div class="procpop" id="suGpuPop" onclick="event.stopPropagation()"></div>'
     + '</span>'
     + '<span class="suwrap">'
     +   '<button class="procbtn" id="suRamBtn" title="nuarr\'s memory against the whole machine"'
-    +           ' onclick="toggleSu(event,\'ram\')"><b>—</b> ram'
+    +           ' onclick="toggleSu(event,\'ram\')"><b>—</b> ram<span class="mult subox" id="suRamBox">\u00a0</span>'
     +           '<span class="caret" id="suRamCaret">▸</span></button>'
     +   '<div class="procpop" id="suRamPop" onclick="event.stopPropagation()"></div>'
     + '</span>'
@@ -23471,6 +23500,15 @@ function renderSelfUse(s){
   cb.style.color = c;
   const rb=document.querySelector('#suRamBtn b');
   rb.firstChild.nodeValue = ram;
+  // AND THE WHOLE MACHINE BESIDE EACH (2026-11-27): nuarr's share first, the
+  // box after it, so "17% cpu" can be read against a box at 30% or at 95%
+  // without opening the panel. Written into a text node that is already
+  // there, for the same reason as the numbers above.
+  const boxTxt=(id,t)=>{ const e=document.getElementById(id); if(e&&e.firstChild) e.firstChild.nodeValue=t; };
+  boxTxt('suCpuBox', s.cpu_pct!=null ? ` \u00b7 box ${Math.round(s.cpu_pct)}%` : '\u00a0');
+  boxTxt('suRamBox', s.ram_total_gb ? ` \u00b7 box ${Math.round(s.ram_used_gb)} of ${Math.round(s.ram_total_gb)} GB` : '\u00a0');
+  { const g=(s&&s.gpu)||{};
+    boxTxt('suGpuBox', g.name ? ` \u00b7 card ${Math.round(Math.max(g.gpu_pct||0, g.encoder_pct||0, g.decoder_pct||0))}%` : '\u00a0'); }
   // THE GPU CHIP IS NUARR'S, LIKE THE OTHER TWO.
   //
   // It reported the whole card, which made it the one chip in the row that was
@@ -31021,6 +31059,7 @@ async function loadGate(){
       <table class="gtab">${rows}</table>`);
   paintGateCfg(g.toggles||{});
   _lowTier = g.low_tier||'';
+  _lowAuto = g.low_auto||null;
   paintGateQuick(g.toggles||{});
   sizeGateCfg();
 }
@@ -31112,26 +31151,43 @@ function paintGateCfg(toggles){
 // Driven by the SAME toggles object as the settings list rather than by its own
 // fetch, so the two can never disagree about whether the queue is paused - a
 // second source of truth for a stop switch is worth avoiding.
-let _quickKey='', _lowTier='';
+let _quickKey='', _lowTier='', _lowAuto=null;
 function paintGateQuick(toggles){
   const el=document.getElementById('gateQuick');
   if(!el) return;
   const on=!!toggles['gate.manual_pause'];
   const tier=toggles['gate.low_priority'] ? (_lowTier||'one') : '';
-  const key=(on?'1':'0')+tier;
-  if(key===_quickKey) return;          // same no-repaint discipline as above
+  const A=_lowAuto||{}, auto=!!A.on;
+  const key=(on?'1':'0')+tier+(auto?'a'+(A.cause||''):'');
+  // the numbers move every few seconds; the tooltip follows them without a repaint
+  const autoTip = `Auto: the tier follows what everything that is not nuarr is using. `
+    + `Right now outside nuarr: processor ${Math.round(A.cpu||0)} %, graphics card ${
+        A.gpu_seen===false?'not measurable while nuarr is on it':Math.round(A.gpu||0)+' %'}, `
+    + `memory free ${Math.round(A.ram_free==null?100:A.ram_free)} %. `
+    + `Half from 20 % processor or 25 % card, Two from 40 / 50, One from 60 / 75 (or memory nearly full). `
+    + `It gives way after 15 s and takes one tier back after 3 quiet minutes.`
+    + (auto?'':` It would pick ${({'':'Normal',half:'Half',two:'Two',one:'One'})[A.want||'']} now.`);
+  if(key===_quickKey){
+    const ab=el.querySelector('.gqauto'); if(ab) ab.title=autoTip;
+    return;                            // same no-repaint discipline as above
+  }
   _quickKey=key;
-  // PRIORITY IS A CHOICE OF FOUR, not a switch: how much runs at once.
+  // PRIORITY IS A CHOICE, not a switch: how much runs at once - or Auto,
+  // which keeps choosing from what the rest of the machine is using.
   const TIERS=[['', 'Normal', 'Every lane runs up to its own count.'],
     ['half', 'Half', 'Every lane at half its count - a lane set to 4 runs 2. Background checks carry on.'],
     ['two', 'Two', 'Two jobs at a time, whatever the lane. Background checks wait while a job runs.'],
     ['one', 'One', 'One job at a time. Background checks wait while a job runs.']];
-  const words={half:'every lane at half its count', two:'two jobs at a time', one:'one job at a time'};
+  const words={'':'every lane at its count', half:'every lane at half its count', two:'two jobs at a time', one:'one job at a time'};
+  const label = auto ? `Auto \u00b7 ${words[tier]}${A.cause&&tier?` \u00b7 ${A.cause} busy elsewhere`:''}`
+              : tier ? 'Low priority \u00b7 '+words[tier] : 'Priority';
   el.innerHTML=
-    `<span class="gqlabel">${tier?'Low priority \u00b7 '+words[tier]:'Priority'}</span>`+
-    `<span class="gqseg" style="margin-right:12px">${TIERS.map(([k,name,tip])=>
-       `<button class="gqbtn${k===tier?(k?' on':' cur'):''}" onclick="setLowTier('${k}')"
-          title="${tip} Running jobs finish; what a job does inside itself still runs with it.">${name}</button>`).join('')}</span>`+
+    `<span class="gqlabel">${label}</span>`+
+    `<span class="gqseg" style="margin-right:12px">`+
+      `<button class="gqbtn gqauto${auto?' cur':''}" onclick="setLowTier('auto')" title="${autoTip}">Auto</button>`+
+      TIERS.map(([k,name,tip])=>
+       `<button class="gqbtn${k===tier?(auto?' pick':(k?' on':' cur')):''}" onclick="setLowTier('${k}')"
+          title="${tip} Running jobs finish; what a job does inside itself still runs with it.${auto?' Picking one takes it off Auto.':''}">${name}</button>`).join('')+`</span>`+
     `<span class="gqlabel">${on?'Queue paused':'Manual pause'}</span>`+
     `<button class="gqbtn${on?' on':''}" onclick="setGate('gate.manual_pause',${on?'false':'true'})"
        title="${on?'Let jobs start again':'Stop new jobs starting. Running jobs finish.'}"
