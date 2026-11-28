@@ -306,6 +306,52 @@ def part_of(rating_key: str, file_path: str = "") -> dict:
         return {}
 
 
+# IS PLEX READING THIS FILE RIGHT NOW? Plex cannot be told to wait - it has
+# no such call - so nuarr waits for Plex instead. Its /activities feed names
+# what each analysis is working on: "Detecting intros / Horimiya S01" (a whole
+# season), "Detecting Credits / Yu Yu Hakusho S03 E13", "Generating loudness
+# data / Swapped (2026)". A commit that swaps the file under one of those
+# gives Plex a burst of decode errors and a failed analysis (41,664 lines for
+# one Velvet episode on 2026-11-22).
+_BUSY_TYPES = ("media.generate.", "library.update.item")
+
+
+def _norm(s: str) -> str:
+    import re as _re
+    return _re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+
+def busy_on(title: str, season=None, episode=None) -> str:
+    """What Plex is doing to this show's season / this film right now, in
+    words - or ''. Never raises; an unreachable Plex is 'not busy'."""
+    try:
+        import json as _json
+        d = _json.loads(_get("/activities", timeout=4))
+    except Exception:                                        # noqa: BLE001
+        return ""
+    want = _norm(title)
+    if not want:
+        return ""
+    for a in (d.get("MediaContainer") or {}).get("Activity") or []:
+        if not str(a.get("type") or "").startswith(_BUSY_TYPES):
+            continue
+        sub = _norm(a.get("subtitle") or "")
+        if not sub.startswith(want):
+            continue
+        rest = sub[len(want):].split()
+        if season is None:
+            # a film: "title 2016", nothing after the title but the year
+            if not rest or (len(rest) == 1 and rest[0].isdigit() and len(rest[0]) == 4):
+                return f"{a.get('title')} - {a.get('subtitle')}"
+            continue
+        if not rest or rest[0] != f"s{int(season):02d}":
+            continue
+        if len(rest) > 1 and episode is not None and rest[1] != f"e{int(episode):02d}":
+            continue                                  # another episode of the season
+        return f"{a.get('title')} - {a.get('subtitle')}"
+    return ""
+
+
 def analyze(rating_key: str) -> bool:
     """Make Plex re-read this item's streams. The scan alone does not."""
     try:

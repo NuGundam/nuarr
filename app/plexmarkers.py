@@ -93,15 +93,15 @@ def scan() -> dict:
             if st not in (1, 2):
                 continue
             show = st == 2
-            rows = q("SELECT m.id, m.added_at, p.extra_data, m.title, m.\"index\", m.parent_id "
+            rows = q("SELECT m.id, m.added_at, p.extra_data, m.title, m.\"index\", m.parent_id, p.file "
                      "FROM metadata_items m JOIN media_items mi ON mi.metadata_item_id = m.id "
                      "JOIN media_parts p ON p.media_item_id = mi.id "
                      "WHERE m.library_section_id = ? AND m.metadata_type = ? AND p.deleted_at IS NULL",
                      sid, 4 if show else 1)
             items: dict = {}
-            for mid, added, extra, title, idx, parent in rows:
+            for mid, added, extra, title, idx, parent, pfile in rows:
                 it = items.setdefault(mid, {"added": added or 0, "tried": False, "title": title or "",
-                                            "idx": idx, "parent": parent})
+                                            "idx": idx, "parent": parent, "file": pfile or ""})
                 if '"pv:intros"' in (extra or ""):
                     it["tried"] = True
             old = {mid: it for mid, it in items.items() if now - it["added"] > GRACE_S}
@@ -121,7 +121,7 @@ def scan() -> dict:
                     missed.append({"library": name, "show": gt or "", "title": it["title"],
                                    "ep": (f"S{int(sn):02d}E{int(it['idx']):02d}"
                                           if sn is not None and it["idx"] is not None else ""),
-                                   "added": it["added"]})
+                                   "added": it["added"], "file": it["file"], "key": mid})
             libs.append(lib)
     finally:
         con.close()
@@ -152,6 +152,11 @@ def last() -> dict:
         d["trail"] = []
     d["running"] = STATE["running"]
     d["error"] = STATE["error"]
+    try:
+        from . import subbigevent
+        d["mended"] = subbigevent.log()[:20]
+    except Exception:                                            # noqa: BLE001
+        d["mended"] = []
     return d
 
 
@@ -184,6 +189,15 @@ async def watch() -> None:
                     c = sum(x["credits_missing"] for x in d["libs"] if x["kind"] == "shows")
                     joblog.log(f"plex markers: {n} episode(s) never analysed for an intro, "
                                f"{c} episode(s) without a credits marker", "info")
+                    # THE ONES PLEX CANNOT ANALYSE get the one fix nuarr has
+                    # for that - see subbigevent - and a second look after,
+                    # so the page shows whether it worked.
+                    if d.get("missed"):
+                        from . import subbigevent
+                        did = await subbigevent.unblock(d["missed"])
+                        if any(x.get("cut") for x in did):
+                            await asyncio.sleep(180)
+                            await run_once()
         except Exception:                                        # noqa: BLE001
             pass
         await asyncio.sleep(3600)

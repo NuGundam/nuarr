@@ -24664,9 +24664,13 @@ async function loadPlexMarkers(run){
     ${trend}
     ${(d.missed||[]).length?`<div style="margin-top:6px;font-size:11.5px"><b>Never analysed</b> <span class="dim">\u2014 in the library more than three days, with no record that intro detection ran</span>
       <div style="max-height:150px;overflow:auto;margin-top:2px">${d.missed.map(m=>`<div><span class="dim">${esc(m.library)}</span> \u00b7 ${esc(m.show)} ${esc(m.ep)} <span class="dim">${esc(m.title)}</span></div>`).join('')}</div></div>`:''}
+    ${(d.mended||[]).length?`<div style="margin-top:6px;font-size:11.5px"><b>Mended so Plex could analyse them</b>
+      <span class="dim">\u2014 a subtitle event too big for Plex's transcoder was taken out; everything else in the track stayed</span>
+      <div style="max-height:110px;overflow:auto;margin-top:2px">${d.mended.map(m=>`<div>${esc(m.name)} <span class="dim">\u00b7 ${fmt(m.cut)} event(s), ${(m.bytes/1e6).toFixed(1)} MB \u00b7 ${esc(new Date(m.at*1000).toLocaleDateString())}</span></div>`).join('')}</div></div>`:''}
     <div class="dim" style="font-size:10.5px;margin-top:6px">Marker source in Plex: <b>${esc(SRC[d.source]||d.source||'unknown')}</b>.
       Read from Plex's own database, read-only, once a day${d.at?` \u00b7 last ${esc(new Date(d.at*1000).toLocaleString())}`:''}.
       An episode with no intro marker where detection ran simply has no intro Plex could find.
+      A never-analysed episode is read for an oversized subtitle event and mended by itself after each daily look.
       <a href="#" onclick="this.textContent='reading\u2026'; loadPlexMarkers(true); return false" style="color:#6fb0ff;text-decoration:none">Read again</a></div>
   </details>`;
 }
@@ -28758,7 +28762,9 @@ function cardSteps(w){
   const at = (s==='starting'||s==='probing') ? 0
     : s==='handlers' ? 1
     : s==='encoding' ? ((vm && !found && w.vmaf_stage) ? work-1 : work)
-    : (s==='committing'||s==='waiting to commit') ? work+1
+    // held at the door of the library: for DrivePool, or for Plex to finish
+    // reading the file - the step is the same, the card says which
+    : (s==='committing'||s==='waiting to commit'||/^waiting for (Plex|DrivePool)/.test(s)) ? work+1
     : (s==='arr refresh / rename'||s==='done') ? work+2
     : -1;
   return at<0 ? null : {names, at};

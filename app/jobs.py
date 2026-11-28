@@ -2799,7 +2799,61 @@ def _refresh_placement(cur, pool: str, hot: set, limit: int = 30) -> int:
 DRIVEPOOL_WAIT_MAX_S = 3 * 3600
 
 
+PLEX_WAIT_MAX_S = 10 * 60
+
+
+async def _wait_for_plex(w, job) -> None:
+    """Hold a commit while Plex is analysing this very file (or its season).
+
+    Plex cannot be asked to wait, so the commit does. An intro detection
+    reads every episode of a season - a minute on average - and a file
+    replaced under it fails the analysis with thousands of decode errors.
+    Ten minutes at most, then the commit goes ahead: a long detection must
+    not hold a finished encode in the cache."""
+    try:
+        from . import plexnotify
+        with cursor() as cur:
+            cur.execute("SELECT title, season, episode FROM files WHERE id = ?", (job.file_id,))
+            r = cur.fetchone()
+        if not r or not r["title"]:
+            return
+        title, season, episode = r["title"], r["season"], r["episode"]
+    except Exception:                                    # noqa: BLE001
+        return
+    t0, said = time.time(), False
+    while True:
+        try:
+            what = await asyncio.to_thread(plexnotify.busy_on, title, season, episode)
+        except Exception:                                # noqa: BLE001
+            return
+        if not what:
+            if said:
+                w.stage_note = ""
+                joblog.log(f"committing now - Plex has finished with it (waited {int(time.time() - t0)}s)",
+                           "info", job.id)
+            return
+        if time.time() - t0 >= PLEX_WAIT_MAX_S:
+            joblog.log(f"waited {PLEX_WAIT_MAX_S // 60} min for Plex ({what}) - committing anyway", "warn", job.id)
+            w.stage_note = ""
+            return
+        if not said:
+            said = True
+            w.set_stage("waiting for Plex")
+            joblog.log(f"holding the commit - Plex is reading this file: {what}", "info", job.id)
+        # on the card's step line: what Plex is doing, and how long it may take
+        left = max(0, int(PLEX_WAIT_MAX_S - (time.time() - t0)))
+        w.stage_note = f"{what} - commits when Plex is done, or in {left // 60}m {left % 60:02d}s at the latest"
+        await asyncio.sleep(5)
+
+
 async def _wait_for_drivepool(w, job) -> None:
+    """Hold a commit while DrivePool is moving data, if that hold is on -
+    and then while Plex is analysing the file itself (_wait_for_plex)."""
+    await _wait_for_drivepool_only(w, job)
+    await _wait_for_plex(w, job)
+
+
+async def _wait_for_drivepool_only(w, job) -> None:
     """Hold a commit while DrivePool is moving data, if that hold is on."""
     try:
         from . import drivepool as _dp
