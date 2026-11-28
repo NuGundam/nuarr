@@ -11145,7 +11145,8 @@ async def api_jobs(recent: int = Query(60, le=1000)):
     # `recent` defaults low: this is polled every 2 s, and shipping 300 finished
     # rows each time made a 160 KB response out of data that rarely changes.
     return await _off_loop_json(
-        lambda: jobs.snapshot(recent_limit=recent) | {"system": system.snapshot(), "outside": _outside_live()})
+        lambda: jobs.snapshot(recent_limit=recent) | {"system": system.snapshot(), "outside": _outside_live(),
+                                                      "priority": _priority_now()})
 
 
 _TAUT_PROBE: dict = {"at": 0.0, "d": None, "busy": False}
@@ -14943,6 +14944,21 @@ async def api_gate_low(tier: str = ""):
     return {"ok": True, "tier": gate.low_tier(), "auto": False}
 
 
+def _priority_now() -> dict:
+    """The priority tier in force, for the panels that show work starting and
+    waiting: which tier, how many jobs it allows, how many are running."""
+    try:
+        from . import autoprio
+        tier = gate.low_tier()
+        auto = autoprio.enabled()
+        return {"tier": tier, "auto": auto, "limit": gate.low_limit(),
+                "running": len(jobs.RUNNING),
+                "cause": (autoprio.STATE.get("cause") or "") if auto and tier else "",
+                "paused": gate.get_toggle("gate.manual_pause")}
+    except Exception:                                    # noqa: BLE001
+        return {}
+
+
 def _low_auto() -> dict:
     try:
         from . import autoprio
@@ -15369,8 +15385,40 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
    as you started reading it. The ghost never delays actual work - the queue
    runs server-side regardless - and it is dropped early if a new job needs the
    slot, so a held card cannot make the panel look busier than it is. */
-.wk.fading{animation:wkfade .6s ease 2s forwards;pointer-events:none}
+.wk.fading{animation:wkfade .6s ease forwards;animation-delay:calc(var(--ge,0ms) + var(--hold,2s));pointer-events:none}
 @keyframes wkfade{0%{opacity:1}100%{opacity:0;transform:translateY(-4px)}}
+/* HOW IT ENDED, SHOWN AS IT LEAVES (2026-11-27). A cancelled or discarded
+   job used to go the way a finished one does - a stamp, two seconds, gone -
+   and the reason was a page away in Activity. These hold for eight seconds
+   with the reason on the card, and each ending moves its own way:
+     cancelled  the bar drains back to nothing - the work was not kept
+     discarded  the full bar breaks up and drops away - the work was done,
+                and the result was thrown out
+     failed     the card shakes once
+   The panel is repainted from scratch every poll, which would restart these;
+   every delay is offset by how long ago the job ended (--ge), so each picks
+   up where it was. Not switched off for reduced motion - see the bars. */
+.wk.fading .wkdone{animation:stamppop .32s cubic-bezier(.2,1.4,.4,1) both;animation-delay:var(--ge,0ms)}
+@keyframes stamppop{0%{transform:scale(1.9);opacity:0}100%{transform:none;opacity:1}}
+.wk.fading .wkwhy{font-size:12px;margin-top:6px;line-height:1.45;animation:whyin .4s ease both;
+  animation-delay:calc(var(--ge,0ms) + .25s)}
+.wk.fading .wkwhy b{font-weight:600}
+@keyframes whyin{0%{opacity:0;transform:translateY(3px)}100%{opacity:1;transform:none}}
+.wk.fading.fate-cancelled .bar.big > i{animation:bardrain 1.3s cubic-bezier(.6,0,.8,1) both;
+  animation-delay:calc(var(--ge,0ms) + .35s);transform-origin:left center}
+@keyframes bardrain{0%{transform:scaleX(1);opacity:1}100%{transform:scaleX(0);opacity:.5}}
+.wk.fading.fate-cancelled .wrap{text-decoration:line-through;text-decoration-color:var(--warn);
+  text-decoration-thickness:1px}
+.wk.fading.fate-discarded .bar.big > i{
+  -webkit-mask-image:repeating-linear-gradient(90deg,#000 0 14px,transparent 14px 20px);
+  mask-image:repeating-linear-gradient(90deg,#000 0 14px,transparent 14px 20px);
+  animation:barbreak 1.5s cubic-bezier(.5,0,.9,.6) both;animation-delay:calc(var(--ge,0ms) + .5s)}
+@keyframes barbreak{0%{transform:none;opacity:1}35%{transform:translateY(0) skewX(-8deg);opacity:1}
+  100%{transform:translateY(9px) skewX(-8deg);opacity:0}}
+.wk.fading.fate-failed{animation:wkshake .45s ease both,wkfade .6s ease forwards;
+  animation-delay:var(--ge,0ms),calc(var(--ge,0ms) + var(--hold,2s))}
+@keyframes wkshake{0%,100%{transform:none}20%{transform:translateX(-5px)}40%{transform:translateX(4px)}
+  60%{transform:translateX(-3px)}80%{transform:translateX(2px)}}
 @keyframes pipeflow{to{stroke-dashoffset:-24}}
 .pipeLit{animation:pipeflow 0.9s linear infinite}
 /* and a card ARRIVES rather than snapping in, so a slot changing occupant
@@ -15381,7 +15429,7 @@ tr.logdrop td{padding:0 0 8px 0;background:#1c2129;border-bottom:1px solid var(-
 .wkdone{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:10px;
         font-size:11px;font-weight:600;color:#0b0e12;background:var(--ok)}
 @media (prefers-reduced-motion:reduce){
-  .wk.fading{animation:none;opacity:.35}.wk.arriving{animation:none}}
+  .wk.arriving{animation:none}}
 
 /* ---- scan progress ---- */
 .scanwrap{display:inline-flex;align-items:center;gap:9px;margin-left:10px;
@@ -18128,6 +18176,10 @@ tr.logrow td{background:#1c2129;border-bottom:1px solid var(--acc);padding:0 12p
 .gqbtn.on{color:#ffb84d;border-color:#5a4520;background:#2a2113}
 .gqbtn.cur{color:var(--ok);border-color:rgba(127,212,163,.45);background:rgba(127,212,163,.08)}
 .gqseg{display:inline-flex}
+.priotag .prio{font-size:10.5px;padding:1px 9px;border:1px solid var(--line);border-radius:10px;color:var(--dim);text-decoration:none;text-transform:none;letter-spacing:0;white-space:nowrap}
+.priotag .prio.low{color:#ffb84d;border-color:#5a4520;background:#2a2113}
+.priotag .prio.held{color:var(--warn);border-color:rgba(226,179,65,.45)}
+.priotag .prio:hover{border-color:var(--dim)}
 /* the tier Auto has picked: marked, but not as a button somebody pressed */
 .gqbtn.pick{color:#ffb84d;border-color:#5a4520;border-style:dashed}
 .gqseg .gqbtn.pick{z-index:1}
@@ -18706,7 +18758,7 @@ html.mobile.wide #doneBox th:nth-child(5){width:190px !important}
        and controls sit directly above the list they fill. -->
   <div class="panel">
     <h2>Queue<span class="live"><span class="dot"></span>live</span>
-        <span id="aqState" class="live"></span></h2>
+        <span id="aqState" class="live"></span><span class="live priotag"></span></h2>
     <div id="aqBody" style="padding:11px 14px;border-bottom:1px solid var(--line)"></div>
     <!-- CURRENTLY PROBING. Its own element outside aqBody, which is rebuilt
          wholesale on every poll - a live animation cannot survive being
@@ -18809,7 +18861,7 @@ html.mobile.wide #doneBox th:nth-child(5){width:190px !important}
     <h2>Processing System<span class="live"><span class="dot"></span>live</span>
         <span class="live"><button onclick="cancelAll()"
           title="cancel every running job — the queue is left alone"
-          >Cancel all</button></span></h2>
+          >Cancel all</button></span><span class="live priotag"></span></h2>
     <!-- Worker occupancy, moved here from the Queue heading. It describes what
          is RUNNING, not what is waiting, so it belongs above the worker cards
          it is counting - and at 9px in a heading it was the smallest text on a
@@ -27882,7 +27934,7 @@ let _poolUse={}, _poolCap={};
 // 2 s holding the finished card + 0.6 s fading it. This is now LONGER than the
 // 2 s poll, so a ghost survives a repaint - _fading is keyed on an expiry
 // timestamp rather than on "cleared next tick" precisely so that is safe.
-const FADE_MS=2600;
+const FADE_MS=2600, FADE_SLOW_MS=8000;
 let _cardHtml=new Map(), _fading=new Map(), _lastRunIds=new Set();
 // job_id -> the phase its bar was last drawn in. Used only to decide whether
 // the width change should animate; a phase switch resets the bar and easing
@@ -27923,6 +27975,7 @@ async function loadJobs(){
   // The Workers panel says how many of each MAY run; this is how many are.
   _poolUse = j.in_use||{}; _poolCap = j.capacity||{};
   _outLive = j.outside||[];
+  paintPrioTags(j.priority);
   _ioLowJobs = new Set(j.io_low_jobs||[]);
   // HOW MANY of this pool's jobs are actually demoted, not "is the feature on".
   // Priority is now applied per spindle, so with a viewer on one disk and four
@@ -28391,12 +28444,28 @@ function paintRunning(j){
   // exactly this.
   const fate = Object.assign({}, j.fate || {});
   (j.recent || []).forEach(r => { if(r.job_id) fate[r.job_id] = r.state; });
+  const fateWhy = Object.assign({}, j.fate_why || {});
+  (j.recent || []).forEach(r => { if(r.job_id && r.error && r.state!=='done') fateWhy[r.job_id] = r.error; });
   for(const id of _lastRunIds){
     if(!live.has(id) && _cardHtml.has(id) && !_fading.has(id)){
       // No default of 'done'. Not knowing how a job ended is not evidence
       // that it ended well.
       const st = fate[id] || 'finished';
-      const [word, col] = WKFATE[st] || [st, 'var(--dim)'];
+      // WHY, where there is one - and a result thrown away is its own ending:
+      // the queue files it under "skipped", which says nothing was done, and
+      // a whole encode was.
+      const why = String(fateWhy[id] || '').trim();
+      const discarded = /^discarded/i.test(why);
+      const fk = discarded ? 'discarded' : st;
+      const [word, col] = discarded ? ['discarded', '#ff9a6b'] : (WKFATE[st] || [st, 'var(--dim)']);
+      const whyTxt = why ? why.replace(/^discarded:\s*/i, '')
+        : st==='cancelled' ? 'stopped before it finished'
+        : st==='deferred' ? 'the work is done; the file is waiting in the cache to be moved into the library'
+        : '';
+      // done leaves quickly; an ending with something to read stays for it
+      const hold = (st==='done' || st==='finished') ? FADE_MS : FADE_SLOW_MS;
+      const lastPct = ((_cardHtml.get(id).match(/<div class="bar big"><i [^>]*style="width:([\d.]+)%/)||[])[1]) || '100';
+      const barW = fk==='cancelled' ? lastPct : '100';
       const stamp = `<span class="wkdone" style="background:${col}">${esc(word)}</span>`;
       // A GHOST MUST NOT KEEP CLAIMING TO BE WORKING.
       //
@@ -28417,12 +28486,16 @@ function paintRunning(j){
         .replace(/<span class="spin">.*?<\/span>/s, '')
         .replace('</div>', stamp + '</div>')
         .replace(/<div class="bar big">[\s\S]*?<\/div>/,
-                 `<div class="bar big"><i class="nogrow" style="width:100%;`
+                 `<div class="bar big"><i class="nogrow" style="width:${barW}%;`
                  + `background:${col}"></i></div>`)
         .replace(/<div class="wkstats">[\s\S]*?<\/div>/,
                  `<div class="wkstats dim" style="font-size:11px">`
                  + `<span><span class="m-lbl">ended</span> `
-                 + `<span class="m-time">${esc(word)}</span></span></div>`)
+                 + `<span class="m-time">${esc(word)}</span></span></div>`
+                 + (whyTxt ? `<div class="wkwhy" style="color:${col}"><b>${esc(word)}</b>`
+                     + ` <span style="color:var(--fg,#c9d1d9)">\u2014 ${esc(whyTxt)}</span></div>` : ''))
+        // the step line still says which step it was on, as if it were on it
+        .replace(/<div class="stepzone"[^>]*>[\s\S]*?<\/div>\s*(?=<div class="socrzone")/, '')
         .replace(/<div class="socrzone">[\s\S]*?<\/div>\s*(?=<div class="iozone")/,
                  '<div class="socrzone"></div>')
         .replace(/<div class="iozone">[\s\S]*?<\/div>\s*(?=<div class="wlzone")/,
@@ -28432,7 +28505,7 @@ function paintRunning(j){
         // (the watch box is optional). Remove the inner line instead - same
         // result, no chance of eating the card's own closing tag.
         .replace(/<div class="dim mono wkline">[\s\S]*?<\/div>/, '');
-      _fading.set(id, {html, until:nowMs+FADE_MS});
+      _fading.set(id, {html, until:nowMs+hold, at:nowMs, hold, fk});
     }
   }
   for(const [id, f] of [..._fading]) if(f.until <= nowMs) _fading.delete(id);
@@ -28450,7 +28523,8 @@ function paintRunning(j){
     if(!live.has(id) && !_fading.has(id)) _cardHtml.delete(id);
 
   for(const f of _fading.values())
-    html += f.html.replace('<div class="wk"', '<div class="wk fading"');
+    html += f.html.replace('<div class="wk"',
+      `<div class="wk fading fate-${f.fk}" style="--ge:${-(nowMs-f.at)}ms;--hold:${(f.hold-600)/1000}s"`);
 
   // A ghost stands in the slot the job just vacated, so the panel keeps the
   // same eight rows rather than briefly showing nine.
@@ -31192,6 +31266,32 @@ function paintGateQuick(toggles){
     `<button class="gqbtn${on?' on':''}" onclick="setGate('gate.manual_pause',${on?'false':'true'})"
        title="${on?'Let jobs start again':'Stop new jobs starting. Running jobs finish.'}"
      >${on?'Resume':'Pause'}</button>`;
+}
+// THE PRIORITY TIER, WHERE THE WORK IS. The tier is chosen in the Job gate
+// heading, which is a screen away from the two panels it governs - so the
+// Queue and the Processing System each say which tier is in force and how
+// many jobs it allows. Click it to go to the buttons.
+let _prioKey='';
+function paintPrioTags(p){
+  const tags=document.querySelectorAll('.priotag');
+  if(!tags.length || !p) return;
+  const name=({'':'Normal',half:'Half',two:'Two',one:'One'})[p.tier||''];
+  const count = p.limit ? `${Math.min(p.running,p.limit)} of ${p.limit} job${p.limit===1?'':'s'} running`
+              : p.tier==='half' ? 'every lane at half its count'
+              : 'every lane at its count';
+  const txt = (p.paused?'paused · ':'') + `priority ${p.auto?'auto → ':''}${name} · ${count}`
+            + (p.cause?` · ${p.cause} busy elsewhere`:'');
+  const key=txt;
+  if(key===_prioKey) return;
+  _prioKey=key;
+  const tip = (p.limit ? `Priority ${name}: at most ${p.limit} job${p.limit===1?'':'s'} at a time across every lane. `
+              : p.tier==='half' ? 'Priority Half: every lane runs half its count. ' : 'Priority Normal: every lane runs up to its count. ')
+            + (p.auto?'Chosen by Auto from what the rest of the machine is using. ':'')
+            + 'Click to change it in the Job gate heading.';
+  tags.forEach(t=>{
+    t.innerHTML=`<a class="prio${p.tier?' low':''}${p.paused?' held':''}" href="#gatePanel" title="${tip}"
+       onclick="const g=document.getElementById('gatePanel'); if(g){ g.scrollIntoView({behavior:'smooth',block:'start'}); return false; }">${esc(txt)}</a>`;
+  });
 }
 async function setLowTier(tier){
   await fetch('/api/gate/low?tier='+encodeURIComponent(tier),{method:'POST'});

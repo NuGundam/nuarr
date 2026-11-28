@@ -7520,11 +7520,20 @@ FATE: dict[str, str] = {}
 _FATE_MAX = 60
 
 
-def _remember_fate(job_id: str, state: str) -> None:
+# AND WHY, for the endings that are not "done": the card of a cancelled or
+# discarded job says what happened to it while it leaves, in the words the
+# Activity row will carry.
+FATE_WHY: dict[str, str] = {}
+
+
+def _remember_fate(job_id: str, state: str, why: str = "") -> None:
     FATE[job_id] = state
+    if why and state != "done":
+        FATE_WHY[job_id] = str(why)[:300]
     if len(FATE) > _FATE_MAX:
         for k in list(FATE)[:len(FATE) - _FATE_MAX]:
             FATE.pop(k, None)
+            FATE_WHY.pop(k, None)
 
 
 # THE STAGE A FINISHED JOB SHOULD BE LEFT SITTING IN.
@@ -7592,7 +7601,7 @@ def _finish(job: Job, state: str, before: int, after: int,
         note = ("source replaced during the encode - the arr renamed, "
                 "upgraded or moved it while this job ran; the new file is "
                 "planned on its own")
-    _remember_fate(job.id, state)
+    _remember_fate(job.id, state, error or note or "")
     _finish_stage(job.id, state)
     if job.kind == "transcode":
         try:
@@ -8782,7 +8791,7 @@ def live_snapshot() -> dict:
         "subocr_inline": sum(1 for w in workers if w.sub_ocr_active),
         # How the recently-finished jobs ended, so a ghost card can say what
         # actually happened instead of assuming success. See FATE.
-        "fate": dict(FATE),
+        "fate": dict(FATE), "fate_why": dict(FATE_WHY),
         "live": True,          # tells the painter there is no recent/queue here
     }
 
