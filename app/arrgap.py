@@ -388,6 +388,11 @@ async def scan() -> dict:
             "oldest_at": min((r["first_at"] for r in rows), default=0.0),
         }
         _CACHE["at"] = time.time()
+        try:
+            from . import lastrun as _lr
+            _lr.keep("arrgap", _CACHE)             # survives a restart - see lastrun
+        except Exception:                                    # noqa: BLE001
+            pass
     finally:
         _CACHE.update(running=False, t1=time.time())
     return cached()
@@ -519,7 +524,8 @@ def attention() -> dict | None:
 
 
 def cached() -> dict:
-    from . import schedules as _sch
+    from . import schedules as _sch, lastrun as _lr
+    _lr.restore("arrgap", _CACHE, _every_h() * 3600.0)
     _sch.first_look("arr gap", scan,
                     not (_CACHE.get("data") or _CACHE.get("running")))
     d = _CACHE.get("data")

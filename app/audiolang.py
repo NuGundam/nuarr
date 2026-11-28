@@ -1096,6 +1096,7 @@ def aggregate(dists: list) -> list:
 FIRST_LOOK = (0.10, 0.28, 0.46, 0.64, 0.85)
 SECOND_LOOK = (0.05, 0.19, 0.37, 0.55, 0.73, 0.93)
 OUTLIER_MAX = 0.80                 # a lone dissenter under this is not a second language
+ONE_WINDOW_MIN = 0.85              # a single window deciding alone has to be this sure
 
 
 def _extract_why(e: Exception) -> str:
@@ -1163,6 +1164,20 @@ def _judge(votes: list, strong_floor: float = MIN_PROB) -> dict:
         return out
     code2 = strong[0][0]
     conf = round(min(v[1] for v in strong), 3)
+    # ONE WINDOW IS NOT A VERDICT when the rest could not tell (2026-11-28).
+    # Primal S03E04 - a show with no dialogue at all - scored [en .31, en .44,
+    # en .25, zh .48, zh .65]: four windows under the floor and one barely
+    # over it, and that one window made the track "Chinese, 65% sure",
+    # contradicted its English tag and held the file for an answer. A single
+    # window under ONE_WINDOW_MIN, with most of the others unable to say, is
+    # the model guessing at noise. It is asked again with more windows, and
+    # if that is still all there is, the track stays unjudged rather than
+    # being called something.
+    if len(strong) == 1 and len(votes) >= 3 and conf < ONE_WINDOW_MIN:
+        out.update(code2=code2, confidence=conf, retry=True,
+                   why=(f"only 1 of {len(votes)} windows could tell, and that one said {code2} at "
+                        f"{conf:.2f} - too little speech to judge the track by"))
+        return out
     out.update(code2=code2, confidence=conf, ok=True)
     if len(strong) < len(votes):
         out["why"] = (f"{len(votes) - len(strong)} window(s) ignored as "

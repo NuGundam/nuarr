@@ -114,6 +114,15 @@ async def refresh() -> dict:
         if n and answered == asked and asked:
             _CACHE.update(n=n, bytes=b, by_arr=by, at=time.time(),
                           asked=asked, answered=answered, arrs=_arr_set())
+            try:
+                # kept across a restart, so a start does not ask Sonarr for
+                # every series again to learn a total it knew a minute ago
+                import json as _json
+                from .db import kv_set as _kv_set
+                _kv_set("arrtotals.last", _json.dumps({k: _CACHE.get(k) for k in
+                        ("n", "bytes", "by_arr", "at", "asked", "answered")}, default=str))
+            except Exception:                                # noqa: BLE001
+                pass
         elif n:
             joblog.log(f"library total: only {answered} of {asked} arr(s) "
                        f"answered, so the total would be short - keeping the "
@@ -155,6 +164,19 @@ async def watch() -> None:
              "asking the service that already knows. On local storage it is the "
              "comparison against nuarr's own walk, so it runs every six hours "
              "rather than every thirty minutes.")
+    try:
+        import json as _json
+        from .db import kv_get as _kv_get
+        kept = _json.loads(_kv_get("arrtotals.last") or "{}")
+        left = _ttl() - (time.time() - float(kept.get("at") or 0))
+        if kept.get("n") and left > 0 and not _CACHE.get("at"):
+            _CACHE.update(n=int(kept["n"]), bytes=int(kept.get("bytes") or 0), by_arr=kept.get("by_arr") or {},
+                          at=float(kept["at"]), asked=kept.get("asked"), answered=kept.get("answered"),
+                          arrs=_arr_set())
+            schedules.beat("arrtotals", f"{int(kept['n']):,} files (kept from before the restart)")
+            await asyncio.sleep(left)
+    except Exception:                                        # noqa: BLE001
+        pass
     while True:
         try:
             d = await refresh()

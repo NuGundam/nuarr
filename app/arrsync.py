@@ -568,7 +568,8 @@ def cached() -> dict:
     See schedules.first_look(): an empty answer after a restart used to sit
     there reading "not checked yet" until the loop woke up.
     """
-    from . import schedules as _sch
+    from . import schedules as _sch, lastrun as _lr
+    _lr.restore("arrsync", _CACHE, float(getattr(SETTINGS, "arrsync_every_h", 12) or 12) * 3600.0)
     _sch.first_look("arr agreement", refresh,
                     not (_CACHE.get("data") or _CACHE.get("running")))
     d = _CACHE.get("data")
@@ -619,6 +620,11 @@ async def refresh() -> dict:
     try:
         d = await scan()
         _CACHE.update(data=d, at=time.time())
+        try:
+            from . import lastrun as _lr
+            _lr.keep("arrsync", _CACHE)            # survives a restart - see lastrun
+        except Exception:                                    # noqa: BLE001
+            pass
         # A CLEAN SCAN RETIRES THE FAILURES. They are a record of records that
         # would not take a correction; if a later scan finds nothing to
         # correct, whatever they described has resolved - by hand, by the arr
