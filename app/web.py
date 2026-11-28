@@ -28712,7 +28712,11 @@ function wkStatsHtml(w, pct, indet){
       : ''}>${indet?'—':pct.toFixed(1)+'%'
       }${(w.by_bytes&&w.stage==='encoding')?'<span class="dim" style="font-size:10px">~</span>':''}</span>
     ${(w.kind==='subs'||w.kind==='audio'||w.kind==='decode'
-       ||w.kind==='subread'||w.kind==='listen'||w.kind==='sub_ocr'||w.kind==='submake')
+       ||w.kind==='subread'||w.kind==='listen'||w.kind==='sub_ocr'||w.kind==='submake'
+       // ...and the same for every lane added since (subtiming, verify, qwen,
+       // the quiet checks): only an encode or a remux has frames and a speed,
+       // so only they keep the two columns while the numbers are still coming.
+       ||(!w.rate_unit && !w.fps && !w.speed && w.pool!=='encode' && w.pool!=='passthrough'))
       // NO FPS AND NO SPEED, BECAUSE THERE IS NO VIDEO TIMELINE. These jobs
       // move bytes and write headers; two dashes where a number belongs read
       // as "something is missing", and nothing is. The bytes moved are on
