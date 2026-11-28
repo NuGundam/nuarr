@@ -606,6 +606,69 @@ def from_subs(src, spec, src_name, ffmpeg, out):
     say(done=True, narration=0, onscreen=0, translated=len(keep), dropped=len(cues) - len(keep), applied=hits)
 
 
+# ------------------------------------------- the file's own signs track --
+# THE SIGNS AND SONGS ARE ALREADY WRITTEN. A dubbed release nearly always
+# carries an English "Signs & Songs" track: a person's translation of what is
+# on screen and of the songs, timed by a person. When the file has one, its
+# lines go into the made track as they are - at the top, where the maker puts
+# on-screen text - and the maker has only the dialogue left to do. Nothing is
+# read off the picture and nothing on screen is translated, which is two of
+# the three slow steps.
+#
+# A typeset track repeats a sign once per frame it moves in, so the same text
+# in back-to-back cues is one line here. Vector drawings are not text. And a
+# track that turns out to carry more than twelve lines a minute is not a
+# signs track whatever it is called - it is ignored and the picture is read.
+_FOREIGN = re.compile("[\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7af]")
+
+
+def _secs(t):
+    h, m, r = t.strip().replace(".", ",").split(":")
+    s, ms = (r.split(",") + ["0"])[:2]
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(ms[:3].ljust(3, "0")) / 1000.0
+
+
+def signs_cues(src, spec, ffmpeg, duration):
+    say(stage="reading the file's signs and songs track", pct=46)
+    try:
+        raw = subprocess.run([ffmpeg, "-v", "error", "-i", src, "-map", "0:" + spec.split(":", 1)[1],
+                              "-f", "srt", "-"], capture_output=True, timeout=600).stdout.decode("utf-8", "replace")
+    except Exception:                                            # noqa: BLE001
+        return []
+    rows = []
+    # its own reading of the SRT, not _srt_parse: a sign of two lines stays two lines
+    parsed = []
+    for blk in re.split(r"\r?\n\s*\r?\n", raw.strip()):
+        L = [x for x in blk.splitlines() if x.strip()]
+        i = next((n for n, x in enumerate(L) if "-->" in x), None)
+        if i is None:
+            continue
+        a, z = [x.strip() for x in L[i].split("-->")[:2]]
+        body = "\n".join(y for y in (" ".join(re.sub(r"<[^>]+>|\{[^}]*\}", "", x).split()) for x in L[i + 1:]) if y)
+        if body:
+            parsed.append((a, z.split(" ")[0], body))
+    for a, z, body in parsed:
+        if re.match(r"^m -?[\d.]+ -?[\d.]+ [lb] ", body) or not re.search(r"[A-Za-z0-9]", body):
+            continue                                             # a drawing, or nothing to read
+        try:
+            rows.append([_secs(a), _secs(z), body])
+        except Exception:                                        # noqa: BLE001
+            continue
+    rows.sort(key=lambda x: (x[2], x[0]))
+    out = []
+    for s, e, t in rows:
+        if out and out[-1][2] == t and s - out[-1][1] <= 0.35:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e, t])
+    out.sort(key=lambda x: x[0])
+    if len(out) > max(40, 12 * max(1.0, duration / 60.0)):
+        say(stage="reading the file's signs and songs track", pct=46,
+            note=f"{len(out)} lines - too many for a signs track, reading the picture instead")
+        return []
+    return out
+
+
 # ---------------------------------------------------------------- main ----
 def main():
     ap = argparse.ArgumentParser()
@@ -625,6 +688,7 @@ def main():
     ap.add_argument("--sub-lang", default="", help="the language of --from-subs")
     ap.add_argument("--learn", default="", help="json: the show's names and corrections (sublearn)")
     ap.add_argument("--audio", type=int, default=0, help="audio track ordinal (0:a:N) to listen to")
+    ap.add_argument("--signs", default="", help="stream:N - the file's own English signs/songs track")
     ap.add_argument("--verify", default="", help="json file: {windows:[{t,len,a}]} - what is said there, in English")
     a = ap.parse_args()
     if a.learn:
@@ -701,12 +765,24 @@ def main():
                 return
         talk = speech(a.src, wlang, os.path.join(a.data, "whisper"), a.ffmpeg, a.audio)
         shown, words = [], []
-        if plang and not a.no_ocr:
+        ready = signs_cues(a.src, a.signs, a.ffmpeg,
+                           a.duration or (talk[-1][1] if talk else 3600)) if a.signs else []
+        if not ready and plang and not a.no_ocr:
             shown = picture(a.src, plang, script, a.ffmpeg, a.duration or (talk[-1][1] if talk else 3600))
-            if shown:
-                words = translate([s[2] for s in shown], a.title,
-                                  os.path.join(a.data, "llm", "qwen2.5-7b-instruct-ct2-int8"),
-                                  plan["name"])
+        # A LINE WHISPER LEFT HALF IN THE SOURCE LANGUAGE ("we will now begin
+        # the new" followed by the Japanese word) - 109 of them in the 942
+        # tracks made so far (2026-11-27). The translator is asked for those
+        # lines too; one that still does not come back in English is dropped
+        # rather than shown.
+        leak = [i for i, x in enumerate(talk) if _FOREIGN.search(x[2])] if wlang != "en" else []
+        ask = [s[2] for s in shown] + [talk[i][2] for i in leak]
+        if ask:
+            got = translate(ask, a.title, os.path.join(a.data, "llm", "qwen2.5-7b-instruct-ct2-int8"),
+                            plan["name"])
+            words = got[:len(shown)]
+            for i, w2 in zip(leak, got[len(shown):]):
+                talk[i][2] = w2 or ""
+            talk = [x for x in talk if x[2]]
         say(stage="writing", pct=96)
         bot = []
         for s, e, t in talk:
@@ -727,6 +803,7 @@ def main():
         for i in range(len(bot) - 1):
             bot[i][1] = max(min(bot[i][1], bot[i + 1][0] - 0.05), bot[i][0] + 0.8)
         top = [[s, max(e, s + 1.5), "{\\an8}" + w] for (s, e, _j), w in zip(shown, words) if w]
+        top += [[s, max(e, s + 1.0), "{\\an8}" + t] for s, e, t in ready]
         ev = sorted(bot + top, key=lambda x: x[0])
         ev, hits = _apply_fixes(ev)
         if not ev:
@@ -736,7 +813,8 @@ def main():
         with open(tmp, "w", encoding="utf-8") as f:
             f.write("\n\n".join(f"{i + 1}\n{ts(s)} --> {ts(e)}\n{t}" for i, (s, e, t) in enumerate(ev)) + "\n")
         os.replace(tmp, a.out)
-        say(done=True, narration=len(bot), onscreen=len(top), seconds=round(time.time() - t0), applied=hits)
+        say(done=True, narration=len(bot), onscreen=len(top), seconds=round(time.time() - t0), applied=hits,
+            signs=len(ready), retranslated=len(leak))
     except Exception as e:                                       # noqa: BLE001
         say(error=f"{type(e).__name__}: {e}"[:300])
 

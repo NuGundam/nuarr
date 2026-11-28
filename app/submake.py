@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 
@@ -327,6 +328,86 @@ def text_source(r: dict) -> dict | None:
     return None
 
 
+def signs_source(r: dict) -> dict | None:
+    """The file's own English signs/songs track, as text - so the maker has
+    only the dialogue to do. -> {"spec": "stream:N", "what"} or None.
+    English, text (a picture track cannot be merged), titled signs/songs or
+    flagged forced, and not one of nuarr's own."""
+    import subprocess
+    from . import rules
+    from .jobs import _ffprobe_exe
+    try:
+        raw = subprocess.run([_ffprobe_exe(), "-v", "error", "-select_streams", "s",
+                              "-show_entries", "stream=index,codec_name:stream_tags=language,title:"
+                              "stream_disposition=forced", "-of", "json", r["path"]],
+                             capture_output=True, text=True, timeout=60,
+                             creationflags=NO_WINDOW).stdout
+        streams = json.loads(raw or "{}").get("streams") or []
+    except Exception:                                            # noqa: BLE001
+        return None
+    for st in streams:
+        tags = st.get("tags") or {}
+        lang = str(tags.get("language") or "").lower()
+        title = str(tags.get("title") or "")
+        if lang not in ("eng", "en") or (st.get("codec_name") or "").lower() not in _TEXT_CODECS:
+            continue
+        if "(nuarr)" in title.lower():
+            continue
+        forced = bool((st.get("disposition") or {}).get("forced"))
+        if rules.is_signs_title(title) or forced:
+            return {"spec": f"stream:{int(st['index'])}",
+                    "what": f'the file\'s own "{title or "forced"}" track'}
+    return None
+
+
+# WHERE THE TIME GOES. Every stage the worker reports is timed, per file, and
+# the last 600 files are kept - so "which step is slow" is a measurement and
+# not a reading of the code. See /api/submake/timing.
+KV_TIMES = "submake.timings"
+_T: dict = {"stage": "", "at": 0.0, "by": {}}
+
+
+def _time_stage(stage: str) -> None:
+    now = time.time()
+    if _T["stage"]:
+        _T["by"][_T["stage"]] = _T["by"].get(_T["stage"], 0.0) + (now - _T["at"])
+    _T["stage"], _T["at"] = stage, now
+
+
+def _times_keep(row: dict) -> None:
+    try:
+        rows = json.loads(kv_get(KV_TIMES) or "[]")
+    except Exception:                                            # noqa: BLE001
+        rows = []
+    kv_set(KV_TIMES, json.dumps(([row] + rows)[:600]))
+
+
+def timing() -> dict:
+    """Per stage: how many files had it, the middle file's seconds, and its
+    share of all the time spent - split by kind of make."""
+    try:
+        rows = json.loads(kv_get(KV_TIMES) or "[]")
+    except Exception:                                            # noqa: BLE001
+        rows = []
+    out = {}
+    for kind in ("make", "make with the file's signs", "dub", "translate"):
+        mine = [r for r in rows if r.get("kind") == kind]
+        if not mine:
+            continue
+        total = sum(sum((r.get("stages") or {}).values()) for r in mine) or 1.0
+        st: dict = {}
+        for r in mine:
+            for k, v in (r.get("stages") or {}).items():
+                st.setdefault(k, []).append(float(v))
+        secs = sorted(float(r.get("secs") or 0) for r in mine)
+        out[kind] = {"files": len(mine), "median_s": round(secs[len(secs) // 2]),
+                     "video_min": round(sum(float(r.get("duration") or 0) for r in mine) / 60 / len(mine), 1),
+                     "stages": sorted(({"stage": k, "files": len(v), "median_s": round(sorted(v)[len(v) // 2], 1),
+                                        "share": round(sum(v) / total, 3)} for k, v in st.items()),
+                                      key=lambda x: -x["share"])}
+    return {"since": min((r.get("at") or 0 for r in rows), default=0), "n": len(rows), "kinds": out}
+
+
 def _lang_of(r: dict) -> str:
     langs = [x.strip() for x in str(r.get("audio_langs") or "").split(",") if x.strip()]
     for x in langs:
@@ -462,6 +543,8 @@ def _step_of(stage: str) -> str:
     s = (stage or "").lower()
     if "inside the file" in s:
         return "put inside the file"
+    if "signs and songs track" in s:
+        return "add the file's signs"
     if "translat" in s:
         return "translate"
     if "ocr" in s or "reading the picture" in s:
@@ -480,6 +563,7 @@ def _st(**kw) -> None:
     if w is not None:
         try:
             if "stage" in kw:
+                _time_stage(re.sub(r"(loading Whisper) .*", r"\1", str(kw["stage"]))[:60])
                 steps = getattr(w, "steps", None) or []
                 name = _step_of(str(kw["stage"]))
                 if name in steps:
@@ -676,6 +760,22 @@ async def _one(file_id: int, overwrite: bool, by: str = "you", dub: bool = False
     src = None if dub else await asyncio.to_thread(text_source, r)
     if dub:
         STATE["note"] = "dub subtitles - writing down what the English dub says"
+    # THE FILE'S OWN SIGNS AND SONGS, when it has them in English: they go in
+    # as they are, and the maker has only the dialogue to do.
+    signs = None if src else await asyncio.to_thread(signs_source, r)
+    if signs:
+        cmd += ["--signs", signs["spec"]]
+        STATE["note"] = (STATE.get("note") or "") + (" - " if STATE.get("note") else "") + \
+            "signs and songs from " + signs["what"]
+        joblog.log(f"subtitle maker: {label} - signs and songs taken from {signs['what']}; "
+                   "only the dialogue is made", "info")
+        try:
+            if _W[0] is not None:
+                _W[0].steps = ["prepare", "listen", "add the file's signs", "write", "put inside the file"]
+        except Exception:                                        # noqa: BLE001
+            pass
+    _T.update(stage="", at=0.0, by={})
+    _time_stage("starting")
     if src:
         cmd += ["--from-subs", src["spec"], "--sub-lang", src["lang"]]
         STATE["note"] = "translating " + src["what"]
@@ -772,7 +872,16 @@ async def _one(file_id: int, overwrite: bool, by: str = "you", dub: bool = False
             pass
     row.update(ok=True, narration=end.get("narration", 0), onscreen=end.get("onscreen", 0),
                translated=end.get("translated", 0), source=(src or {}).get("what", ""),
-               style=style)
+               style=style, signs=end.get("signs", 0), retranslated=end.get("retranslated", 0))
+    # HOW IT READS, measured from the text - see subquality.
+    try:
+        from . import subquality
+        qual = subquality.score(made_text, float(r["duration"] or 0))
+        row["quality"] = qual["grade"]
+        row["quality_flags"] = qual["flags"]
+        subquality.record(file_id, label, qual, dub)
+    except Exception:                                            # noqa: BLE001
+        qual = {}
     try:
         subembed.forget_sidecars(r["path"])
     except Exception:                                            # noqa: BLE001
@@ -809,11 +918,23 @@ async def _one(file_id: int, overwrite: bool, by: str = "you", dub: bool = False
                    why="kept beside the file - mkvmerge is not installed")
     if not dub:
         _learnt()        # sublearn follows the "English (nuarr)" track only
+    try:
+        _time_stage("")
+        kind = ("translate" if src else "dub" if dub
+                else "make with the file's signs" if row.get("signs") else "make")
+        row["stages"] = {k: round(v, 1) for k, v in _T["by"].items() if v >= 0.05}
+        _times_keep({"at": time.time(), "file_id": file_id, "kind": kind, "secs": row.get("secs"),
+                     "duration": float(r["duration"] or 0), "stages": row["stages"]})
+    except Exception:                                            # noqa: BLE001
+        pass
     _remember(row)
     joblog.log(f"subtitle maker: {label} - "
                + (f"{row['translated']} line(s) translated from {row['source']}" if row.get("translated")
                   else f"{row['narration']} spoken + {row['onscreen']} on-screen line(s)")
-               + f", {row['why']}", "ok")
+               + (f" ({row['signs']} of them from the file's own signs track)" if row.get("signs") else "")
+               + f", {row['why']}"
+               + (f" - reads {qual['grade']}" + (": " + "; ".join(qual["flags"]) if qual.get("flags") else "")
+                  if qual else ""), "ok")
     try:
         from . import pushover
         # NOT FOR THE TRICKLES. The library switches feed thousands of files,

@@ -11433,6 +11433,20 @@ def api_submake():
     return submake.snapshot()
 
 
+@app.get("/api/submake/timing")
+def api_submake_timing():
+    """Where the Subtitle maker's time goes, stage by stage."""
+    from . import submake
+    return submake.timing()
+
+
+@app.get("/api/submake/quality")
+def api_submake_quality():
+    """How the made subtitles read - see subquality."""
+    from . import subquality
+    return subquality.summary()
+
+
 # THEIR OWN WORKERS. A release search is a minute of waiting on the arr, and
 # on the shared thread pool it queued behind nuarr's other work - the row sat
 # at "starting" before anything had begun. Four threads, used by nothing else.
@@ -45382,9 +45396,56 @@ async function smRestyle(g,btn){
   await fetch(`/api/submake/restyle?group=${g}`,{method:'POST'});
   setTimeout(smStyles, 800);
 }
+// WHERE THE TIME GOES AND HOW THE RESULT READS (2026-11-27). Two folded
+// rows under the styles: the maker's stages timed per file, and every made
+// track scored from its own text (subquality). Fetched when the panel loads
+// and again every five minutes - neither moves faster than a file is made.
+let _smStatsAt=0, _smStatsKey='';
+async function smStats(force){
+  const el=document.getElementById('smStats'); if(!el) return;
+  if(!force && Date.now()-_smStatsAt < 300000) return;
+  _smStatsAt=Date.now();
+  let t={}, q={};
+  try{ [t,q]=await Promise.all([fetch('/api/submake/timing').then(r=>r.json()), fetch('/api/submake/quality').then(r=>r.json())]); }catch(e){ return; }
+  const dur=s=>s>=90?`${Math.floor(s/60)}m ${String(Math.round(s%60)).padStart(2,'0')}s`:`${Math.round(s)}s`;
+  const kinds=Object.entries(t.kinds||{});
+  const timeHtml = kinds.length ? kinds.map(([k,v])=>`
+      <div style="margin:5px 0 2px"><b>${esc(k)}</b> <span class="dim">\u00b7 ${fmt(v.files)} file${v.files===1?'':'s'} \u00b7 middle one ${dur(v.median_s)} for ${v.video_min} min of video</span></div>
+      ${v.stages.filter(x=>x.share>=0.005).map(x=>`<div style="display:flex;align-items:center;gap:8px;font-size:11px;margin:1px 0">
+          <span style="flex:0 0 250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(x.stage)}</span>
+          <span style="flex:1 1 120px;max-width:260px;height:6px;border-radius:3px;background:rgba(255,255,255,.07);overflow:hidden">
+            <i style="display:block;height:100%;width:${(x.share*100).toFixed(1)}%;background:#79c0ff"></i></span>
+          <span style="flex:0 0 44px;text-align:right">${(x.share*100).toFixed(0)}%</span>
+          <span class="dim" style="flex:0 0 130px">middle file ${dur(x.median_s)}</span></div>`).join('')}`).join('')
+    : `<div class="dim" style="margin:4px 0">Nothing timed yet - each file made from now on adds its stages here.</div>`;
+  const by=q.by||{}, GC={good:'#7fd4a3',check:'#e2b341',poor:'#f47067'};
+  const qualHtml = q.n ? `
+      <div style="margin:5px 0 3px">${['good','check','poor'].map(g=>`<span style="color:${GC[g]};margin-right:12px"><b>${fmt(by[g]||0)}</b> ${g}</span>`).join('')}
+        <span class="dim">of ${fmt(q.n)} made tracks${q.silent?` \u00b7 ${fmt(q.silent)} nearly silent (not a fault)`:''}</span></div>
+      ${(q.kinds||[]).map(([k,n])=>`<div style="font-size:11px"><span class="dim">${fmt(n)} track${n===1?'':'s'}:</span> ${esc(k)}</div>`).join('')}
+      ${(q.flagged||[]).length?`<div style="margin-top:5px;max-height:190px;overflow:auto">${q.flagged.map(r=>`
+        <div style="font-size:11px;display:flex;gap:8px;margin:1px 0"><span style="flex:0 0 42px;color:${GC[r.grade]}">${esc(r.grade)}</span>
+          <span style="flex:0 1 300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.label||'')}</span>
+          <span class="dim" style="flex:1 1 0;min-width:0">${esc((r.flags||[]).join('; '))}</span></div>`).join('')}</div>`:''}
+      <div class="dim" style="font-size:10.5px;margin-top:4px">Measured from each track's own text: repeated lines, untranslated words, lines Whisper invents over silence, lines too fast or too long to read. It cannot tell whether a translation is right.</div>`
+    : `<div class="dim" style="margin:4px 0">Nothing scored yet.</div>`;
+  const slow = kinds.length ? kinds[0][1].stages[0] : null;
+  const html = `
+    <details class="smfold"${_smStatsOpen.time?' open':''} ontoggle="_smStatsOpen.time=this.open">
+      <summary style="cursor:pointer;font-size:11.5px"><b>Where the time goes</b>
+        <span class="dim">${slow?` \u00b7 slowest: ${esc(slow.stage)}, ${(slow.share*100).toFixed(0)}% of the time`:' \u00b7 collecting'}</span></summary>
+      ${timeHtml}</details>
+    <details class="smfold"${_smStatsOpen.qual?' open':''} ontoggle="_smStatsOpen.qual=this.open" style="margin-top:3px">
+      <summary style="cursor:pointer;font-size:11.5px"><b>How the made subtitles read</b>
+        <span class="dim">${q.n?` \u00b7 ${fmt(by.good||0)} good \u00b7 ${fmt(by.check||0)} to check \u00b7 ${fmt(by.poor||0)} poor`:''}</span></summary>
+      ${qualHtml}</details>`;
+  if(html!==_smStatsKey){ _smStatsKey=html; el.innerHTML=html; }
+}
+const _smStatsOpen={time:false, qual:false};
 async function smLoad(){
   if(!document.getElementById('smPanel')) return;
   if(!_smSt) setTimeout(smStyles, 0);
+  setTimeout(()=>smStats(false), 0);
   try{ _sm=await (await fetch('/api/submake')).json(); }catch(e){ return; }
   smPaint();
   if(_smPoll) clearTimeout(_smPoll);
@@ -45402,6 +45463,7 @@ function smShell(){
       <span class="mono">name.en.ass</span> beside the file only for a file that is not an mkv.
       Runs as a queue job, one file at a time, after the file's checks and its encode.</div>
     <div id="smStyles" style="margin:0 0 8px"></div>
+    <div id="smStats" style="margin:0 0 8px"></div>
     <div style="display:flex;gap:6px;align-items:center;margin-bottom:4px">
       <input id="smQ" placeholder="make subtitles for… (title or file name)" style="flex:1;font-size:11px"
         onkeydown="if(event.key==='Enter') smFind()">
@@ -45470,7 +45532,10 @@ function smRowHtml(r){
         ${r.ok?(r.translated?`<div><span class="dim">lines:</span> ${fmt(r.translated)} translated by Qwen from ${esc(r.source||'a subtitle track')}, every cue keeping its original timing</div>`
           :`<div><span class="dim">lines:</span> ${fmt(r.narration||0)} from the audio (Whisper, timed by the voice detector) · ${fmt(r.onscreen||0)} from the picture (OCR, translated, shown at the top)</div>`):''}
         ${r.sidecar?`<div><span class="dim">subtitle file:</span> <span class="mono">${esc(r.sidecar)}</span>${r.where==='embedded'?' <span class="dim">- taken into the file and recycled</span>':''}</div>`:''}
-        <div><span class="dim">took:</span> ${r.secs!=null?esc(hsDur(r.secs)):'—'} · <span class="dim">finished</span> ${r.at?esc(new Date(r.at*1000).toLocaleString()):'—'}</div>`}
+        <div><span class="dim">took:</span> ${r.secs!=null?esc(hsDur(r.secs)):'—'} · <span class="dim">finished</span> ${r.at?esc(new Date(r.at*1000).toLocaleString()):'—'}</div>
+        ${r.signs?`<div><span class="dim">signs and songs:</span> ${fmt(r.signs)} line(s) taken from the file's own signs track - nothing was read off the picture</div>`:''}
+        ${r.quality?`<div><span class="dim">reads:</span> <span style="color:${({good:'#7fd4a3',check:'#e2b341',poor:'#f47067'})[r.quality]||'inherit'}">${esc(r.quality)}</span>${(r.quality_flags||[]).length?' - '+esc(r.quality_flags.join('; ')):''}</div>`:''}
+        ${r.stages?`<div><span class="dim">time by stage:</span> ${Object.entries(r.stages).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([k,v])=>`${esc(k)} ${esc(hsDur(Math.round(v)))}`).join(' \u00b7 ')}</div>`:''}`}
       <div><span class="dim">file:</span> <span class="mono">${esc(r.file||'')}</span> · <span class="dim">audio</span> ${esc(r.lang||'—')} · <span class="dim">library</span> ${esc(r.library||'—')}${r.by?` · <span class="dim">asked by</span> ${esc(r.by)}`:''}</div>
     </td></tr>`:'';
   return `<tr${on?' style="background:rgba(88,166,255,.06)"':''}>${cb}${ep}${lib}${lang}${when}${res}${where}${ans}</tr>${det}`;
